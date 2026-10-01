@@ -1,0 +1,17 @@
+[package]
+name = "sim-core"
+description = "Radiance 2 simulator kernel: clock, event queue, Neutrino and PE actors, resource plane, program driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nu-model = { path = "../nu-model", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[dev-dependencies]
+func = { path = "../func" }
+
+[lints]
+workspace = true

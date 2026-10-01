@@ -1,0 +1,14 @@
+# configs/2p.yaml as of step 5a (go-back-N then; ready/valid now), inbound_refs 32 and pending 64 at the
+# SMs, default table sizes at the device and the clusters (the device runs
+# no program in 5a). Kept to reproduce the 5a and 5b item 0 numbers; the
+# current values are in 2p.yaml.
+#
+# SM Neutrino: scoreboard and execution table 256 (a window forwards about 250 tasks per SM),
+# pending table 64, inbound refs, requests and invokes 32, c_invoke 8 cycles.
+base: 2p.yaml
+set:
+  # The device keeps the version table of 2p.yaml (1024; version tables
+  # did not exist in 5a, and 256 does not hold one window's HBM writes).
+  - "root.neutrino={versions: 1024}"
+  - root.*.neutrino={}
+  - "root.*.*.neutrino={scoreboard: 256, execution: 256, pending: 64, inbound_refs: 32, outbound_deps: 32, outbound_invokes: 32, c_invoke: 8}"

@@ -1,0 +1,33 @@
+# One SM of the 2p family. All eight are identical.
+#
+# * LBUS: the SM's local bus, unlimited (no bw_bytes): the SMEM port is the
+#   only limit on SMEM traffic.
+# * SMEM: 1 MiB at 256 B/cycle, latency 10 cycles.
+# * Atlas: 16384 MAC/cycle = one 128 x 128 output tile per cycle of K, the
+#   same rate for every data type; quantize = tile charges a 51-token row as
+#   a full 128-row tile (the padding-waste assumption of workload 1).
+# * Muon: 256 lane-op/cycle (a 16 x 16 SIMT core), overhead 50 cycles per
+#   task for launch and the reduction tail.
+# * DMA: latency 100 cycles, 4 chunks outstanding (enough to cover the
+#   latency at a 64 KiB chunk), 4 transfers in flight.
+# * Neutrino: the table sizes of architecture Section 3.3
+#   (2026-09-24): scoreboard 128, pending table 256, execution table 256,
+#   inbound ref table 128, inbound invoke table 64, outbound dep table 128,
+#   outbound invoke table 32; c_invoke 8 cycles. Version table 256
+#   (2026-09-28; the device and the cmem clusters have 1024). The outbound
+#   and inbound invoke tables count messages (a multi-beat message is one
+#   entry). The 5a values are in 2p-smallrefs.yaml.
+
+fabric:
+  - {name: LBUS, topology: xbar}
+memory:
+  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 256, latency: 10,
+     slave: $this.LBUS}
+  - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+compute:
+  - {name: atlas, type: tensor, rate: {bf16: 16384, fp8: 16384, mxfp4: 16384},
+     quantize: tile, operand_reuse: none, acc_buffer: 0, master: $this.LBUS}
+  - {name: muon, type: vector, rate: {lane_op: 256}, overhead: 50, master: $this.LBUS}
+  - {name: dma, type: dma, latency: 100, inflight: 4, outstanding: 4, master: $this.LBUS}
+neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
+           c_invoke: 8}

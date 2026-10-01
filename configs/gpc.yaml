@@ -1,0 +1,12 @@
+# A cluster of the 2p family without cmem: a crossbar and the cluster sync
+# space. The SMs are listed by the including file.
+
+# SMEM keeps data (router outputs, activations); HBM (the device) is null:
+# weights have no values, and a DMA from HBM copies nothing.
+fidelity: numeric
+fabric:
+  # Crossbar 512 B/cycle: four SM bridges at full rate.
+  - {name: CSBUS, topology: xbar, bw_bytes: 512}
+memory:
+  - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+neutrino: {scoreboard: 128, pending: 256, execution: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}

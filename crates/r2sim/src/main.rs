@@ -1,0 +1,621 @@
+//! `r2sim run --config C --program P [options]` (see `USAGE`).
+//!
+//! Runs program P on configuration C in timing mode with the Trace backend.
+//! It prints a summary to stdout and, with `--stats OUT`, writes the run as
+//! JSON to OUT. `--trace-out DIR` writes the tracer files (`trace.rs`).
+
+mod trace;
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use serde::Serialize;
+use sim_core::{build_config_file, ProfileRegistry, SimWarning, Stats};
+
+const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
+[--trace FILE | --synthetic SEED] [--stats OUT] [--timeline] [--quantize tile|none] \
+[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--no-diagnostics]";
+
+#[derive(Default)]
+struct Args {
+    config: Option<PathBuf>,
+    program: Option<String>,
+    params: Option<PathBuf>,
+    overrides: Vec<String>,
+    trace: Option<PathBuf>,
+    synthetic: Option<u64>,
+    stats: Option<PathBuf>,
+    timeline: bool,
+    phase_stats: bool,
+    trace_out: Option<PathBuf>,
+    sets: Vec<String>,
+    bin: Option<u64>,
+    window: Option<(u64, u64)>,
+    node: Option<String>,
+    row_panel: Option<bool>,
+    acc_buffer: Option<u64>,
+    quantize: Option<bool>,
+    cocharge: Option<sim_core::CoCharge>,
+    flow: Option<sim_core::Flow>,
+    diagnostics: bool,
+}
+
+fn parse(argv: &[String]) -> Result<Args, String> {
+    let mut a = Args {
+        diagnostics: true,
+        ..Args::default()
+    };
+    let mut it = argv.iter();
+    match it.next().map(String::as_str) {
+        Some("run") => {}
+        _ => return Err(USAGE.into()),
+    }
+    while let Some(k) = it.next() {
+        let mut val = || it.next().cloned().ok_or(format!("{k} needs a value"));
+        match k.as_str() {
+            "--config" => a.config = Some(val()?.into()),
+            "--program" => a.program = Some(val()?),
+            "--params" => a.params = Some(val()?.into()),
+            "--param" => a.overrides.push(val()?),
+            "--trace" => a.trace = Some(val()?.into()),
+            "--synthetic" => a.synthetic = Some(val()?.parse().map_err(|e| format!("{e}"))?),
+            "--stats" => a.stats = Some(val()?.into()),
+            "--timeline" => a.timeline = true,
+            "--phase-stats" => a.phase_stats = true,
+            "--trace-out" => a.trace_out = Some(val()?.into()),
+            "--set" => a.sets.push(val()?),
+            "--bin" => a.bin = Some(val()?.parse().map_err(|e| format!("--bin: {e}"))?),
+            "--node" => a.node = Some(val()?),
+            "--window" => {
+                let v = val()?;
+                let (x, y) = v.split_once(':').ok_or("--window wants A:B")?;
+                let p = |t: &str| t.parse::<u64>().map_err(|e| format!("--window: {e}"));
+                a.window = Some((p(x)?, p(y)?));
+            }
+            "--acc-buffer" => {
+                a.acc_buffer = Some(val()?.parse().map_err(|e| format!("--acc-buffer: {e}"))?)
+            }
+            "--operand-reuse" => {
+                a.row_panel = Some(match val()?.as_str() {
+                    "none" => false,
+                    "row_panel" => true,
+                    r => return Err(format!("unknown operand reuse {r:?}")),
+                })
+            }
+            "--no-diagnostics" => a.diagnostics = false,
+            "--cocharge" => {
+                a.cocharge = Some(match val()?.as_str() {
+                    "longest" => sim_core::CoCharge::Longest,
+                    "own" => sim_core::CoCharge::Own,
+                    c => return Err(format!("--cocharge {c}")),
+                })
+            }
+            "--flow" => {
+                a.flow = Some(match val()?.as_str() {
+                    "readyvalid" => sim_core::Flow::ReadyValid,
+                    "ticket" => sim_core::Flow::Ticket,
+                    f => return Err(format!("--flow {f}")),
+                })
+            }
+            "--quantize" => {
+                a.quantize = Some(match val()?.as_str() {
+                    "tile" => true,
+                    "none" => false,
+                    q => return Err(format!("--quantize {q}")),
+                })
+            }
+            _ => return Err(format!("unknown argument {k}\n{USAGE}")),
+        }
+    }
+    Ok(a)
+}
+
+/// Resource shares in one interval between program marks.
+#[derive(Serialize)]
+struct PhaseStats {
+    name: String,
+    start: u64,
+    end: u64,
+    /// Top resources by share of chunk culprit cycles, of start delay, and
+    /// by utilization (busy / interval).
+    culprits: Vec<(String, f64)>,
+    delays: Vec<(String, f64)>,
+    busiest: Vec<(String, f64)>,
+}
+
+fn phase_stats(stats: &Stats) -> Vec<PhaseStats> {
+    let names: Vec<&str> = stats.resources.iter().map(|r| r.name.as_str()).collect();
+    let top = |v: Vec<(usize, f64)>| -> Vec<(String, f64)> {
+        let mut v: Vec<(usize, f64)> = v.into_iter().filter(|x| x.1 > 0.0).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        v.into_iter()
+            .take(5)
+            .map(|(i, x)| (names[i].to_string(), x))
+            .collect()
+    };
+    stats
+        .marks
+        .windows(2)
+        .map(|w| {
+            let (a, b) = (&w[0], &w[1]);
+            let d: Vec<[u64; 3]> = b
+                .res
+                .iter()
+                .zip(&a.res)
+                .map(|(x, y)| [x[0] - y[0], x[1] - y[1], x[2] - y[2]])
+                .collect();
+            let len = (b.time - a.time).max(1) as f64;
+            let sum = |k: usize| d.iter().map(|x| x[k]).sum::<u64>().max(1) as f64;
+            let share = |k: usize, den: f64| {
+                top(d
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (i, x[k] as f64 / den))
+                    .collect())
+            };
+            PhaseStats {
+                name: b.name.clone(),
+                start: a.time,
+                end: b.time,
+                culprits: share(1, sum(1)),
+                delays: share(2, sum(2)),
+                busiest: share(0, len),
+            }
+        })
+        .collect()
+}
+
+/// SMEM port utilization over the SMs other than the driver's.
+#[derive(Serialize)]
+struct Spread {
+    min: f64,
+    max: f64,
+    mean: f64,
+    /// The driver SM's own port.
+    home: f64,
+    per_sm: Vec<(String, f64)>,
+}
+
+#[derive(Serialize, Clone)]
+struct ResourceOut {
+    name: String,
+    kind: String,
+    busy_cycles: u64,
+    utilization: f64,
+    culprit_cycles: u64,
+    culprit_share: f64,
+    delay_cycles: u64,
+    delay_share: f64,
+}
+
+#[derive(Serialize)]
+struct Out<'a> {
+    config: String,
+    program: String,
+    quantize: Option<bool>,
+    /// The `--cocharge` and `--flow` overrides ("default": the
+    /// configuration's).
+    cocharge: &'static str,
+    flow: &'static str,
+    end_time: u64,
+    step_end: Vec<u64>,
+    step_time: Vec<u64>,
+    hbm_bytes: u64,
+    /// HBM bytes loaded again because every attention SM computes the MQA
+    /// K/V projection and streams the prefix KV itself.
+    mqa_dup_bytes: u64,
+    hbm_rate_bytes_per_cycle: f64,
+    hbm_bound_cycles: u64,
+    end_over_hbm_bound: f64,
+    /// The central driver's instruction throughput used (busy / end): at 1
+    /// the driver is the bottleneck.
+    driver_scalar_utilization: f64,
+    wall_seconds: f64,
+    events: u64,
+    events_per_second: f64,
+    tasks: u64,
+    messages: u64,
+    rejects: u64,
+    /// Program cycles stalled on full outbound invoke tables, summed.
+    outbound_stall_total: u64,
+    resends: u64,
+    /// The most version table entries held at once, over all Neutrinos.
+    version_peak_max: usize,
+    warnings: BTreeMap<String, u64>,
+    /// All warnings; `stats.warnings` keeps the first 1000.
+    warnings_total: usize,
+    smem_port_util: Spread,
+    /// Atlas knobs of the run (H3 accumulator buffer, H1 row panel).
+    acc_buffer: u64,
+    row_panel: bool,
+    /// Per interval between program marks (--phase-stats).
+    phase_stats: Vec<PhaseStats>,
+    culprits: Vec<ResourceOut>,
+    /// Resources chunks queued on, by share of start delay.
+    delays: Vec<(String, f64)>,
+    resources: Vec<ResourceOut>,
+    report: &'a nu_prog::adamoe::Report,
+    prefill: Option<&'a nu_prog::prefill::Report>,
+    forward: Option<&'a nu_prog::forward::Report>,
+    stats: &'a Stats,
+}
+
+/// The action expert's parameters of `program` (for the trace).
+fn action_params(
+    program: &str,
+    text: &str,
+    overrides: &[String],
+) -> Result<nu_prog::adamoe::Params, String> {
+    if program == "forward" {
+        let p: nu_prog::forward::Params = nu_prog::params(text, overrides)?;
+        Ok(p.action)
+    } else {
+        nu_prog::params(text, overrides)
+    }
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Err(e) = run(&argv) {
+        eprintln!("r2sim: {e}");
+        std::process::exit(2);
+    }
+}
+
+fn run(argv: &[String]) -> Result<(), String> {
+    let a = parse(argv)?;
+    let cfg_path = a.config.clone().ok_or(USAGE)?;
+    let program = a.program.clone().ok_or(USAGE)?;
+    let params_text = match &a.params {
+        Some(p) => std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+        None => String::new(),
+    };
+    let mut b = build_config_file(&cfg_path, &a.sets, ProfileRegistry::with_builtins())
+        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+    let granule = 512;
+    let records = match (&a.trace, a.synthetic) {
+        (Some(p), None) => func::load_trace(p).map_err(|e| e.0)?,
+        (None, Some(seed)) => {
+            let p = action_params(&program, &params_text, &a.overrides)?;
+            nu_prog::synthetic_trace(&p, seed, 4.0, 0.9)
+        }
+        (None, None) if program != "adamoe" => Default::default(),
+        (None, None) => return Err("adamoe needs --trace or --synthetic".into()),
+        _ => return Err("give only one of --trace and --synthetic".into()),
+    };
+    // Activation probabilities for cmem placement, from the trace.
+    let mut overrides = a.overrides.clone();
+    if (program == "adamoe" || program == "forward")
+        && !overrides.iter().any(|o| o.starts_with("expert_prob"))
+    {
+        let p = action_params(&program, &params_text, &overrides)?;
+        let probs = nu_prog::adamoe::expert_prob(&records, &p);
+        overrides.push(format!("expert_prob={probs:?}"));
+    }
+    // Before the launch: the prefill cost model reads the Atlas knob.
+    if let Some(on) = a.row_panel {
+        b.sim.set_atlas_row_panel(on);
+    }
+    if let Some(bytes) = a.acc_buffer {
+        b.sim.set_atlas_acc_buffer(bytes);
+    }
+    let launch = nu_prog::launch(&program, &b, granule, &params_text, &overrides)?;
+    // HBM rate for the bound.
+    let hbm_port = b
+        .sim
+        .memories()
+        .iter()
+        .find(|m| m.name.ends_with(".hbm"))
+        .map(|m| m.port)
+        .ok_or("no memory named hbm")?;
+    let rate = b.sim.resources().flow(hbm_port).rate();
+    let rate_f = rate.num as f64 / rate.den as f64;
+
+    let driver_scalar = format!("{}.scalar", b.sim.topology().path_name(launch.nu));
+    let home_path = b.sim.topology().path_name(launch.nu);
+    // The tracer export needs the timeline, the marks and the resource logs.
+    let tracing = a.trace_out.is_some();
+    b.sim.set_timeline(a.timeline || tracing);
+    b.sim.set_marks(a.phase_stats || tracing);
+    b.sim.resources_mut().set_log(tracing);
+    if !a.diagnostics {
+        b.sim.set_open_pending_report(false);
+        b.sim.set_late_consumer_check(false);
+    }
+    if let Some(q) = a.quantize {
+        b.sim.set_atlas_quantize(q);
+    }
+    if let Some(c) = a.cocharge {
+        b.sim.resources_mut().set_cocharge(c);
+    }
+    if let Some(f) = a.flow {
+        b.sim.set_flow(f);
+    }
+    b.sim.set_functional(Box::new(func::Trace::new(records)));
+    // The names are taken now, before the run consumes the simulation.
+    let names = tracing.then(|| trace::names(&b));
+    let atlas = b
+        .pe_paths()
+        .into_iter()
+        .find_map(|(_, id)| match b.sim.pe_config(id).params {
+            sim_core::PeParams::Atlas {
+                acc_buffer,
+                row_panel,
+                ..
+            } => Some((acc_buffer, row_panel)),
+            _ => None,
+        })
+        .unwrap_or((0, false));
+    let mut sim = b.sim;
+    sim.spawn(launch.nu, launch.program);
+    let t0 = Instant::now();
+    let stats = sim.run();
+    let wall = t0.elapsed().as_secs_f64();
+    let prefill = launch.prefill.as_ref().map(|r| r.borrow().clone());
+    let forward = launch.forward.as_ref().map(|r| r.borrow().clone());
+    if let (Some(dir), Some(names)) = (&a.trace_out, &names) {
+        let phases = trace_phases(prefill.as_ref(), forward.as_ref(), &launch.report.borrow());
+        let opts = trace::Opts {
+            dir: dir.clone(),
+            bin: a.bin.unwrap_or(10_000),
+            window: a.window,
+            node: a.node.clone(),
+        };
+        trace::write(&opts, names, &stats, &phases).map_err(|e| format!("--trace-out: {e}"))?;
+    }
+    let mut report = launch.report.borrow().clone();
+    if let Some(p) = &prefill {
+        report.step_end = p.layer_end.clone();
+        report.hbm_bytes = p.hbm_bytes;
+    }
+    // The warning list can be long (one record per pipelined slot reuse);
+    // the JSON keeps the first ones and the per-kind counts.
+    const KEEP_WARNINGS: usize = 1000;
+    let warnings_total = stats.warnings.len();
+
+    let res = resource_outs(&stats);
+    let home_port = format!("{}.smem.port", home_path);
+    let per_sm: Vec<(String, f64)> = res
+        .iter()
+        .filter(|r| r.name.ends_with(".smem.port") && r.name != home_port)
+        .map(|r| (r.name.clone(), r.utilization))
+        .collect();
+    let us = || per_sm.iter().map(|x| x.1);
+    let smem_port_util = Spread {
+        min: us().fold(f64::INFINITY, f64::min),
+        max: us().fold(0.0, f64::max),
+        mean: us().sum::<f64>() / per_sm.len().max(1) as f64,
+        home: res
+            .iter()
+            .find(|r| r.name == home_port)
+            .map_or(0.0, |r| r.utilization),
+        per_sm: per_sm.clone(),
+    };
+    let mut culprits: Vec<ResourceOut> = res
+        .iter()
+        .filter(|r| r.culprit_cycles > 0)
+        .cloned()
+        .collect();
+    culprits.sort_by_key(|r| std::cmp::Reverse(r.culprit_cycles));
+    let mut delays: Vec<&ResourceOut> = res.iter().filter(|r| r.delay_cycles > 0).collect();
+    delays.sort_by_key(|r| std::cmp::Reverse(r.delay_cycles));
+    let delays: Vec<(String, f64)> = delays
+        .iter()
+        .take(8)
+        .map(|r| (r.name.clone(), r.delay_share))
+        .collect();
+    let warnings = warning_counts(&stats);
+    let mut step_time = Vec::new();
+    let mut prev = 0;
+    for &e in &report.step_end {
+        step_time.push(e - prev);
+        prev = e;
+    }
+    let bound = (report.hbm_bytes as f64 / rate_f).ceil() as u64;
+    let phase_stats = phase_stats(&stats);
+    let mut stats_out = stats.clone();
+    stats_out.marks.clear();
+    // The interval logs go to the tracer files, not into the JSON.
+    for r in &mut stats_out.resources {
+        r.log = None;
+    }
+    stats_out.warnings.truncate(KEEP_WARNINGS);
+    let out = Out {
+        config: cfg_path.display().to_string(),
+        program,
+        quantize: a.quantize,
+        cocharge: match a.cocharge {
+            None => "default",
+            Some(sim_core::CoCharge::Longest) => "longest",
+            Some(sim_core::CoCharge::Own) => "own",
+        },
+        flow: match a.flow {
+            None => "default",
+            Some(sim_core::Flow::ReadyValid) => "readyvalid",
+            Some(sim_core::Flow::Ticket) => "ticket",
+        },
+        end_time: stats.end_time,
+        step_end: report.step_end.clone(),
+        step_time,
+        hbm_bytes: report.hbm_bytes,
+        mqa_dup_bytes: report.mqa_dup_bytes,
+        hbm_rate_bytes_per_cycle: rate_f,
+        hbm_bound_cycles: bound,
+        end_over_hbm_bound: stats.end_time as f64 / bound.max(1) as f64,
+        driver_scalar_utilization: res
+            .iter()
+            .find(|r| r.name == driver_scalar)
+            .map_or(0.0, |r| r.utilization),
+        wall_seconds: wall,
+        events: stats.events,
+        events_per_second: stats.events as f64 / wall.max(1e-9),
+        tasks: stats.invoked,
+        messages: stats.messages,
+        rejects: stats.rejects,
+        outbound_stall_total: stats.outbound_stall.iter().sum(),
+        resends: stats.resends,
+        version_peak_max: stats.version_peak.iter().copied().max().unwrap_or(0),
+        warnings,
+        warnings_total,
+        smem_port_util,
+        acc_buffer: atlas.0,
+        row_panel: atlas.1,
+        phase_stats,
+        culprits,
+        delays,
+        resources: res,
+        report: &report,
+        prefill: prefill.as_ref(),
+        forward: forward.as_ref(),
+        stats: &stats_out,
+    };
+    print_summary(&out, &stats);
+    if let Some(p) = &a.stats {
+        let json = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
+        std::fs::write(p, json).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    if stats.fatal.is_some() {
+        return Err("the run stopped on a fatal error".into());
+    }
+    Ok(())
+}
+
+/// Per-resource totals of the run, with utilization and shares.
+fn resource_outs(stats: &Stats) -> Vec<ResourceOut> {
+    let end = stats.end_time.max(1);
+    let total_culprit: u64 = stats.resources.iter().map(|r| r.culprit_cycles).sum();
+    let total_delay: u64 = stats.resources.iter().map(|r| r.delay_cycles).sum();
+    stats
+        .resources
+        .iter()
+        .map(|r| ResourceOut {
+            name: r.name.clone(),
+            kind: format!("{:?}", r.kind),
+            busy_cycles: r.busy_cycles,
+            utilization: r.busy_cycles as f64 / end as f64,
+            culprit_cycles: r.culprit_cycles,
+            culprit_share: r.culprit_cycles as f64 / total_culprit.max(1) as f64,
+            delay_cycles: r.delay_cycles,
+            delay_share: r.delay_cycles as f64 / total_delay.max(1) as f64,
+        })
+        .collect()
+}
+
+/// Warning counts by kind.
+fn warning_counts(stats: &Stats) -> BTreeMap<String, u64> {
+    let mut warnings = BTreeMap::new();
+    for w in &stats.warnings {
+        let k = match w.warning {
+            SimWarning::Dep(d) => format!("{d:?}")
+                .split_whitespace()
+                .next()
+                .unwrap_or("Dep")
+                .to_string(),
+            SimWarning::Race { .. } => "Race".into(),
+            SimWarning::LateConsumer { .. } => "LateConsumer".into(),
+        };
+        *warnings.entry(k).or_insert(0) += 1;
+    }
+    warnings
+}
+
+/// The phase rows of the tracer: the prefill phases of each prefill stage,
+/// and the denoise steps of the action expert when there is no prefill
+/// program.
+fn trace_phases(
+    prefill: Option<&nu_prog::prefill::Report>,
+    forward: Option<&nu_prog::forward::Report>,
+    action: &nu_prog::adamoe::Report,
+) -> Vec<trace::Phase> {
+    let mut phases = Vec::new();
+    let mut add = |stage: &str, r: &nu_prog::prefill::Report| {
+        for p in &r.phases {
+            phases.push(trace::Phase {
+                stage: stage.into(),
+                name: p.name.clone(),
+                layer: p.layer,
+                start: p.start,
+                end: p.end,
+                estimate: p.grid.map(|g| g.cost),
+                roofline: p.roofline.map(|x| x.bound),
+                bound_by: p.roofline.map_or("", |x| x.bound_by).to_string(),
+            });
+        }
+    };
+    if let Some(p) = prefill {
+        add("prefill", p);
+    }
+    if let Some(f) = forward {
+        if let Some(v) = &f.vision {
+            add("vision", v);
+        }
+        if let Some(v) = &f.vlm {
+            add("vlm", v);
+        }
+    }
+    if prefill.is_none() {
+        let mut prev = forward
+            .and_then(|f| {
+                f.stages
+                    .iter()
+                    .find(|s| s.name == "action")
+                    .map(|s| s.start)
+            })
+            .unwrap_or(0);
+        for (i, &e) in action.step_end.iter().enumerate() {
+            phases.push(trace::Phase {
+                stage: "action".into(),
+                name: format!("step {i}"),
+                layer: 0,
+                start: prev,
+                end: e,
+                estimate: None,
+                roofline: None,
+                bound_by: String::new(),
+            });
+            prev = e;
+        }
+    }
+    phases
+}
+
+/// The one-line summary with the SMEM spread, the top culprits and queues.
+fn print_summary(out: &Out, stats: &Stats) {
+    let s = &out.smem_port_util;
+    let spread = format!(
+        "SMEM port utilization over workers min {:.3} mean {:.3} max {:.3}, home {:.3}",
+        s.min, s.mean, s.max, s.home
+    );
+    println!(
+        "end {} cycles ({} steps), HBM {} B (MQA dup {}), bound {} cycles, ratio {:.3}, \
+    driver scalar {:.3}, wall {:.2} s, {} events",
+        out.end_time,
+        out.step_end.len(),
+        out.hbm_bytes,
+        out.mqa_dup_bytes,
+        out.hbm_bound_cycles,
+        out.end_over_hbm_bound,
+        out.driver_scalar_utilization,
+        out.wall_seconds,
+        out.events
+    );
+    println!("  {spread}");
+    for c in out.culprits.iter().take(5) {
+        println!(
+            "  culprit {:<24} {:>6.1}% of chunk cycles, utilization {:.3}",
+            c.name,
+            100.0 * c.culprit_share,
+            c.utilization
+        );
+    }
+    for (n, sh) in out.delays.iter().take(3) {
+        println!("  queued on {:<24} {:>6.1}% of start delay", n, 100.0 * sh);
+    }
+    if let Some(f) = &stats.fatal {
+        println!("FATAL: {f:?}");
+    }
+    if !stats.unfinished.is_empty() {
+        println!("unfinished: {:?}", stats.unfinished);
+    }
+}

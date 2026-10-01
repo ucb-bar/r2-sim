@@ -1,0 +1,468 @@
+//! Step 4b: forwarded invoke (architecture Section 3.3). Config and path
+//! timings as in `hierarchy.rs`: a message of b 64 B beats between the SMs
+//! arrives 20 + 6b cycles after it is sent when the path is free; a 64^3
+//! bf16 matmul takes 192 cycles on smem.
+
+use nu_model::{Addr, Dep, Range};
+use sim_core::{
+    build_config_file, Args, Built, Descriptor, Dtype, FatalError, NuCtx, ProfileRegistry,
+};
+
+const MAT: u64 = 64 * 64 * 2;
+
+fn two_sm(sets: &[&str]) -> Built {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/configs/two_sm.yaml");
+    build_config_file(&path, sets, ProfileRegistry::with_builtins()).expect("config")
+}
+
+/// two_sm.yaml with the sm1 Neutrino overrides `sm1` ("key=value").
+fn built_with(sm1: &[&str]) -> Built {
+    let sets: Vec<String> = sm1
+        .iter()
+        .map(|kv| format!("root.cluster0.sm1.neutrino.{kv}"))
+        .collect();
+    let sets: Vec<&str> = sets.iter().map(String::as_str).collect();
+    two_sm(&sets)
+}
+
+/// Version 1 of `r`: every test range is written once unless a test says
+/// otherwise.
+fn v1(r: Range) -> Dep {
+    Dep::Versioned {
+        addr: r.base,
+        version: 1,
+    }
+}
+
+/// A versioned matmul into `c`. A forwarded one needs its version
+/// ([`Descriptor::with_version`]).
+fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
+    Descriptor {
+        opcode: b.sim.profiles().lookup("atlas.matmul").unwrap(),
+        pe: Some(b.pe(pe)),
+        dst: c,
+        versioned: true,
+        inferred_version: None,
+        deps: deps.clone(),
+        label: None,
+        args: Args::Matmul {
+            a: Addr(deps.first().map_or(c.base, |d| d.addr())),
+            b: Addr(c.base),
+            lda: 64,
+            ldb: 64,
+            ldc: 64,
+            m: 64,
+            n: 64,
+            k: 64,
+            in_dtype: Dtype::Bf16,
+            b_dtype: Dtype::Bf16,
+            out_dtype: Dtype::Bf16,
+            accumulate: false,
+            keep: false,
+            tile: [64, 64],
+        },
+    }
+}
+
+#[test]
+fn forwarded_invoke_with_a_dep_back_on_the_invoker() {
+    let b = built_with(&[]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let a = Range::from_len(b.memory("root.cluster0.sm0.smem").base, MAT);
+    let c = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
+    let p0 = matmul(&b, "root.cluster0.sm0.atlas", a, vec![]);
+    let m = matmul(&b, "root.cluster0.sm1.atlas", c, vec![v1(a)]).with_inferred_version(1);
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.invoke(p0).await;
+        let h = ctx.invoke(m).await;
+        assert_eq!((h.task, h.gid), (None, None), "no local task");
+        assert_eq!(h.version, 0, "the owner assigns the version on arrival");
+        assert_eq!(ctx.now(), 16, "the invoke returns once queued");
+        ctx.wait(h.addr, 1).await;
+        assert_eq!(ctx.now(), 452);
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert!(s.unfinished.is_empty());
+    let (tp, tm) = (&s.tasks[0], &s.tasks[1]);
+    // P0 at sm0: [8,200), complete 204.
+    assert_eq!(tp.complete, Some(204));
+    // The Invoke (80 B, 2 beats) is sent at 16 and moves hop by hop: sm0's
+    // up bridge [16,20) + 10, the crossbar ports [30,32) and [32,34),
+    // sm1's down bridge [34,38) + 10: M enters sm1's scoreboard at 48 with
+    // a remote dep on A (the 1-beat Await back to sm0 takes 26 cycles,
+    // arrives 74, Registered).
+    assert_eq!(tm.nu, sm1, "the task lives at the owner");
+    assert_eq!(tm.invoke, 48);
+    // Resolve(A) leaves sm0 at 204 and arrives 230: M runs [230,422) on
+    // sm1's atlas, completes 426; Resolve(M) for sm0's wait arrives 452.
+    assert_eq!(tm.ready, Some(230));
+    assert_eq!((tm.chunks[0].start, tm.chunks[0].end), (230, 422));
+    assert_eq!(tm.complete, Some(426));
+    assert_eq!(s.end_time, 452);
+    // Invoke, 2 Await, 2 Registered, 2 Resolve (no acknowledgement).
+    assert_eq!(s.messages, 7);
+    assert_eq!(s.rejects, 0);
+}
+
+#[test]
+fn a_full_scoreboard_holds_forwarded_invokes_in_the_inbound_table() {
+    let b = built_with(&["scoreboard=1"]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let (x, y, c) = (
+        Range::from_len(s1, MAT),
+        Range::from_len(s1 + MAT, MAT),
+        Range::from_len(s1 + 2 * MAT, MAT),
+    );
+    let (p1, p2) = (
+        matmul(&b, "root.cluster0.sm1.atlas", x, vec![]),
+        matmul(&b, "root.cluster0.sm1.atlas", y, vec![]),
+    );
+    let m = matmul(&b, "root.cluster0.sm1.atlas", c, vec![]).with_inferred_version(1);
+    let mut sim = b.sim;
+    sim.spawn(sm1, move |ctx: NuCtx| async move {
+        // P1 runs [8,200); P2 waits for the atlas in the scoreboard (full) until 200.
+        ctx.invoke(p1).await;
+        ctx.invoke(p2).await;
+    });
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(m).await;
+        ctx.wait(h.addr, 1).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert!(s.unfinished.is_empty());
+    // The Invoke (72 B, 2 beats) at 8 arrives 40: the scoreboard is full
+    // (P2), so M waits in the inbound invoke table. P2 issues at 200 and
+    // frees the entry: M enters then. sm0's wait Await for (C, 1) arrived
+    // at 36 and created a pending entry at sm1, which M adopts.
+    assert_eq!(s.rejects, 0);
+    assert_eq!(s.inbound_invoke_peak[sm1.0 as usize], 1);
+    let tm = &s.tasks[2];
+    assert_eq!(tm.invoke, 200);
+    // The atlas is busy with P2 until 392: M runs [392,584), completes 588;
+    // Resolve arrives at sm0 at 614.
+    assert_eq!(tm.issue, Some(392));
+    assert_eq!(tm.complete, Some(588));
+    assert_eq!(s.end_time, 614);
+    assert!(s.open_pending.is_empty());
+}
+
+#[test]
+fn forwarded_invoke_of_a_matmul_on_the_invokers_atlas_is_fatal() {
+    // The descriptor's PE must be the owner's (Section 3.3).
+    let b = built_with(&[]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let c = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
+    let m = matmul(&b, "root.cluster0.sm0.atlas", c, vec![]).with_inferred_version(1);
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.invoke(m).await;
+    });
+    let s = sim.run();
+    let f = s.fatal.expect("fatal");
+    assert!(matches!(f.error, FatalError::Invalid(_)));
+    // The Invoke (72 B, 2 beats) sent at 8 arrives at 40.
+    assert_eq!((f.nu, f.time), (sm1, 40), "at the owner, on arrival");
+}
+
+#[test]
+fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
+    // The canonical case: sm0 forwards a DMA that copies its smem into
+    // sm1's smem; sm1 runs it on its engine and charges the path.
+    let b = built_with(&[]);
+    let sm0 = b.nu("root.cluster0.sm0");
+    let (src, dst) = (
+        b.memory("root.cluster0.sm0.smem").base,
+        b.memory("root.cluster0.sm1.smem").base,
+    );
+    let d = Descriptor {
+        opcode: b.sim.profiles().lookup("dma").unwrap(),
+        pe: Some(b.pe("root.cluster0.sm1.dma")),
+        dst: Range::from_len(dst, 8192),
+        versioned: true,
+        inferred_version: Some(1),
+        deps: vec![],
+        label: None,
+        args: Args::Dma {
+            src: Addr(src),
+            dst: Addr(dst),
+            bytes: 8192,
+            tile_bytes: 8192,
+        },
+    };
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(d).await;
+        ctx.wait(h.addr, 1).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let t = &s.tasks[0];
+    // The Invoke (52 B, 1 beat) arrives at sm1 at 34 and issues; latency
+    // 100 + 20; 256 cycles on the links: [154,410), complete 414; Resolve
+    // arrives at sm0 at 440.
+    assert_eq!(t.invoke, 34);
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (154, 410));
+    assert_eq!(t.complete, Some(414));
+    assert_eq!(s.end_time, 440);
+}
+
+#[test]
+fn a_forwarded_invoke_gets_the_owners_version_and_the_inference_matches() {
+    // sm0 forwards two writes of X to sm1: the handles carry version 0,
+    // the owner assigns 1 and 2 on arrival, and the inferences (1, 2) match
+    // (checked by the owner in debug builds).
+    let b = built_with(&[]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
+    let atlas = "root.cluster0.sm1.atlas";
+    let w1 = matmul(&b, atlas, x, vec![]).with_inferred_version(1);
+    let w2 = matmul(&b, atlas, x, vec![v1(x)]).with_inferred_version(2);
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h1 = ctx.invoke(w1).await;
+        let h2 = ctx.invoke(w2).await;
+        assert_eq!((h1.version, h2.version), (0, 0));
+        ctx.wait(x.base, 2).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let versions: Vec<_> = s.tasks.iter().map(|t| (t.nu, t.version)).collect();
+    assert_eq!(versions, vec![(sm1, Some(1)), (sm1, Some(2))]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn a_wrong_inference_is_fatal_in_debug_builds() {
+    let b = built_with(&[]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
+    let w = matmul(&b, "root.cluster0.sm1.atlas", x, vec![]).with_inferred_version(3);
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.invoke(w).await;
+    });
+    let s = sim.run();
+    let f = s.fatal.expect("fatal");
+    assert_eq!(f.nu, sm1, "at the owner");
+    let FatalError::Invalid(msg) = f.error else {
+        panic!("{f:?}");
+    };
+    assert!(
+        msg.contains("infers version 3, the owner assigns 1"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
+    // sm0 forwards C (a copy of X from sm1's SMEM into HBM, dep (X, 1)) to
+    // the device, waits 200 cycles, then forwards P (the writer of X) to
+    // sm1. The device's Await for (X, 1) reaches sm1 before P's Invoke: the
+    // counter (none) is below 1, so a pending entry for (X, 1) waits, and
+    // P adopts it.
+    let b = built_with(&[]);
+    let (sm0, sm1, dev) = (
+        b.nu("root.cluster0.sm0"),
+        b.nu("root.cluster0.sm1"),
+        b.nu("root"),
+    );
+    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
+    let h = Range::from_len(b.memory("root.hbm").base, MAT);
+    let c = Descriptor {
+        opcode: b.sim.profiles().lookup("dma").unwrap(),
+        pe: Some(b.pe("root.dma")),
+        dst: h,
+        versioned: true,
+        inferred_version: Some(1),
+        deps: vec![v1(x)],
+        label: None,
+        args: Args::Dma {
+            src: Addr(x.base),
+            dst: Addr(h.base),
+            bytes: MAT,
+            tile_bytes: MAT,
+        },
+    };
+    let p = matmul(&b, "root.cluster0.sm1.atlas", x, vec![]).with_inferred_version(1);
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.invoke(c).await;
+        ctx.cycles(200).await;
+        ctx.invoke(p).await;
+        ctx.wait(h.base, 1).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
+    let (tc, tp) = (&s.tasks[0], &s.tasks[1]);
+    assert_eq!((tc.nu, tp.nu), (dev, sm1));
+    // C (60 B, 1 beat) is sent at 8 and enters the device at 43 (sm0's up
+    // bridge 2 + 10, two crossbar ports, the cluster bridge 1 + 20); its
+    // Await for (X, 1) reaches sm1 at 78 (the cluster bridge 1 + 20, two
+    // ports, sm1's down bridge 2 + 10) and waits on a pending entry. P
+    // (72 B, 2 beats) is invoked at [208, 216) and enters sm1 at 248,
+    // adopting the entry; it runs [248, 440) and completes at 444. Resolve
+    // reaches the device at 479: C is ready. C's DMA (latency 100 + 30,
+    // 8 KiB at 32 B/cycle on sm1's bridge) runs [609, 865) and completes
+    // at 869; Resolve reaches sm0's wait at 904.
+    assert_eq!((tc.invoke, tp.invoke), (43, 248));
+    assert_eq!((tp.complete, tc.ready), (Some(444), Some(479)));
+    assert_eq!(
+        (tc.chunks[0].start, tc.chunks[0].end, tc.complete),
+        (609, 865, Some(869))
+    );
+    assert_eq!(s.end_time, 904);
+}
+
+#[test]
+fn backpressure_holds_invokes_across_two_hops() {
+    // sm1: one scoreboard entry, one inbound invoke table entry. P1 runs
+    // [8,200); P2 holds the scoreboard entry until it issues at 200. sm0
+    // forwards M1, M2 and M3 (72 B, 2 beats each) at 8, 16 and 24: M1 takes
+    // the inbound entry, M2 waits in the last stage (after sm1's down
+    // bridge) and M3 in the stage before it (after the crossbar port to
+    // sm1); no invoke is rejected. Stages hold one message each, from the
+    // start of the transmission into them until the message moves on.
+    //
+    // M1: sm0's up bridge [8,12), in stage 1 at 22; port [22,24), stage 2
+    // at 24; port [24,26); sm1's down bridge [26,30) + 10: the inbound
+    // table at 40.
+    // M2: waits in sm0's source queue for stage 1 until 24 (M1 left it);
+    // [24,28), stage 1 at 38; [38,40); [40,42); [42,46) + 10: stage 4 at
+    // 56, where it waits for the inbound entry (held by M1 until 200).
+    // M3: waits for stage 1 until M2's transmission out of it ends at 40;
+    // [40,44), stage 1 at 54; [54,56), stage 2 at 56; [56,58) (M2 left
+    // stage 3 at 46), stage 3 at 58, where it waits for stage 4 (M2).
+    // At 200 P2 issues and M1 enters the scoreboard: M2 moves into the
+    // inbound table, M3 takes stage 4 ([200,204) + 10, at 214) and waits
+    // there for M2. At 392 M1 issues, M2 enters and M3 moves into the
+    // table; at 584 M2 issues and M3 enters.
+    let b = built_with(&["scoreboard=1", "inbound_invokes=1"]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let at = |i: u64| Range::from_len(s1 + i * MAT, MAT);
+    let atlas = "root.cluster0.sm1.atlas";
+    let (p1, p2) = (
+        matmul(&b, atlas, at(0), vec![]),
+        matmul(&b, atlas, at(1), vec![]),
+    );
+    let ms: Vec<Descriptor> = (2..5)
+        .map(|i| matmul(&b, atlas, at(i), vec![]).with_inferred_version(1))
+        .collect();
+    let mut sim = b.sim;
+    sim.spawn(sm1, move |ctx: NuCtx| async move {
+        ctx.invoke(p1).await;
+        let h = ctx.invoke(p2).await;
+        ctx.wait(h.addr, h.version).await;
+    });
+    let last = at(4);
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        for m in ms {
+            ctx.invoke(m).await;
+        }
+        ctx.wait(last.base, 1).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert!(s.unfinished.is_empty());
+    assert_eq!(s.rejects, 0);
+    let (t1, t2, t3) = (&s.tasks[2], &s.tasks[3], &s.tasks[4]);
+    assert_eq!((t1.invoke, t2.invoke, t3.invoke), (200, 392, 584));
+    let hol = |name: &str| {
+        s.stages
+            .iter()
+            .find(|x| x.stage == name)
+            .map_or(0, |x| x.hol_cycles)
+    };
+    // Head-of-line cycles: the stage after sm1's down bridge M2 [56,200)
+    // and M3 [214,392); the stage after the port to sm1 M3 [58,200); none
+    // after the port from sm0; sm0's source queue M2 [16,24) and M3
+    // [24,40).
+    assert_eq!(hol("root.cluster0.sm1.bridge.down.ctl.invoke"), 144 + 178);
+    assert_eq!(hol("root.cluster0.CSBUS.sm1.out.ctl.invoke"), 142);
+    assert_eq!(hol("root.cluster0.CSBUS.sm0.in.ctl.invoke"), 0);
+    assert_eq!(hol("root.cluster0.sm0.source.invoke"), 8 + 16);
+}
+
+#[test]
+fn the_deadlock_detector_fires_on_a_cycle() {
+    // sm1: one scoreboard entry, one inbound invoke table entry. Its own
+    // task T waits forever for (X5, 1), which nobody produces, and holds
+    // the scoreboard entry; sm0's M1 waits in the inbound table for it and
+    // M2 in the channel for M1. No event is left: the run ends with a
+    // Deadlock that names the stage holding M2.
+    let b = built_with(&["scoreboard=1", "inbound_invokes=1"]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let at = |i: u64| Range::from_len(s1 + i * MAT, MAT);
+    let t = matmul(&b, "root.cluster0.sm1.atlas", at(0), vec![v1(at(5))]);
+    let (m1, m2) = (
+        matmul(&b, "root.cluster0.sm1.atlas", at(1), vec![]).with_inferred_version(1),
+        matmul(&b, "root.cluster0.sm1.atlas", at(2), vec![]).with_inferred_version(1),
+    );
+    let mut sim = b.sim;
+    sim.spawn(sm1, move |ctx: NuCtx| async move {
+        ctx.invoke(t).await;
+    });
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.invoke(m1).await;
+        ctx.invoke(m2).await;
+    });
+    let s = sim.run();
+    let f = s.fatal.expect("fatal");
+    let FatalError::Deadlock { tables, stages, .. } = f.error else {
+        panic!("{f:?}");
+    };
+    let t1 = &tables[sm1.0 as usize];
+    assert_eq!((t1.scoreboard, t1.inbound_invokes, t1.pending), (1, 1, 1));
+    assert_eq!(tables[sm0.0 as usize].outbound_invokes, 0);
+    assert_eq!(stages.len(), 1, "{stages:?}");
+    assert_eq!(stages[0].stage, "root.cluster0.sm1.bridge.down.ctl.invoke");
+    assert_eq!(stages[0].messages, 1);
+}
+
+#[test]
+fn a_join_with_20_deps_travels_in_3_beats() {
+    // 2 + 2 + 16 + 8 x 20 = 180 B: 3 beats, 20 + 6 x 3 = 38 cycles. sm1
+    // first writes version 1 of 20 ranges with local joins (done by 208);
+    // sm0 forwards the join on them at 208, so it is ready on arrival.
+    let b = built_with(&[]);
+    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
+    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let at = |i: u64| Range::from_len(s1 + i * 512, 512);
+    let j = at(0);
+    let signals: Vec<Descriptor> = (1..21)
+        .map(|i| {
+            let mut d = Descriptor::join(at(i), vec![]);
+            d.versioned = true;
+            d
+        })
+        .collect();
+    let mut join =
+        Descriptor::join(j, (1..21).map(|i| v1(at(i))).collect()).with_inferred_version(1);
+    join.versioned = true;
+    assert_eq!(join.wire_bytes(), 180);
+    let mut sim = b.sim;
+    sim.spawn(sm1, move |ctx: NuCtx| async move {
+        for d in signals {
+            ctx.invoke(d).await;
+        }
+        ctx.wait(j.base, 1).await;
+    });
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.cycles(200).await;
+        ctx.invoke(join).await;
+        ctx.wait(j.base, 1).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert!(s.unfinished.is_empty());
+    let t = &s.tasks[20];
+    assert_eq!((t.invoke, t.ready), (208 + 38, Some(246)));
+    // The join, then the Await, AwaitAck and Resolve of sm0's wait.
+    assert_eq!(s.beats, [3, 0, 1, 0]);
+}

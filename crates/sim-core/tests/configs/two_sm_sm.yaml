@@ -1,0 +1,10 @@
+# An SM of two_sm.yaml.
+fabric:
+  - {name: LBUS}
+memory:
+  - {name: smem, type: scratch, addr: [[0x0, 0x80000]], bw_bytes: 128, latency: 10, slave: $this.LBUS}
+  - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+compute:
+  - {name: atlas, type: tensor, rate: {bf16: 4096}, master: $this.LBUS}
+  - {name: dma, type: dma, latency: 100, inflight: 2, master: $this.LBUS}
+neutrino: {inbound_refs: 4, t_retry: 50}

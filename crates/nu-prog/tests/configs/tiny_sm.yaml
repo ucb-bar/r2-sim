@@ -1,0 +1,12 @@
+# An SM of tiny.yaml.
+fabric:
+  - {name: LBUS}
+memory:
+  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 128, latency: 10, slave: $this.LBUS}
+  - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+compute:
+  - {name: atlas, type: tensor, rate: {bf16: 4096, fp8: 4096, mxfp4: 4096}, quantize: none,
+     master: $this.LBUS}
+  - {name: muon, type: vector, rate: {lane_op: 64}, overhead: 10, master: $this.LBUS}
+  - {name: dma, type: dma, latency: 50, inflight: 2, outstanding: 1, master: $this.LBUS}
+neutrino: {scoreboard: 64, execution: 64, pending: 16, inbound_refs: 16, outbound_deps: 16, outbound_invokes: 16}

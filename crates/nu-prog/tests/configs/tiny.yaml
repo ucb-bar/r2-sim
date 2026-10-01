@@ -1,0 +1,36 @@
+# One cluster, three SMs (sm0 is the driver), small rates for hand
+# computation. Own spaces: offset_bits 24, fields cluster:2 sm:2.
+#   root 0x000_0000, cluster0 0x400_0000, sm0 0x500_0000, sm1 0x600_0000,
+#   sm2 0x700_0000.
+
+global:
+  neutrino_granule: 512
+  msg_bytes: 64
+  address:
+    fields: [{name: cluster, bits: 2}, {name: sm, bits: 2}]
+    offset_bits: 24
+
+device:
+  name: root
+  fabric:
+    - {name: SBUS}
+  memory:
+    - {name: hbm, type: dram, addr: [[0x0, 0x800000]], bw_bytes: 64, latency: 100, slave: $this.SBUS}
+    - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+  compute:
+    # Copy engine: writes into HBM are its pulls (Section 3.3).
+    - {name: dma, type: dma, latency: 50, inflight: 2, outstanding: 1, master: $this.SBUS}
+  neutrino: {}
+  children:
+    - name: cluster0
+      bridge: {bus: $parent.SBUS}
+      fidelity: numeric
+      fabric:
+        - {name: CSBUS, bw_bytes: 64}
+      memory:
+        - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+      neutrino: {}
+      children:
+        - {name: sm0, config: tiny_sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 32, latency: 10}}
+        - {name: sm1, config: tiny_sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 32, latency: 10}}
+        - {name: sm2, config: tiny_sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 32, latency: 10}}

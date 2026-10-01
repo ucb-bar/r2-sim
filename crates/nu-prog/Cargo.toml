@@ -1,0 +1,18 @@
+[package]
+name = "nu-prog"
+description = "Neutrino program library: graph builder with expected-consumer counts, layer builders, the AdaMoE action-expert workload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nu-model = { path = "../nu-model" }
+sim-core = { path = "../sim-core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+[dev-dependencies]
+func = { path = "../func" }
+
+[lints]
+workspace = true

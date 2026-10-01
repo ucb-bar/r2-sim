@@ -1,0 +1,36 @@
+# Two SMs under one cluster under a device, for the hierarchy tests.
+# Own spaces (offset_bits 24, fields cluster:2 sm:2):
+#   root 0x000_0000, cluster0 0x400_0000, sm0 0x500_0000, sm1 0x600_0000
+
+global:
+  neutrino_granule: 512
+  msg_bytes: 64
+  # The hand computations of hierarchy.rs and remote_invoke.rs were derived
+  # under the first co-charge rule and without separate control lanes; the
+  # control lanes below run at the data rate, so messages time as before.
+  cocharge: longest
+  address:
+    fields: [{name: cluster, bits: 2}, {name: sm, bits: 2}]
+    offset_bits: 24
+
+device:
+  name: root
+  fabric:
+    - {name: SBUS}
+  memory:
+    - {name: hbm, type: dram, addr: [[0x0, 0x800000]], bw_bytes: 256, latency: 200, slave: $this.SBUS}
+  compute:
+    # Copy engine: writes into HBM are its pulls (Section 3.3).
+    - {name: dma, type: dma, latency: 100, inflight: 2, master: $this.SBUS}
+  neutrino: {}
+  children:
+    - name: cluster0
+      bridge: {bus: $parent.SBUS, bw_bytes: 64, control_bytes: 64, latency: 20}
+      fabric:
+        - {name: CSBUS, bw_bytes: 64, control_bytes: 64}
+      memory:
+        - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+      neutrino: {}
+      children:
+        - {name: sm0, config: two_sm_sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 32, control_bytes: 32, latency: 10}}
+        - {name: sm1, config: two_sm_sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 32, control_bytes: 32, latency: 10}}

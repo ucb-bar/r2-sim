@@ -1,0 +1,7 @@
+# 2p.yaml with 2 MiB of SMEM per SM (the 5b item 3b target size) and an SMEM
+# port of 512 B/cycle (H2: the rate the Atlas needs for bf16 operands, 128 A
+# plus 128 B elements per cycle of K; 2p.yaml has 256).
+base: 2p.yaml
+set:
+  - "root.*.*.smem.addr=[[0x0, 0x200000]]"
+  - root.*.*.smem.bw_bytes=512

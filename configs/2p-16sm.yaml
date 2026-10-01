@@ -1,0 +1,59 @@
+# 2p.yaml with 4 clusters of 4 SMs (16 SMs; the SM-count axis of the
+# sensitivity sweep). The device crossbar is 256 B/cycle per cluster
+# (1024). Ready/valid flow; scoreboard 128 at every
+# Neutrino (as in 2p.yaml).
+
+global:
+  neutrino_granule: 512
+  clock_ghz: 1.0
+  msg_bytes: 64
+  flow: readyvalid
+  address:
+    fields: [{name: cluster, bits: 3}, {name: sm, bits: 3}]
+    offset_bits: 33
+
+device:
+  name: root
+  fabric:
+    - {name: SBUS, topology: xbar, bw_bytes: 1024}
+  memory:
+    - {name: hbm, type: dram, addr: [[0x0, 0x1E0000000]], bw_bytes: 273, latency: 200,
+       slave: $this.SBUS}
+    - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  compute:
+    - {name: dma, type: dma, latency: 100, inflight: 8, outstanding: 4, master: $this.SBUS}
+  neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+  children:
+    - name: gpc0
+      config: gpc.yaml
+      bridge: {bus: $parent.SBUS, bw_bytes: 256, latency: 20}
+      children:
+        - {name: sm0, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm1, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm2, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm3, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+    - name: gpc1
+      config: gpc.yaml
+      bridge: {bus: $parent.SBUS, bw_bytes: 256, latency: 20}
+      children:
+        - {name: sm4, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm5, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm6, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm7, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+    - name: gpc2
+      config: gpc.yaml
+      bridge: {bus: $parent.SBUS, bw_bytes: 256, latency: 20}
+      children:
+        - {name: sm8, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm9, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm10, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm11, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+    - name: gpc3
+      config: gpc.yaml
+      bridge: {bus: $parent.SBUS, bw_bytes: 256, latency: 20}
+      children:
+        - {name: sm12, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm13, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm14, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+        - {name: sm15, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+

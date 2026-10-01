@@ -1,0 +1,5 @@
+# 2p-cmem64.yaml with 1.5 GiB of cmem per cluster (5b item 2): the whole
+# action expert fits in cmem.
+base: 2p-cmem64.yaml
+set:
+  - "root.*.cmem.addr=[[0x0, 0x60000000]]"

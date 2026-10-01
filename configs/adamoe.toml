@@ -1,0 +1,36 @@
+# AdaMoE action expert (pi0 action expert with a top-1 MoE FFN), LIBERO
+# setting. Program parameters for `r2sim run --program adamoe`; every key is
+# optional and can be overridden with `--param key=value`.
+
+steps = 10          # denoise steps per inference
+layers = 18         # action-expert layers (Gemma 300M)
+tokens = 51         # suffix: 1 state + 50 action tokens
+d = 1024            # model width
+ffn = 4096          # FFN hidden size per expert
+heads = 8           # query heads
+head_dim = 256
+prefix = 816        # prefix KV entries (3 images x 256 + 48 text), in HBM
+experts = 4         # routed experts, top-1, plus one shared expert
+shared_expert = true
+shared_before_barrier = true   # the shared expert does not wait for the router
+
+home = 0            # driver SM (cluster0.sm0); it runs norms, router, adds
+workers = []        # all SMs but home
+attn_sms = []       # = workers; 8 heads round-robin
+attn_kv = "multicast"   # prefix KV and MQA K/V projection loaded once per
+                        # cluster and round, pulled by the other head SMs;
+                        # "per_head": every head SM loads them from HBM
+shared_sms = []     # = workers
+expert_sms = []     # every routed expert on all workers
+
+block_cols = 128    # weight block = d x 128 bf16 = 256 KiB, one staging slot
+key_block = 128     # prefix KV block
+dma_chunk = 65536   # 64 KiB DMA chunks
+gather_bufs = 4     # partial-sum buffers at home
+resident_bytes_per_sm = 0             # no resident weights (swept in 5b)
+resident_order = ["shared", "routed", "attn"]
+tile = [128, 128]   # Atlas output tile of every matmul
+rms_ops = 4         # Muon lane-ops per element
+geglu_ops = 8
+softmax_ops = 6
+add_ops = 1

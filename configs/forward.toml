@@ -1,0 +1,17 @@
+# Full pi0 forward pass (5b item 4): SigLIP vision encoder, PaliGemma 2B
+# prefill, then the AdaMoE action expert. Program parameters for
+# `r2sim run --program forward`; every key is optional. Sections [vision]
+# and [vlm] take the prefill parameters, [action] the adamoe parameters
+# (defaults as in adamoe.toml).
+
+weight_dtype = "bf16"       # all three stages: bf16 | fp8 | mxfp4
+vlm_last_layer = "no_ffn"   # the last VLM layer's FFN feeds nothing; skip it
+                            # as a compiler would ("kv": skip q, attention,
+                            # o too; "full": run everything)
+act_mem = "auto"            # prefill activations: cmem when present, else HBM
+single_accumulator = true   # prefill GEMMs: one accumulator per SM (5b item 4:
+                            # faster on all four configurations)
+
+[action]
+steps = 10
+layers = 18
