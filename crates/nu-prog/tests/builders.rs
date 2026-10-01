@@ -58,7 +58,7 @@ fn one_linear_layer() {
     // Hand computation (tiny.yaml; own co-charging; control lanes at 1/8
     // of the data rate: a 64 B beat takes 16 cycles on a 4 B/cycle SM
     // bridge lane and 8 on an 8 B/cycle crossbar port lane; each bridge
-    // adds 10 cycles of latency; the crossbar CSBUS is an xbar, charged per
+    // adds 10 cycles of latency; the crossbar clsbus is an xbar, charged per
     // port). Control messages go store and forward through one-message
     // stages (after sm0's up bridge, after the port from sm0, after the port
     // to the target, then the target's inbound table): a 1-beat message
@@ -112,7 +112,7 @@ fn one_linear_layer() {
             .find(|x| x.stage == name)
             .map_or(0, |x| x.hol_cycles)
     };
-    assert_eq!(hol("root.cluster0.sm0.source.invoke"), 186);
+    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 186);
 }
 
 #[test]
@@ -260,17 +260,17 @@ fn an_invoke_to_a_full_owner_delays_an_invoke_to_a_free_owner() {
     // [T+64, T+80) and sm2's down bridge [T+80, T+112) + 10: sm2 at T+122.
     // On a free path M5 would reach sm2 at 40 + 116 = 156.
     let b = tiny_with(&[
-        "root.cluster0.sm1.neutrino.scoreboard=1",
-        "root.cluster0.sm1.neutrino.inbound_invokes=1",
+        "root.gpc0.sm1.neutrino.scoreboard=1",
+        "root.gpc0.sm1.neutrino.inbound_invokes=1",
     ]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let b2 = b.nu("root.cluster0.sm2");
-    let base1 = b.memory("root.cluster0.sm1.smem").base;
-    let base2 = b.memory("root.cluster0.sm2.smem").base;
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let b2 = b.nu("root.gpc0.sm2");
+    let base1 = b.memory("root.gpc0.sm1.smem").base;
+    let base2 = b.memory("root.gpc0.sm2.smem").base;
     let small = 64 * 64 * 2;
     let big = nu_model::Range::from_len(base1, 128 * 128 * 2);
     let at = |i: u64| nu_model::Range::from_len(base1 + big.len() + i * small, small);
-    let atlas1 = "root.cluster0.sm1.atlas";
+    let atlas1 = "root.gpc0.sm1.atlas";
     let p1 = matmul(&b, atlas1, big, 128, vec![]);
     let p2 = matmul(
         &b,
@@ -286,7 +286,7 @@ fn an_invoke_to_a_full_owner_delays_an_invoke_to_a_free_owner() {
         .map(|i| matmul(&b, atlas1, at(i), 64, vec![]).with_inferred_version(1))
         .collect();
     let r5 = nu_model::Range::from_len(base2, small);
-    ms.push(matmul(&b, "root.cluster0.sm2.atlas", r5, 64, vec![]).with_inferred_version(1));
+    ms.push(matmul(&b, "root.gpc0.sm2.atlas", r5, 64, vec![]).with_inferred_version(1));
     let last = at(4);
     let mut sim = b.sim;
     sim.spawn(sm1, move |ctx: NuCtx| async move {
@@ -317,8 +317,8 @@ fn an_invoke_to_a_full_owner_delays_an_invoke_to_a_free_owner() {
     // Head-of-line cycles on M5's path: S1 M5 [282, T+48); S2 M4
     // [240, T+32); sm0's source queue M2 [16,66), M3 [66,124), M4
     // [124,182), M5 [182,240). None after the port to sm2.
-    assert_eq!(hol("root.cluster0.sm0.bridge.up.ctl.invoke"), t + 48 - 282);
-    assert_eq!(hol("root.cluster0.CSBUS.sm0.in.ctl.invoke"), t + 32 - 240);
-    assert_eq!(hol("root.cluster0.sm0.source.invoke"), 50 + 58 + 58 + 58);
-    assert_eq!(hol("root.cluster0.CSBUS.sm2.out.ctl.invoke"), 0);
+    assert_eq!(hol("root.gpc0.sm0.bridge.up.ctl.invoke"), t + 48 - 282);
+    assert_eq!(hol("root.gpc0.clcbus.sm0.in.invoke"), t + 32 - 240);
+    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 50 + 58 + 58 + 58);
+    assert_eq!(hol("root.gpc0.clcbus.sm2.out.invoke"), 0);
 }

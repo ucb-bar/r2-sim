@@ -2,8 +2,10 @@
 //! prefill and the action expert's denoise loop, run by one driver on the
 //! home SM, one stage after the other.
 //!
-//! One HBM map: the action expert's weights and the prefix KV cache (as
-//! [`adamoe::hbm_map`]), then the VLM weights, then the vision weights.
+//! One HBM map over the slices: the action expert's weights and the
+//! prefix KV cache (as [`adamoe::hbm_map`]), then the VLM weights, then
+//! the vision weights, each slice in that order (the placement rule is in
+//! [`crate::machine`]).
 //! Prefill activations: VLM tensors, then vision tensors, in the
 //! activation memory (cmem of the first cmem cluster when present, else
 //! HBM). The vision projector writes the VLM input rows; the VLM writes the
@@ -91,6 +93,9 @@ pub struct Stage {
     pub hbm_bytes: u64,
     /// cmem bytes of the stage (its report's `cmem_bytes`).
     pub cmem_bytes: u64,
+    /// The HBM bytes per gpc of the SM that moved them: from or to its own
+    /// gpc's slice (`local`) or another slice (`remote`).
+    pub hbm_by_gpc: Vec<crate::machine::GpcBytes>,
     /// Every weight byte the stage uses, once per use (the action expert
     /// uses its weights once per denoise step), whether it is in HBM or
     /// cmem.
@@ -113,7 +118,7 @@ pub struct Report {
     /// The whole pass as one stage: byte sums, and the sum of the stage
     /// rooflines.
     pub total: Stage,
-    /// HBM port rate, bytes per cycle (1 without an HBM owner node).
+    /// HBM rate of all slices, bytes per cycle.
     pub hbm_rate: f64,
     /// Bytes of each cmem cluster kept for prefill activations.
     pub cmem_reserve: Vec<u64>,
@@ -180,7 +185,7 @@ impl Driver {
             m.clone(),
             vp,
             Place {
-                hbm_base: Some(vlm.hbm_end()),
+                hbm_next: Some(vlm.hbm_end()),
                 act_base: Some(vlm.act_end()),
                 out_x: Some(vlm.x_in()),
             },
@@ -196,9 +201,8 @@ impl Driver {
             .map(|c| if copies.contains(&c.mem) { used } else { 0 })
             .collect();
         ap.cmem_reserve = reserve.clone();
-        let (_, layer_stride, _) = adamoe::hbm_map(&m, &ap)?;
-        let action_w = (layer_stride * ap.layers as u64, ap.steps);
-        let hbm_rate = m.hbm_node.as_ref().map_or(1.0, |h| h.rate);
+        let action_w = (adamoe::hbm_map(&m, &ap)?.weight_bytes, ap.steps);
+        let hbm_rate = m.hbm_rate();
         let action = adamoe::Driver::new(m, ap)?;
         if vlm.kv() != action.kv() {
             return Err(format!(
@@ -281,6 +285,7 @@ impl Driver {
                     w_once_bytes: once,
                     weights_once_bound,
                     own_traffic_bound: (hbm as f64 / hbm_rate).ceil() as u64,
+                    hbm_by_gpc: Vec::new(),
                 }
             };
         let (v, l, a) = (
@@ -288,7 +293,12 @@ impl Driver {
             lr.borrow().clone(),
             action_report.borrow().clone(),
         );
-        let stages = vec![
+        let splits = [
+            v.hbm_by_gpc.clone(),
+            l.hbm_by_gpc.clone(),
+            a.hbm_by_gpc.clone(),
+        ];
+        let mut stages = vec![
             stage(
                 "vision",
                 t0,
@@ -317,8 +327,18 @@ impl Driver {
                 None,
             ),
         ];
+        let mut all = splits[0].clone();
+        for (st, sp) in stages.iter_mut().zip(&splits) {
+            st.hbm_by_gpc = sp.clone();
+        }
+        for sp in &splits[1..] {
+            for (t, x) in all.iter_mut().zip(sp) {
+                t.local += x.local;
+                t.remote += x.remote;
+            }
+        }
         let sum = |f: fn(&Stage) -> u64| stages.iter().map(f).sum::<u64>();
-        let total = stage(
+        let mut total = stage(
             "total",
             t0,
             t3,
@@ -327,6 +347,7 @@ impl Driver {
             sum(|s| s.w_once_bytes),
             Some(sum(|s| s.roofline)),
         );
+        total.hbm_by_gpc = all;
         let mut r = report.borrow_mut();
         r.stages = stages;
         r.total = total;

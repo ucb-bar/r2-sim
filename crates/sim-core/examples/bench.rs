@@ -44,7 +44,7 @@ fn main() {
     sim.add_memory(MemBlock {
         name: "dram".into(),
         owner: device,
-        attach: None,
+        attach: Vec::new(),
         numeric: true,
         range: Range::new(0, SPAN),
         port: dram_port,
@@ -80,7 +80,7 @@ fn main() {
         sim.add_memory(MemBlock {
             name: format!("smem{i}"),
             owner: nu,
-            attach: None,
+            attach: Vec::new(),
             numeric: true,
             range: Range::new(smem, smem + SPAN),
             port: smem_port,
@@ -96,6 +96,7 @@ fn main() {
                 params: PeParams::Dma {
                     links: vec![link],
                     latency: 50,
+                    masters: Vec::new(),
                 },
             },
         );

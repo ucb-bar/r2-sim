@@ -2,11 +2,23 @@
 //!
 //! A file has two sections, `global` and `device` (the root node). Every
 //! node has the sections `fabric`, `memory`, `compute`, `neutrino` and
-//! `children`; a child entry has a `name`, an optional `bridge` to a
-//! parent bus, and either its sections inline or `config: FILE`, a file
-//! (relative to the including file) that holds them. A file may instead
-//! be `base: FILE` plus `set: [PATH=VALUE, ...]`: the base configuration
-//! with overrides.
+//! `children`, and every node but the root a `bridge`. A child entry has a
+//! `name` and either its sections inline or `config: FILE`, a file
+//! (relative to the including file) that holds them; other keys of the
+//! entry override the file's (mappings merge key by key, anything else is
+//! replaced). A file may instead be `base: FILE` plus `set: [PATH=VALUE,
+//! ...]`: the base configuration with overrides. The loader flattens the
+//! includes, applies the overrides, resolves names, then builds.
+//!
+//! Fabric: a bus is a data bus, or a control bus with `control: true`
+//! (protocol messages). A node's `bridge: {data, control, bw_bytes,
+//! control_bw_bytes, latency}` joins its first data bus to the parent data
+//! bus `data` and its first control bus to the parent control bus
+//! `control`, each with one resource per direction (`control_bw_bytes`
+//! defaults to `bw_bytes`). `slave` (memories) and `master` (compute, and
+//! the Neutrino) are a bus or a list of buses; the default Neutrino master
+//! is the node's first control bus and every data bus. A transfer takes
+//! the route with the fewest bridges among them.
 //!
 //! Every element has a dotted name from the root (`root.gpc0.sm1.atlas`);
 //! `$this` and `$parent` in a bus reference name the node being defined
@@ -24,8 +36,7 @@
 //!   latency), `flow` (readyvalid | ticket), `hop_queue` (messages one
 //!   hop stage holds per protocol class, default 1: a pipeline register,
 //!   not a buffer to size).
-//! * buses and bridges: `control_bytes` (control lane; default 1/8 of
-//!   `bw_bytes`). A bus or bridge without `bw_bytes` is unlimited.
+//! * buses and bridges: a bus or bridge without `bw_bytes` is unlimited.
 //! * nodes: `fidelity` (null | numeric; inherited; the root defaults to
 //!   null).
 //! * `neutrino`: every key of [`NeutrinoConfig`] (`scoreboard`, `execution`, `pending`,
@@ -33,15 +44,15 @@
 //!   `issue_headroom` (default: the node's number of compute elements), `t_retry`,
 //!   `c_invoke`, `c_wait`, `c_version`, `c_vreset`, `c_complete`,
 //!   `c_load`, `c_store`, `c_spawn`, `c_resolve`, `scalar_rate`,
-//!   `complete_rate`).
+//!   `complete_rate`), and `master`.
 //! * compute: `utilization` (tensor and vector), `inflight` and
 //!   `outstanding` on every type (default 1).
 //!
 //! Addressing: an address is [field 1] .. [field n] [offset]. A child's
 //! field value is its index among its parent's children plus one; value 0
-//! at a level is the parent's own space. Scratch and sync ranges are
-//! offsets inside the node's own space; dram and cache ranges are global.
-//! A node owns its scratch, dram and sync ranges.
+//! at a level is the parent's own space. Scratch, dram and sync ranges are
+//! offsets inside the node's own space; cache ranges are global. A node
+//! owns its scratch, dram and sync ranges.
 //!
 //! Rates and sizes: YAML numbers, or strings with a rational ("2/3") or a
 //! unit ("512 KiB").
@@ -58,7 +69,7 @@ use crate::profile::{Dtype, PeId, ProfileRegistry};
 use crate::resource::{Kind, ResourceId};
 use crate::sim::Sim;
 use crate::time::Ratio;
-use crate::topology::{BusId, BusTopology, Lane};
+use crate::topology::{BusId, BusTopology};
 
 /// A configuration that cannot be loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +154,7 @@ fn expand_node(node: &mut Value, dir: &Path) -> Result<(), ConfigError> {
                     ));
                 }
                 for (k, v) in std::mem::take(entry) {
-                    inc.insert(k, v);
+                    merge(&mut inc, k, v);
                 }
                 *entry = inc;
                 dir_of(&path)
@@ -152,6 +163,20 @@ fn expand_node(node: &mut Value, dir: &Path) -> Result<(), ConfigError> {
         expand_node(c, &child_dir)?;
     }
     Ok(())
+}
+
+/// Sets key `k` of `m` to `v`; two mappings merge key by key.
+fn merge(m: &mut Mapping, k: Value, v: Value) {
+    match (m.get_mut(&k), v) {
+        (Some(Value::Mapping(old)), Value::Mapping(new)) => {
+            for (k2, v2) in new {
+                merge(old, k2, v2);
+            }
+        }
+        (_, v) => {
+            m.insert(k, v);
+        }
+    }
 }
 
 /// One override path component: a name pattern and list indexes.
@@ -379,19 +404,41 @@ struct BusSec {
     name: String,
     topology: Option<String>,
     bw_bytes: Option<Num>,
-    control_bytes: Option<Num>,
     #[serde(default)]
     latency: u64,
+    /// A control bus (protocol messages).
+    #[serde(default)]
+    control: bool,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BridgeSec {
-    bus: String,
+    /// The parent data bus.
+    data: String,
+    /// The parent control bus.
+    control: String,
     bw_bytes: Option<Num>,
-    control_bytes: Option<Num>,
+    control_bw_bytes: Option<Num>,
     #[serde(default)]
     latency: u64,
+}
+
+/// A bus reference or a list of them.
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+enum Buses {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Buses {
+    fn list(&self) -> Vec<&str> {
+        match self {
+            Buses::One(s) => vec![s.as_str()],
+            Buses::Many(v) => v.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -405,7 +452,7 @@ struct MemSec {
     bw_bytes: Option<Num>,
     #[serde(default)]
     latency: u64,
-    slave: Option<String>,
+    slave: Option<Buses>,
     master: Option<String>,
 }
 
@@ -433,6 +480,7 @@ struct NuSec {
     c_resolve: Option<u64>,
     scalar_rate: Option<Num>,
     complete_rate: Option<Num>,
+    master: Option<Buses>,
 }
 
 #[derive(Deserialize)]
@@ -451,7 +499,7 @@ struct CompSec {
     latency: Option<u64>,
     inflight: Option<u32>,
     outstanding: Option<u32>,
-    master: Option<String>,
+    master: Option<Buses>,
 }
 
 /// A number: a YAML integer or float, or a string with a unit or a ratio.
@@ -665,10 +713,10 @@ fn resolve(name: &str, this: &str, parent: Option<&str>) -> Result<String, Confi
     Ok(name.to_string())
 }
 
-/// A memory block whose bus is resolved at the end.
+/// A memory block whose buses are resolved at the end.
 struct PendingMem {
     block: MemBlock,
-    slave: String,
+    slaves: Vec<String>,
 }
 
 /// A cache: a bridge from its slave bus to its master bus through its port.
@@ -796,10 +844,7 @@ impl Builder {
         }
         for c in std::mem::take(&mut self.caches) {
             let (a, b) = (self.bus(&c.slave, &c.name)?, self.bus(&c.master, &c.name)?);
-            let lane = Lane {
-                data: Some(c.port),
-                ctl: None,
-            };
+            let lane = Some(c.port);
             let short = c.name.rsplit('.').next().unwrap_or(&c.name).to_string();
             self.built
                 .sim
@@ -807,9 +852,11 @@ impl Builder {
         }
         for m in std::mem::take(&mut self.mems) {
             let mut block = m.block;
-            let bus = self.bus(&m.slave, &block.name)?;
             let short = block.name.rsplit('.').next().unwrap_or("").to_string();
-            block.attach = Some(self.built.sim.attach(bus, &short));
+            for slave in &m.slaves {
+                let bus = self.bus(slave, &block.name)?;
+                block.attach.push(self.built.sim.attach(bus, &short, true));
+            }
             self.built.sim.add_memory(block);
         }
         self.built.sim.finish_fabric().map_err(ConfigError)?;
@@ -863,11 +910,13 @@ impl Builder {
                 if b <= a {
                     return err(format!("{path}.{}: empty range", m.name));
                 }
-                let r = match m.kind.as_str() {
-                    "scratch" | "sync" => Range::new(base + a, base + b),
-                    _ => Range::new(a, b),
+                let local = matches!(m.kind.as_str(), "scratch" | "dram" | "sync");
+                let r = if local {
+                    Range::new(base + a, base + b)
+                } else {
+                    Range::new(a, b)
                 };
-                if matches!(m.kind.as_str(), "scratch" | "sync") && !own.covers(&r) {
+                if local && !own.covers(&r) {
                     return err(format!("{path}.{}: {r} is outside its space {own}", m.name));
                 }
                 match m.kind.as_str() {
@@ -882,39 +931,28 @@ impl Builder {
                 }
             }
         }
-        // Bridge lanes first (the order of the tree model's link resources).
+        // Bridge resources first: data, then control.
         let bridge = match (parent, &sec.bridge) {
             (None, _) => None,
             (Some(_), None) => return err(format!("{path}: a child needs a bridge")),
             (Some(_), Some(br)) => {
-                let target = resolve(&br.bus, &path, ppath)?;
-                let bus = self.bus(&target, &path)?;
-                let lanes = match opt_rate(&br.bw_bytes)? {
-                    None => (Lane::default(), Lane::default()),
-                    Some(rate) => {
-                        let ctl = opt_rate(&br.control_bytes)?
-                            .unwrap_or_else(|| super::default_control(rate));
-                        let r = self.built.sim.resources_mut();
-                        let up = r.add_flow(&format!("{path}.bridge.up"), Kind::Bandwidth, rate);
-                        let down =
-                            r.add_flow(&format!("{path}.bridge.down"), Kind::Bandwidth, rate);
-                        let up_ctl =
-                            r.add_flow(&format!("{path}.bridge.up.ctl"), Kind::Bandwidth, ctl);
-                        let down_ctl =
-                            r.add_flow(&format!("{path}.bridge.down.ctl"), Kind::Bandwidth, ctl);
-                        (
-                            Lane {
-                                data: Some(up),
-                                ctl: Some(up_ctl),
-                            },
-                            Lane {
-                                data: Some(down),
-                                ctl: Some(down_ctl),
-                            },
-                        )
-                    }
-                };
-                Some((bus, lanes, br.latency))
+                let data = self.bus(&resolve(&br.data, &path, ppath)?, &path)?;
+                let control = self.bus(&resolve(&br.control, &path, ppath)?, &path)?;
+                if self.built.sim.topology().bus(data).control
+                    || !self.built.sim.topology().bus(control).control
+                {
+                    return err(format!(
+                        "{path}: bridge data must be a data bus and control a control bus"
+                    ));
+                }
+                let rate = opt_rate(&br.bw_bytes)?;
+                let ctl_rate = opt_rate(&br.control_bw_bytes)?.or(rate);
+                let r = &mut self.built.sim;
+                let up = r.lane(&format!("{path}.bridge.up"), rate);
+                let down = r.lane(&format!("{path}.bridge.down"), rate);
+                let up_ctl = r.lane(&format!("{path}.bridge.up.ctl"), ctl_rate);
+                let down_ctl = r.lane(&format!("{path}.bridge.down.ctl"), ctl_rate);
+                Some((data, control, (up, down), (up_ctl, down_ctl), br.latency))
             }
         };
         let Some(nsec) = &sec.neutrino else {
@@ -946,7 +984,8 @@ impl Builder {
             self.built.sim.add_sync_only(r);
             self.built.sync_only.insert(nu, r);
         }
-        // Buses; the first one is the Neutrino's.
+        // Buses.
+        let mut own_buses = Vec::new();
         for b in &sec.fabric {
             let name = format!("{path}.{}", b.name);
             let topology = match b.topology.as_deref().unwrap_or("xbar") {
@@ -959,23 +998,60 @@ impl Builder {
                 &name,
                 topology,
                 opt_rate(&b.bw_bytes)?,
-                opt_rate(&b.control_bytes)?,
                 b.latency,
+                b.control,
             );
             if self.buses.insert(name.clone(), id).is_some() {
                 return err(format!("{name}: two buses of this name"));
             }
+            own_buses.push((name, id, b.control));
         }
-        let Some(hub) = sec.fabric.first() else {
-            return err(format!("{path}: no bus in fabric"));
+        let first = |control: bool| own_buses.iter().find(|b| b.2 == control).map(|b| b.1);
+        let (Some(hub_data), Some(hub_ctl)) = (first(false), first(true)) else {
+            return err(format!("{path}: needs a data bus and a control bus"));
         };
-        let hub = self.buses[&format!("{path}.{}", hub.name)];
-        let nu_att = self.built.sim.attach(hub, "neutrino");
-        self.built.sim.set_hub(nu, nu_att);
-        if let Some((bus, (up, down), latency)) = bridge {
-            self.built
-                .sim
-                .add_bridge(hub, "bridge", bus, &sec.name, up, down, latency);
+        // The Neutrino: its control bus (messages) and its data buses (loads
+        // and stores).
+        let masters: Vec<String> = match &nsec.master {
+            Some(m) => m
+                .list()
+                .into_iter()
+                .map(|b| resolve(b, &path, ppath))
+                .collect::<Result<_, _>>()?,
+            None => {
+                let mut v: Vec<String> = own_buses
+                    .iter()
+                    .filter(|b| b.2)
+                    .take(1)
+                    .map(|b| b.0.clone())
+                    .collect();
+                v.extend(own_buses.iter().filter(|b| !b.2).map(|b| b.0.clone()));
+                v
+            }
+        };
+        let mut nu_ctl = None;
+        let mut nu_data = Vec::new();
+        for m in &masters {
+            let bus = self.bus(m, &format!("{path}.neutrino"))?;
+            let att = self.built.sim.attach(bus, "neutrino", true);
+            if self.built.sim.topology().bus(bus).control {
+                if nu_ctl.replace(att).is_some() {
+                    return err(format!("{path}.neutrino: masters two control buses"));
+                }
+            } else {
+                nu_data.push(att);
+            }
+        }
+        let Some(nu_ctl) = nu_ctl else {
+            return err(format!("{path}.neutrino: masters no control bus"));
+        };
+        self.built.sim.set_hub(nu, nu_ctl, nu_data);
+        if let Some((data, control, (up, down), (up_ctl, down_ctl), latency)) = bridge {
+            let sim = &mut self.built.sim;
+            sim.add_bridge(hub_data, "bridge", data, &sec.name, up, down, latency);
+            sim.add_bridge(
+                hub_ctl, "bridge", control, &sec.name, up_ctl, down_ctl, latency,
+            );
         }
         self.memories(sec, &path, ppath, nu, own.base, numeric)?;
         self.compute(sec, &path, ppath, nu)?;
@@ -1007,7 +1083,11 @@ impl Builder {
             let Some(slave) = &m.slave else {
                 return err(format!("{name}: needs slave"));
             };
-            let slave = resolve(slave, path, ppath)?;
+            let slaves: Vec<String> = slave
+                .list()
+                .into_iter()
+                .map(|b| resolve(b, path, ppath))
+                .collect::<Result<_, _>>()?;
             match m.kind.as_str() {
                 "scratch" | "dram" => {
                     if m.master.is_some() {
@@ -1016,33 +1096,37 @@ impl Builder {
                     let [[a, b]] = m.addr.as_slice() else {
                         return err(format!("{name}: needs exactly one addr range"));
                     };
-                    let off = if m.kind == "scratch" { base } else { 0 };
-                    let range = Range::new(off + a.bytes()?, off + b.bytes()?);
+                    let range = Range::new(base + a.bytes()?, base + b.bytes()?);
                     if m.kind == "scratch" {
-                        self.scratch_ports.push((name.clone(), slave.clone(), port));
+                        for sl in &slaves {
+                            self.scratch_ports.push((name.clone(), sl.clone(), port));
+                        }
                     }
                     self.built.memories.insert(name.clone(), range);
                     self.mems.push(PendingMem {
                         block: MemBlock {
                             name,
                             owner: nu,
-                            attach: None,
+                            attach: Vec::new(),
                             numeric,
                             range,
                             port,
                             load_latency: m.latency,
                         },
-                        slave,
+                        slaves,
                     });
                 }
                 "cache" => {
+                    let [slave] = slaves.as_slice() else {
+                        return err(format!("{name}: a cache is a slave on one bus"));
+                    };
                     let Some(master) = &m.master else {
                         return err(format!("{name}: a cache needs master"));
                     };
                     self.caches.push(PendingCache {
                         name,
                         port,
-                        slave,
+                        slave: slave.clone(),
                         master: resolve(master, path, ppath)?,
                         latency: m.latency,
                     });
@@ -1053,13 +1137,22 @@ impl Builder {
         Ok(())
     }
 
-    /// The port of the scratch memory that is a slave on `bus`.
-    fn smem_port(&self, name: &str, bus: &str) -> Result<ResourceId, ConfigError> {
-        let mut it = self.scratch_ports.iter().filter(|s| s.1 == bus);
-        match (it.next(), it.next()) {
-            (Some(s), None) => Ok(s.2),
-            (None, _) => err(format!("{name}: no scratch memory is a slave on {bus}")),
-            (Some(a), Some(b)) => err(format!("{name}: {} and {} are slaves on {bus}", a.0, b.0)),
+    /// The port of the one scratch memory that is a slave on one of
+    /// `buses`.
+    fn smem_port(&self, name: &str, buses: &[String]) -> Result<ResourceId, ConfigError> {
+        let mut found: Vec<&(String, String, ResourceId)> = self
+            .scratch_ports
+            .iter()
+            .filter(|s| buses.contains(&s.1))
+            .collect();
+        found.dedup_by(|a, b| a.0 == b.0);
+        match found.as_slice() {
+            [s] => Ok(s.2),
+            [] => err(format!("{name}: no scratch memory is a slave on {buses:?}")),
+            [a, b, ..] => err(format!(
+                "{name}: {} and {} are slaves on {buses:?}",
+                a.0, b.0
+            )),
         }
     }
 
@@ -1075,8 +1168,16 @@ impl Builder {
             let Some(master) = &c.master else {
                 return err(format!("{name}: needs master"));
             };
-            let master = resolve(master, path, ppath)?;
-            self.bus(&master, &name)?;
+            let masters: Vec<String> = master
+                .list()
+                .into_iter()
+                .map(|b| resolve(b, path, ppath))
+                .collect::<Result<_, _>>()?;
+            let mut atts = Vec::new();
+            for m in &masters {
+                let bus = self.bus(m, &name)?;
+                atts.push(self.built.sim.attach(bus, &c.name, false));
+            }
             let utilization = || opt_rate(&c.utilization).map(|u| u.unwrap_or(Ratio::ONE));
             let params = match c.kind.as_str() {
                 "tensor" => {
@@ -1104,7 +1205,7 @@ impl Builder {
                         Kind::TensorOps,
                         max,
                     );
-                    let smem_port = self.smem_port(&name, &master)?;
+                    let smem_port = self.smem_port(&name, &masters)?;
                     let quantize = match c.quantize.as_deref().unwrap_or("tile") {
                         "tile" => true,
                         "none" => false,
@@ -1141,7 +1242,7 @@ impl Builder {
                     );
                     PeParams::Muon {
                         vector,
-                        smem_port: self.smem_port(&name, &master)?,
+                        masters: atts,
                         utilization: utilization()?,
                         overhead: c.overhead.unwrap_or(0),
                     }
@@ -1149,6 +1250,7 @@ impl Builder {
                 "dma" => PeParams::Dma {
                     links: Vec::new(),
                     latency: c.latency.unwrap_or(0),
+                    masters: atts,
                 },
                 k => return err(format!("{name}: unknown compute type {k:?}")),
             };

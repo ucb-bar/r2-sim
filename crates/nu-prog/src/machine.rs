@@ -1,6 +1,13 @@
 //! The program's view of a built configuration: the SMs with their PEs,
-//! SMEM and sync-only space, and the HBM block. An SM is a node with PEs
-//! named `atlas`, `muon` and `dma` and a scratch block named `smem`.
+//! SMEM and sync-only space, and the HBM slices. An SM is a node with PEs
+//! named `atlas`, `muon` and `dma` and a scratch block named `smem`; an
+//! HBM slice is a block named `hbm` (one per gpc under NUMA, or one at the
+//! device).
+//!
+//! Placement rule for HBM (architecture Section 8.2, NUMA): a tensor goes
+//! to the slice of the gpc whose SMs read it most ([`Machine::slice_for`]);
+//! a tie goes to the lower slice, and a slice without room passes the
+//! tensor to the next one.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -68,14 +75,72 @@ pub(crate) struct MemNode {
     pub(crate) grant: Option<u64>,
 }
 
-/// The program's view of a built configuration: the SMs, the HBM and
-/// cmem owner nodes, the granule and the task opcodes.
+/// Bytes one gpc's SMs moved to or from HBM: from their own gpc's slice
+/// (`local`) or from another slice (`remote`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GpcBytes {
+    /// The gpc's dotted name.
+    pub gpc: String,
+    /// Bytes to or from the gpc's own slice.
+    pub local: u64,
+    /// Bytes to or from other slices.
+    pub remote: u64,
+}
+
+/// Bump allocators over the HBM slices: [`SliceBump::take`] tries the
+/// preferred slice, then the others in order.
+#[derive(Debug, Clone)]
+pub(crate) struct SliceBump {
+    pub(crate) next: Vec<u64>,
+    bound: Vec<u64>,
+    granule: u64,
+}
+
+impl SliceBump {
+    /// From `next` (per slice) to the slices' bounds.
+    pub(crate) fn new(m: &Machine, next: Vec<u64>) -> Self {
+        Self {
+            next,
+            bound: m.hbm.iter().map(|h| h.mem.bound).collect(),
+            granule: m.granule,
+        }
+    }
+
+    /// From the start of every slice.
+    pub(crate) fn start(m: &Machine) -> Self {
+        Self::new(m, m.hbm.iter().map(|h| h.mem.base).collect())
+    }
+
+    /// `bytes` (granule-rounded) in slice `pref`, or the next slice with
+    /// room.
+    pub(crate) fn take(&mut self, pref: usize, bytes: u64) -> Result<u64, String> {
+        let bytes = bytes.div_ceil(self.granule) * self.granule;
+        let n = self.next.len();
+        for k in 0..n {
+            let s = (pref + k) % n;
+            if self.next[s] + bytes <= self.bound[s] {
+                let a = self.next[s];
+                self.next[s] += bytes;
+                return Ok(a);
+            }
+        }
+        Err(format!(
+            "HBM: no slice has {bytes} B free (next {:x?}, bounds {:x?})",
+            self.next, self.bound
+        ))
+    }
+}
+
+/// The program's view of a built configuration: the SMs, the HBM slices
+/// and cmem owner nodes, the granule and the task opcodes.
 #[derive(Debug, Clone)]
 pub struct Machine {
     pub(crate) sms: Vec<Sm>,
-    pub(crate) hbm: Range,
-    /// The owner of HBM.
-    pub(crate) hbm_node: Option<MemNode>,
+    /// HBM slices with their owner nodes, in configuration order.
+    pub(crate) hbm: Vec<MemNode>,
+    /// The parents of the SMs (gpcs), in configuration order, and their
+    /// dotted names.
+    pub(crate) gpcs: Vec<(NeutrinoId, String)>,
     /// Clusters with a cmem block, in configuration order.
     pub(crate) cmem_nodes: Vec<MemNode>,
     pub(crate) granule: u64,
@@ -95,8 +160,7 @@ impl Machine {
         let topo = b.sim.topology();
         let res = b.sim.resources();
         let mut sms = Vec::new();
-        let mut hbm = None;
-        let mut hbm_node = None;
+        let mut hbm = Vec::new();
         let mut cmem_nodes = Vec::new();
         let rate_of = |r: Range| -> f64 {
             b.sim
@@ -124,8 +188,10 @@ impl Machine {
                 })
             };
             if let Some(h) = b.try_memory(&format!("{prefix}.hbm")) {
-                hbm = Some(h);
-                hbm_node = mem_node(h);
+                hbm.push(
+                    mem_node(h)
+                        .ok_or_else(|| format!("{prefix} owns hbm but has no sync space"))?,
+                );
             }
             if let Some(c) = b.try_memory(&format!("{prefix}.cmem")) {
                 cmem_nodes.extend(mem_node(c));
@@ -193,6 +259,17 @@ impl Machine {
                 sync,
             });
         }
+        let mut gpcs: Vec<(NeutrinoId, String)> = Vec::new();
+        for s in &sms {
+            if let Some(c) = s.cluster {
+                if !gpcs.iter().any(|g| g.0 == c) {
+                    gpcs.push((c, topo.path_name(c)));
+                }
+            }
+        }
+        if hbm.is_empty() {
+            return Err("no memory named hbm".into());
+        }
         let reg = b.sim.profiles();
         let owners = (0..topo.len())
             .map(|i| {
@@ -203,8 +280,8 @@ impl Machine {
         Ok(Self {
             versions: Rc::new(RefCell::new(VersionState::new(owners))),
             sms,
-            hbm: hbm.ok_or("no memory named hbm")?,
-            hbm_node,
+            hbm,
+            gpcs,
             cmem_nodes,
             granule,
             dma_op: reg.lookup("dma").ok_or("no dma profile")?,
@@ -215,6 +292,64 @@ impl Machine {
 
     pub(crate) fn round(&self, bytes: u64) -> u64 {
         bytes.div_ceil(self.granule) * self.granule
+    }
+
+    /// The HBM bandwidth of all slices, bytes per cycle.
+    pub(crate) fn hbm_rate(&self) -> f64 {
+        self.hbm.iter().map(|h| h.rate).sum()
+    }
+
+    /// The HBM slice that holds `addr`.
+    pub(crate) fn slice_of(&self, addr: u64) -> Option<usize> {
+        self.hbm
+            .iter()
+            .position(|h| h.mem.covers(&Range::from_len(addr, 1)))
+    }
+
+    /// The slice of the gpc whose SMs among `readers` are the most; a tie
+    /// goes to the lower slice; slice 0 when no reader's gpc owns one.
+    pub(crate) fn slice_for(&self, readers: impl IntoIterator<Item = usize>) -> usize {
+        let mut count = vec![0usize; self.hbm.len()];
+        for sm in readers {
+            if let Some(i) = self.local_slice(sm) {
+                count[i] += 1;
+            }
+        }
+        let best = count.iter().copied().max().unwrap_or(0);
+        count.iter().position(|&c| c == best).unwrap_or(0)
+    }
+
+    /// The slice that SM `sm`'s gpc owns.
+    pub(crate) fn local_slice(&self, sm: usize) -> Option<usize> {
+        let g = self.sms[sm].cluster?;
+        self.hbm.iter().position(|h| h.nu == g)
+    }
+
+    /// Per gpc, no bytes yet.
+    pub(crate) fn gpc_bytes(&self) -> Vec<GpcBytes> {
+        self.gpcs
+            .iter()
+            .map(|g| GpcBytes {
+                gpc: g.1.clone(),
+                ..GpcBytes::default()
+            })
+            .collect()
+    }
+
+    /// Adds `bytes` of SM `sm` at HBM address `addr` to `split`: local
+    /// when the slice is the SM's gpc's.
+    pub(crate) fn count_hbm(&self, split: &mut [GpcBytes], sm: usize, addr: u64, bytes: u64) {
+        let Some(c) = self.sms[sm].cluster else {
+            return;
+        };
+        let Some(g) = self.gpcs.iter().position(|g| g.0 == c) else {
+            return;
+        };
+        if self.slice_of(addr).is_some_and(|s| self.hbm[s].nu == c) {
+            split[g].local += bytes;
+        } else {
+            split[g].remote += bytes;
+        }
     }
 
     pub(crate) fn dma(
@@ -303,6 +438,7 @@ impl Machine {
                 ops,
                 bytes_in,
                 bytes_out,
+                src: None,
             },
         }
     }

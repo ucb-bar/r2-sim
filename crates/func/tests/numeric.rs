@@ -21,7 +21,7 @@ fn numeric() -> Numeric {
         &[MemBlock {
             name: "m".into(),
             owner: nu_model::NeutrinoId(0),
-            attach: None,
+            attach: Vec::new(),
             numeric: true,
             range: Range::new(0x10_0000, 0x30_0000),
             port: ResourceId(0),

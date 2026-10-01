@@ -126,8 +126,8 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
             .unwrap();
         (out, stats)
     };
-    // Doubling the HBM port rate shows in the JSON's HBM rate.
-    let (out, stats) = run("root.hbm.bw_bytes=546");
+    // A faster gpc0 slice shows in the JSON's HBM rate (546 + gpc1's 512).
+    let (out, stats) = run("root.gpc0.hbm.bw_bytes=546");
     assert!(
         out.status.success(),
         "{}",
@@ -135,7 +135,7 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
     );
     let j: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stats).unwrap()).unwrap();
-    assert_eq!(j["hbm_rate_bytes_per_cycle"], 546.0);
+    assert_eq!(j["hbm_rate_bytes_per_cycle"], 1058.0);
     let (out, _) = run("root.nosuch*.smem.bw_bytes=1");
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing matches"));

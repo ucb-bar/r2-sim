@@ -102,19 +102,18 @@ impl Default for NeutrinoConfig {
     }
 }
 
-/// The default control-lane rate: 1/8 of the data rate (Section 3.5).
-pub(crate) fn default_control(data: Ratio) -> Ratio {
-    Ratio::new(data.num, data.den * 8)
-}
-
 /// PE-specific parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeParams {
     /// A DMA engine.
     Dma {
         /// Extra resources on every transfer, in addition to the two memory
-        /// ports and the fabric path between their owners.
+        /// ports and the fabric routes.
         links: Vec<ResourceId>,
+        /// The engine's attachments to the buses it masters: a transfer
+        /// takes the fewest-bridge route from the source block to one of
+        /// them and from one of them to the destination block.
+        masters: Vec<crate::topology::AttachId>,
         /// Latency of every chunk (Section 5.7).
         latency: Cycle,
     },
@@ -149,8 +148,10 @@ pub enum PeParams {
     Muon {
         /// The vector-op resource (lane-ops per cycle).
         vector: ResourceId,
-        /// The SMEM port resource.
-        smem_port: ResourceId,
+        /// The unit's attachments to the buses it masters: a task charges
+        /// the block that holds its `dst`, over the route with the fewest
+        /// bridges.
+        masters: Vec<crate::topology::AttachId>,
         /// Efficiency of the vector resource, in (0, 1].
         utilization: Ratio,
         /// Fixed cycles per task before its demand (launch, reduction tail).
@@ -178,9 +179,9 @@ pub struct MemBlock {
     pub name: String,
     /// The Neutrino whose node holds the block.
     pub owner: NeutrinoId,
-    /// The block's attachment to the bus it is a slave on; fabric routes
-    /// to it end here (`None`: no fabric, an empty route).
-    pub attach: Option<crate::topology::AttachId>,
+    /// The block's attachments to the buses it is a slave on; fabric
+    /// routes to it end at one of them (none: no fabric, an empty route).
+    pub attach: Vec<crate::topology::AttachId>,
     /// False in a `null`-fidelity subtree: the Numeric backend drops writes
     /// and rejects reads.
     pub numeric: bool,

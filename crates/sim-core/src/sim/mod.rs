@@ -253,8 +253,8 @@ pub struct Sim {
     msg_bytes: u64,
     /// Extra cycles per remote-protocol message.
     msg_latency: u64,
-    /// Port rates (data, control) of each bus; `None`: unlimited.
-    bus_rates: Vec<Option<(crate::time::Ratio, crate::time::Ratio)>>,
+    /// Port rate of each bus; `None`: unlimited.
+    bus_rates: Vec<Option<crate::time::Ratio>>,
     /// Cycle of the last task issue or completion.
     last_progress: Cycle,
     /// Idle cycles with continuing replays that stop the run as a retry
@@ -448,68 +448,50 @@ impl Sim {
     }
 
     /// Adds a bus named `name` of `topology` at `rate` bytes per cycle
-    /// (`None`: unlimited, no resources), with control lanes at `control`
-    /// (`None`: 1/8 of `rate`). A shared bus has one lane (`<name>`,
-    /// `<name>.ctl`); an xbar has ports per attachment ([`Sim::attach`]).
+    /// (`None`: unlimited, no resources); `control`: a control bus. A shared
+    /// bus has one resource (`<name>`); an xbar has ports per attachment
+    /// ([`Sim::attach`]).
     pub fn add_bus(
         &mut self,
         name: &str,
         topology: BusTopology,
         rate: Option<crate::time::Ratio>,
-        control: Option<crate::time::Ratio>,
         latency: Cycle,
+        control: bool,
     ) -> BusId {
-        let rates = rate.map(|r| {
-            (
-                r,
-                control.unwrap_or_else(|| crate::config::default_control(r)),
-            )
-        });
         let lane = match topology {
-            BusTopology::Shared => self.lane(name, rates),
-            BusTopology::Xbar => Lane::default(),
+            BusTopology::Shared => self.lane(name, rate),
+            BusTopology::Xbar => None,
         };
-        self.bus_rates.push(rates);
+        self.bus_rates.push(rate);
         self.topo.add_bus(Bus {
             name: name.to_string(),
             topology,
             lane,
             latency,
+            control,
         })
     }
 
-    /// The lanes of one direction named `name` at `rates` (data, control);
-    /// none when unlimited.
-    pub fn lane(
-        &mut self,
-        name: &str,
-        rates: Option<(crate::time::Ratio, crate::time::Ratio)>,
-    ) -> Lane {
-        let Some((rate, ctl)) = rates else {
-            return Lane::default();
-        };
-        Lane {
-            data: Some(self.res.add_flow(name, Kind::Bandwidth, rate)),
-            ctl: Some(
-                self.res
-                    .add_flow(&format!("{name}.ctl"), Kind::Bandwidth, ctl),
-            ),
-        }
+    /// A bandwidth resource named `name` at `rate`; none when unlimited.
+    pub fn lane(&mut self, name: &str, rate: Option<crate::time::Ratio>) -> Lane {
+        rate.map(|r| self.res.add_flow(name, Kind::Bandwidth, r))
     }
 
     /// Attaches `name` to `bus`. On a limited xbar it gets an ingress and
-    /// an egress port at the bus rate (`<bus>.<name>.in`, `.out`, and their
-    /// `.ctl` lanes).
-    pub fn attach(&mut self, bus: BusId, name: &str) -> AttachId {
+    /// an egress port at the bus rate (`<bus>.<name>.in`, `.out`), unless
+    /// `port` is false (a compute master: never a route endpoint that
+    /// charges).
+    pub fn attach(&mut self, bus: BusId, name: &str, port: bool) -> AttachId {
         let b = self.topo.bus(bus);
         let full = format!("{}.{name}", b.name);
-        let rates = self.bus_rates[bus.0 as usize];
+        let rate = self.bus_rates[bus.0 as usize].filter(|_| port);
         let (ingress, egress) = match b.topology {
             BusTopology::Xbar => (
-                self.lane(&format!("{full}.in"), rates),
-                self.lane(&format!("{full}.out"), rates),
+                self.lane(&format!("{full}.in"), rate),
+                self.lane(&format!("{full}.out"), rate),
             ),
-            BusTopology::Shared => (Lane::default(), Lane::default()),
+            BusTopology::Shared => (None, None),
         };
         self.topo.add_attachment(Attachment {
             bus,
@@ -520,7 +502,7 @@ impl Sim {
     }
 
     /// Adds a bridge from `a` (attached as `a_name`) to `b` (attached as
-    /// `b_name`) with the lanes of each direction (`ab` from `a` to `b`).
+    /// `b_name`) with the resource of each direction (`ab` from `a` to `b`).
     #[allow(clippy::too_many_arguments)]
     pub fn add_bridge(
         &mut self,
@@ -532,14 +514,14 @@ impl Sim {
         ba: Lane,
         latency: Cycle,
     ) {
-        let (att_a, att_b) = (self.attach(a, a_name), self.attach(b, b_name));
+        let (att_a, att_b) = (self.attach(a, a_name, true), self.attach(b, b_name, true));
         self.topo.add_bridge(att_a, att_b, ab, ba, latency);
     }
 
-    /// The attachment that Neutrino `nu` sends and receives messages on
-    /// and issues its loads and stores from.
-    pub fn set_hub(&mut self, nu: NeutrinoId, att: AttachId) {
-        self.topo.set_hub(nu, att);
+    /// The attachments of Neutrino `nu`: on its control bus (messages) and
+    /// on its data buses (loads and stores).
+    pub fn set_hub(&mut self, nu: NeutrinoId, control: AttachId, data: Vec<AttachId>) {
+        self.topo.set_hub(nu, control, data);
     }
 
     /// Idle cycles (no issue, no completion) with continuing resends that
@@ -1084,8 +1066,15 @@ impl Sim {
         };
         // Local or remote: the fabric path to the block's node, twice in
         // latency for a load (request and data), once for a store.
-        let (port, att, block_latency) = (mem.port, mem.attach, mem.load_latency);
-        let path = self.topo.attach_path(self.topo.hub(nu), att).clone();
+        let (port, block_latency) = (mem.port, mem.load_latency);
+        let Some(path) = self
+            .topo
+            .best_path(self.topo.data_hub(nu), &mem.attach)
+            .cloned()
+        else {
+            let msg = format!("no data route from {:?} to {}", nu, mem.name);
+            return self.fatal(nu, None, FatalError::Invalid(msg));
+        };
         let trips = if matches!(req, Request::Load { .. }) {
             2
         } else {

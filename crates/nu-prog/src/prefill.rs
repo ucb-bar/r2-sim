@@ -40,7 +40,7 @@ use crate::graph::{excess_deps, with_deps, Graph, MAX_JOIN_DEPS};
 use crate::kv::KvLayout;
 use crate::label::{self, Kind};
 use crate::machine::{
-    parse_dtype, with_b_dtype, worker_list, Layout, Machine, MemNode, SmRates, SyncPool,
+    parse_dtype, with_b_dtype, worker_list, Layout, Machine, MemNode, SliceBump, SmRates, SyncPool,
 };
 
 /// Program parameters (a TOML file, every key optional).
@@ -96,6 +96,10 @@ pub struct Params {
     /// next pass waits for this pass's out writes. Faster on one VLM layer
     /// on all four item-4 configurations.
     pub single_accumulator: bool,
+    /// How weights spread over the HBM slices: "interleave" (128-column
+    /// blocks round-robin over the slices) or "one" (each tensor in one
+    /// slice, alternating in allocation order).
+    pub weight_slices: String,
     /// Query rows per attention unit; 0 = the largest that fits.
     pub q_tile: u64,
     /// Keys per K/V block in flash attention.
@@ -153,6 +157,7 @@ impl Default for Params {
             quantize: true,
             pass_overhead: 150.0,
             single_accumulator: true,
+            weight_slices: "interleave".into(),
             q_tile: 0,
             key_block: 128,
             dma_chunk: 64 << 10,
@@ -327,8 +332,15 @@ pub struct CostEnv {
     pub hbm_rate: f64,
     /// Activation memory port rate, bytes per cycle.
     pub act_rate: f64,
-    /// Activations share the HBM port.
+    /// Activations share the HBM port (of the slice `act_slice`).
     pub act_in_hbm: bool,
+    /// Port rate of every HBM slice (weights spread over all of them).
+    pub slice_rates: Vec<f64>,
+    /// The slice that holds the activations, if they are in HBM.
+    pub act_slice: Option<usize>,
+    /// Per slice: the index in `cluster_links` of the gpc that owns it
+    /// (`None`: a slice outside every worker cluster).
+    pub slice_cluster: Vec<Option<usize>>,
     /// The Atlas works on whole 128 x 128 tiles.
     pub quantize: bool,
     /// Fixed cycles per pass on an SM's critical path.
@@ -532,7 +544,23 @@ fn estimate(
     let out = s.n * s.c * 2 * if s.residual { 2 } else { 1 };
     let w = mats * blocks * s.w.bytes_for(s.k * 128) * tg;
     let copies = e.act_copies.max(1) as u64;
-    let (hbm, act) = if e.act_in_hbm {
+    let ns = e.slice_rates.len();
+    let (hbm, act) = if ns > 1 {
+        // Weights spread over the slices; the activations in one of them.
+        let per = w as f64 / ns as f64;
+        let t = (0..ns)
+            .map(|i| {
+                let extra = if e.act_slice == Some(i) { a + out } else { 0 };
+                (per + extra as f64) / e.slice_rates[i].max(1e-9)
+            })
+            .fold(0.0, f64::max);
+        let act = if e.act_in_hbm {
+            0.0
+        } else {
+            (a + out * copies) as f64 / (e.act_rate * copies as f64)
+        };
+        (t, act)
+    } else if e.act_in_hbm {
         ((w + a + out) as f64 / e.hbm_rate, 0.0)
     } else {
         // Reads spread over the copies; every copy takes every write.
@@ -549,7 +577,22 @@ fn estimate(
     let mut out_of = vec![0u64; e.cluster_links.len()];
     for &c in e.worker_cluster.iter().take(used) {
         let local = e.cluster_links[c].2;
-        down[c] += w_sm + if local { 0 } else { a_in + res };
+        // Weights: the share in the cluster's own slice stays inside it;
+        // a share in another cluster's slice leaves that cluster too.
+        if ns > 1 {
+            let part = w_sm / ns as u64;
+            for owner in &e.slice_cluster {
+                if *owner != Some(c) {
+                    down[c] += part;
+                    if let Some(o) = *owner {
+                        up[o] += part;
+                    }
+                }
+            }
+        } else {
+            down[c] += w_sm;
+        }
+        down[c] += if local { 0 } else { a_in + res };
         up[c] += if local {
             // Writes to the other clusters' copies.
             link_out * (copies - 1)
@@ -717,7 +760,11 @@ impl Tensor {
 /// Weights `[C/128][K][128]` in the weight type.
 #[derive(Debug, Clone, Copy)]
 struct Weights {
-    base: u64,
+    /// Where the column blocks start: block `cb` at
+    /// `bases[cb % n] + (cb / n) * block` for the first `n` bases (one
+    /// base: contiguous; one per HBM slice: interleaved by block).
+    bases: [u64; MAX_SLICES],
+    n: u64,
     k: u64,
     c: u64,
     /// Bytes per 128-column block (granule-rounded).
@@ -726,12 +773,16 @@ struct Weights {
 
 impl Weights {
     fn chunk(&self, w: Dtype, cb: u64, k0: u64, kw: u64) -> (u64, u64) {
+        let n = self.n;
         (
-            self.base + cb * self.block + w.bytes_for(k0 * 128),
+            self.bases[(cb % n) as usize] + (cb / n) * self.block + w.bytes_for(k0 * 128),
             w.bytes_for(kw * 128),
         )
     }
 }
+
+/// The most HBM slices a weight interleaves over.
+const MAX_SLICES: usize = 8;
 
 /// Where a GEMM writes.
 #[derive(Debug, Clone, Copy)]
@@ -797,6 +848,9 @@ pub struct Report {
     pub layer_end: Vec<u64>,
     /// Bytes read from or written to HBM.
     pub hbm_bytes: u64,
+    /// The same bytes per gpc of the SM that read or wrote them: from its
+    /// own gpc's slice or from another.
+    pub hbm_by_gpc: Vec<crate::machine::GpcBytes>,
     /// Bytes read from or written to cmem.
     pub cmem_bytes: u64,
     /// Weight bytes streamed, and the weights of every GEMM run counted
@@ -846,7 +900,8 @@ pub struct Driver {
     /// Copies of the activations: (cluster, address delta from the
     /// primary, owner node); the primary first.
     copies: Vec<(Option<NeutrinoId>, i64, Node)>,
-    hbm_node: Node,
+    /// HBM slices: the memory nodes `0..hbm_slices`.
+    hbm_slices: usize,
     kv: KvLayout,
     budget: u64,
     /// Per-window counters.
@@ -859,15 +914,17 @@ pub struct Driver {
     place: Place,
     /// The roofline of the GEMM being built.
     roof: Option<Roofline>,
-    /// Ends of this driver's HBM weights and of its activations.
-    ends: (u64, u64),
+    /// Ends of this driver's HBM weights (per slice) and of its
+    /// activations.
+    ends: (Vec<u64>, u64),
 }
 
 /// Where a driver's weights and activations start, and where the vision
 /// projector writes (the VLM input); `None` = the standalone defaults.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Place {
-    pub hbm_base: Option<u64>,
+    /// Next free address per HBM slice.
+    pub hbm_next: Option<Vec<u64>>,
     pub act_base: Option<u64>,
     pub out_x: Option<u64>,
 }
@@ -933,19 +990,26 @@ impl Driver {
         let workers = worker_list(m.sms.len(), p.home, &p.workers)?;
         let w_dtype = parse_dtype(&p.weight_dtype)?;
         let order = Order::parse(&p.order)?;
-        let hbm = m
-            .hbm_node
-            .clone()
-            .ok_or("no owner node with a sync space for HBM")?;
-        let mut mem_nodes = vec![hbm];
+        let hbm_slices = m.hbm.len();
+        let mut mem_nodes = m.hbm.clone();
         mem_nodes.extend(m.cmem_nodes.iter().cloned());
+        // Activations in HBM: the slice of most workers' gpc (they are
+        // written and read by every worker).
+        let act_hbm = m.slice_for(workers.iter().copied());
         let act_idx = match p.act_mem.as_str() {
-            "hbm" => 0,
+            "hbm" => act_hbm,
             "cmem" if m.cmem_nodes.is_empty() => return Err("act_mem cmem without cmem".into()),
-            "cmem" => 1,
-            "auto" => usize::from(!m.cmem_nodes.is_empty()),
+            "cmem" => hbm_slices,
+            "auto" if m.cmem_nodes.is_empty() => act_hbm,
+            "auto" => hbm_slices,
             s => return Err(format!("unknown act_mem {s:?}")),
         };
+        if !["interleave", "one"].contains(&p.weight_slices.as_str()) {
+            return Err(format!(
+                "unknown weight_slices {:?} (interleave, one)",
+                p.weight_slices
+            ));
+        }
         if mem_nodes.iter().any(|x| x.dma.is_none()) {
             return Err("the prefill needs a copy engine at each memory owner (HBM, cmem)".into());
         }
@@ -962,7 +1026,8 @@ impl Driver {
             p.smem_budget
         };
         // HBM map: the action expert's weights and KV first, then ours.
-        let (_, _, kv) = crate::adamoe::hbm_map(&m, &p.action)?;
+        let action_map = crate::adamoe::hbm_map(&m, &p.action)?;
+        let kv = action_map.kv;
         if p.model == "vlm" {
             let n_tok = vlm_tokens(&p);
             if kv.prefix != n_tok
@@ -983,11 +1048,11 @@ impl Driver {
             act_node: sms + act_idx,
             act_region: Range::from_len(0, 0),
             copies: Vec::new(),
-            hbm_node: sms,
+            hbm_slices,
             plan: Plan::empty(),
             place,
             roof: None,
-            ends: (0, 0),
+            ends: (action_map.next.clone(), 0),
             m,
             p,
             model,
@@ -1003,12 +1068,13 @@ impl Driver {
             joins: 0,
             report: Rc::new(RefCell::new(Report::default())),
         };
+        d.report.borrow_mut().hbm_by_gpc = d.m.gpc_bytes();
         // Activation copies: one per cmem cluster, at the same offset.
         let am = d.mem_nodes[act_idx].clone();
         d.act_region = am.mem;
-        d.copies = vec![((act_idx > 0).then_some(am.nu), 0, d.act_node)];
-        if act_idx > 0 && d.p.act_copies {
-            for (i, mn) in d.mem_nodes.iter().enumerate().skip(1) {
+        d.copies = vec![(Some(am.nu), 0, d.act_node)];
+        if act_idx >= hbm_slices && d.p.act_copies {
+            for (i, mn) in d.mem_nodes.iter().enumerate().skip(hbm_slices) {
                 if i != act_idx {
                     d.copies.push((
                         Some(mn.nu),
@@ -1056,16 +1122,45 @@ impl Driver {
     /// activation memory: after the KV cache and from the start of the
     /// activation memory, or where `place` says (the forward pass lays out
     /// both models in one map).
-    fn make_plan(&self) -> Result<(Plan, u64, u64), String> {
+    fn make_plan(&self) -> Result<(Plan, Vec<u64>, u64), String> {
         let g = self.m.granule;
         let w = self.w_dtype;
         let md = self.model;
-        let hbm_base = self.place.hbm_base.unwrap_or(self.kv.end());
-        let mut hbm = Bump::new(hbm_base, self.m.hbm.bound, g, "HBM");
+        let next = self.place.hbm_next.clone().unwrap_or(self.ends.0.clone());
+        let mut hbm = SliceBump::new(&self.m, next);
+        let n_slices = self.m.hbm.len() as u64;
+        if n_slices as usize > MAX_SLICES {
+            return Err(format!("more than {MAX_SLICES} HBM slices"));
+        }
+        let interleave = self.p.weight_slices == "interleave";
+        let mut tensors = 0u64;
+        // Prefill weights are read by every worker, through a grid chosen
+        // per GEMM: interleaved by 128-column block over the slices
+        // (`weight_slices = "interleave"`), or each tensor whole in one
+        // slice, alternating in allocation order ("one").
         let mut weights = |k: u64, c: u64| -> Result<Weights, String> {
             let block = w.bytes_for(k * 128).div_ceil(g) * g;
-            let base = hbm.take(c.div_ceil(128) * block)?;
-            Ok(Weights { base, k, c, block })
+            let blocks = c.div_ceil(128);
+            let mut bases = [0u64; MAX_SLICES];
+            let n = if interleave {
+                for s in 0..n_slices {
+                    let count = blocks / n_slices + u64::from(s < blocks % n_slices);
+                    bases[s as usize] = hbm.take(s as usize, count.max(1) * block)?;
+                }
+                n_slices
+            } else {
+                let s = (tensors % n_slices) as usize;
+                tensors += 1;
+                bases[0] = hbm.take(s, blocks * block)?;
+                1
+            };
+            Ok(Weights {
+                bases,
+                n,
+                k,
+                c,
+                block,
+            })
         };
         let vlm = self.p.model == "vlm";
         let qd = md.heads * md.head_dim;
@@ -1150,9 +1245,9 @@ impl Driver {
         self.kv
     }
 
-    /// End of this driver's weights in HBM.
-    pub(crate) fn hbm_end(&self) -> u64 {
-        self.ends.0
+    /// End of this driver's weights in every HBM slice.
+    pub(crate) fn hbm_end(&self) -> Vec<u64> {
+        self.ends.0.clone()
     }
 
     /// End of this driver's activations.
@@ -1162,7 +1257,7 @@ impl Driver {
 
     /// The cmem blocks holding a copy of the activations (empty in HBM).
     pub(crate) fn act_copy_mems(&self) -> Vec<Range> {
-        if self.act_node == self.hbm_node {
+        if self.act_node < self.m.sms.len() + self.hbm_slices {
             return Vec::new();
         }
         self.copies
@@ -1277,11 +1372,13 @@ impl Driver {
             .expect("address in a memory node")
     }
 
-    fn count_bytes(&mut self, addr: u64, bytes: u64) {
+    /// Bytes `sm` moves to or from the shared memory at `addr`.
+    fn count_bytes(&mut self, sm: usize, addr: u64, bytes: u64) {
         let node = self.node_of_mem(addr);
         let mut r = self.report.borrow_mut();
-        if node == self.hbm_node {
+        if node < self.m.sms.len() + self.hbm_slices {
             r.hbm_bytes += bytes;
+            self.m.count_hbm(&mut r.hbm_by_gpc, sm, addr, bytes);
         } else {
             r.cmem_bytes += bytes;
         }
@@ -1298,7 +1395,7 @@ impl Driver {
         lab: u64,
     ) {
         let src = self.local(sm, src);
-        self.count_bytes(src, bytes);
+        self.count_bytes(sm, src, bytes);
         let d = self.m.dma(sm, src, dst, bytes, self.p.dma_chunk);
         let d = with_deps(d, deps, lab);
         self.add(sm, d);
@@ -1340,7 +1437,7 @@ impl Driver {
         ready: Range,
         lab: u64,
     ) -> Range {
-        self.count_bytes(dst.base, bytes);
+        self.count_bytes(sm, dst.base, bytes);
         let owner = self.node_of_mem(dst.base);
         let pe: PeId = self.mem_nodes[owner - self.m.sms.len()]
             .dma
@@ -1375,7 +1472,7 @@ impl Driver {
 
     fn cost_env(&self) -> CostEnv {
         let am = self.act_node_mem();
-        let act_cluster = (self.act_node != self.hbm_node).then_some(am.nu);
+        let act_cluster = Some(am.nu);
         let mut clusters: Vec<Option<NeutrinoId>> = Vec::new();
         let mut cluster_links = Vec::new();
         let worker_cluster = self
@@ -1410,7 +1507,16 @@ impl Driver {
             sm: self.m.sms[self.workers[0]].rates,
             hbm_rate: self.hbm_rate(),
             act_rate: self.act_rate(),
-            act_in_hbm: self.act_node == self.hbm_node,
+            act_in_hbm: self.act_node < self.m.sms.len() + self.hbm_slices,
+            slice_rates: self.m.hbm.iter().map(|h| h.rate).collect(),
+            act_slice: (self.act_node < self.m.sms.len() + self.hbm_slices)
+                .then(|| self.act_node - self.m.sms.len()),
+            slice_cluster: self
+                .m
+                .hbm
+                .iter()
+                .map(|h| clusters.iter().position(|&c| c == Some(h.nu)))
+                .collect(),
             quantize: self.p.quantize,
             pass_overhead: self.p.pass_overhead,
             cw: self.p.cw,
@@ -1431,7 +1537,7 @@ impl Driver {
     }
 
     fn hbm_rate(&self) -> f64 {
-        self.mem_nodes[0].rate
+        self.m.hbm_rate()
     }
 
     /// Builds one GEMM phase into the window; returns the grid and the

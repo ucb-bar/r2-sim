@@ -3,5 +3,5 @@
 # plus 128 B elements per cycle of K; 2p.yaml has 256).
 base: 2p.yaml
 set:
-  - "root.*.*.smem.addr=[[0x0, 0x200000]]"
-  - root.*.*.smem.bw_bytes=512
+  - "root.gpc*.sm*.smem.addr=[[0x0, 0x200000]]"
+  - root.gpc*.sm*.smem.bw_bytes=512

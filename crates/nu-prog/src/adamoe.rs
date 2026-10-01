@@ -40,7 +40,9 @@ use sim_core::{Descriptor, Dtype, NuCtx};
 use crate::graph::{excess_deps, with_deps, Graph, TaskIx, MAX_JOIN_DEPS};
 use crate::kv::KvLayout;
 use crate::label::{self, Kind};
-use crate::machine::{parse_dtype, with_b_dtype, worker_list, Layout, Machine, SyncPool};
+use crate::machine::{
+    parse_dtype, with_b_dtype, worker_list, Layout, Machine, SliceBump, SyncPool,
+};
 
 /// Program parameters (a TOML file, every key optional).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -190,6 +192,9 @@ pub struct Report {
     pub step_end: Vec<u64>,
     /// Bytes streamed from HBM (weights and KV).
     pub hbm_bytes: u64,
+    /// The same bytes per gpc of the reading SM: from its own gpc's slice
+    /// or from another.
+    pub hbm_by_gpc: Vec<crate::machine::GpcBytes>,
     /// Of those, bytes loaded again by more than one attention SM (MQA K/V
     /// projection weights and the prefix KV).
     pub mqa_dup_bytes: u64,
@@ -270,8 +275,8 @@ struct HomeBufs {
 
 /// HBM addresses of the weights and the KV cache.
 struct Hbm {
-    base: u64,
-    layer_stride: u64,
+    /// Per layer, the address of every weight block (see [`hbm_map`]).
+    blocks: Vec<Vec<u64>>,
     bb: u64,
     hpb: u64,
     nb: u64,
@@ -280,7 +285,7 @@ struct Hbm {
 
 impl Hbm {
     fn block(&self, layer: u32, index: u64) -> u64 {
-        self.base + layer as u64 * self.layer_stride + index * self.bb
+        self.blocks[layer as usize][index as usize]
     }
     fn wq(&self, l: u32, head: u64, j: u64) -> u64 {
         self.block(l, head * self.hpb + j)
@@ -354,24 +359,7 @@ impl Driver {
                 p.attn_kv
             ));
         }
-        let workers = worker_list(n, p.home, &p.workers)?;
-        let or = |v: &Vec<usize>| {
-            if v.is_empty() {
-                workers.clone()
-            } else {
-                v.clone()
-            }
-        };
-        let attn_sms = or(&p.attn_sms);
-        let shared_sms = or(&p.shared_sms);
-        let expert_sms = if p.expert_sms.is_empty() {
-            vec![workers.clone(); p.experts as usize]
-        } else {
-            p.expert_sms.clone()
-        };
-        if expert_sms.len() != p.experts as usize {
-            return Err("expert_sms needs one list per routed expert".into());
-        }
+        let (attn_sms, shared_sms, expert_sms) = sm_lists(n, &p)?;
         if !p.head_dim.is_multiple_of(p.block_cols)
             || !p.ffn.is_multiple_of(p.block_cols)
             || !p.d.is_multiple_of(p.block_cols)
@@ -461,14 +449,13 @@ impl Driver {
         };
 
         let nb = p.ffn / p.block_cols;
-        let (base, layer_stride, kv) = hbm_map(&m, &p)?;
+        let map = hbm_map(&m, &p)?;
         let hbm = Hbm {
-            base,
-            layer_stride,
+            blocks: map.blocks,
             bb,
             hpb,
             nb,
-            kv,
+            kv: map.kv,
         };
         let pools = m.sms.iter().map(|s| SyncPool::new(s.sync, g)).collect();
         let mut d = Self {
@@ -482,6 +469,7 @@ impl Driver {
             resident: Default::default(),
             report: Rc::new(RefCell::new(Report {
                 params: Some(p.clone()),
+                hbm_by_gpc: m.gpc_bytes(),
                 ..Report::default()
             })),
             g: Graph::new(m.sms[p.home].own, m.versions.clone()),
@@ -641,14 +629,12 @@ impl Driver {
 
     /// The attention SM of `head` in layer `l`.
     fn head_sm(&self, l: u32, head: u64) -> usize {
-        let off = if self.p.rotate_heads { l as u64 } else { 0 };
-        self.attn_sms[((head + off) % self.attn_sms.len() as u64) as usize]
+        head_sm(&self.p, &self.attn_sms, l, head)
     }
 
     /// Index into an expert's SM list of hidden block `b` in layer `l`.
     fn ffn_slot(&self, l: u32, b: u64, len: usize) -> usize {
-        let off = if self.p.rotate_ffn { l as u64 } else { 0 };
-        ((b + off) % len as u64) as usize
+        ffn_slot(&self.p, l, b, len)
     }
 
     fn blocks_of_class(&self, class: &str, l: u32) -> Vec<(usize, u64)> {
@@ -779,6 +765,7 @@ impl Driver {
                 r.cmem_bytes += b.bytes;
             } else {
                 r.hbm_bytes += b.bytes;
+                self.m.count_hbm(&mut r.hbm_by_gpc, sm, b.from, b.bytes);
             }
         }
     }
@@ -1081,7 +1068,11 @@ impl Driver {
             let dma = self.m.dma(loader, src, lr, bytes, self.p.dma_chunk);
             let lab = label::label(Kind::DmaW, step, l, loader as u32, (src >> 12) as u32);
             self.add(loader, with_deps(dma, &war, lab));
-            self.report.borrow_mut().hbm_bytes += bytes;
+            {
+                let mut r = self.report.borrow_mut();
+                r.hbm_bytes += bytes;
+                self.m.count_hbm(&mut r.hbm_by_gpc, loader, src, bytes);
+            }
             let sig = self.signal(
                 loader,
                 &[Some(lr)],
@@ -1840,28 +1831,106 @@ pub fn expert_prob(
         .collect()
 }
 
-/// The action expert's HBM map: weights from the HBM base (layer-major,
-/// `layer_stride` bytes per layer), then the prefix KV cache.
-pub fn hbm_map(m: &Machine, p: &Params) -> Result<(u64, u64, KvLayout), String> {
+/// The attention, shared-expert and routed-expert SM lists of `p` on `n`
+/// SMs (the workers where `p` leaves them empty).
+fn sm_lists(n: usize, p: &Params) -> Result<SmLists, String> {
+    let workers = worker_list(n, p.home, &p.workers)?;
+    let or = |v: &Vec<usize>| {
+        if v.is_empty() {
+            workers.clone()
+        } else {
+            v.clone()
+        }
+    };
+    let expert_sms = if p.expert_sms.is_empty() {
+        vec![workers.clone(); p.experts as usize]
+    } else {
+        p.expert_sms.clone()
+    };
+    if expert_sms.len() != p.experts as usize {
+        return Err("expert_sms needs one list per routed expert".into());
+    }
+    Ok((or(&p.attn_sms), or(&p.shared_sms), expert_sms))
+}
+
+/// Attention SMs, shared-expert SMs, and the SMs of each routed expert.
+type SmLists = (Vec<usize>, Vec<usize>, Vec<Vec<usize>>);
+
+/// The attention SM of `head` in layer `l`.
+fn head_sm(p: &Params, attn_sms: &[usize], l: u32, head: u64) -> usize {
+    let off = if p.rotate_heads { l as u64 } else { 0 };
+    attn_sms[((head + off) % attn_sms.len() as u64) as usize]
+}
+
+/// Index into an expert's SM list of hidden block `b` in layer `l`.
+fn ffn_slot(p: &Params, l: u32, b: u64, len: usize) -> usize {
+    let off = if p.rotate_ffn { l as u64 } else { 0 };
+    ((b + off) % len as u64) as usize
+}
+
+/// The action expert's HBM map.
+#[derive(Debug, Clone)]
+pub struct ActionMap {
+    /// Per layer, the address of every weight block, by block index: the
+    /// query heads, K, V and the output heads (`hpb` blocks each), then
+    /// the experts (routed, then shared; gate, up, down; `nb` blocks each).
+    pub(crate) blocks: Vec<Vec<u64>>,
+    /// The prefix KV cache.
+    pub kv: KvLayout,
+    /// The next free address of every HBM slice after the map.
+    pub(crate) next: Vec<u64>,
+    /// Weight bytes of one step (every layer once).
+    pub(crate) weight_bytes: u64,
+}
+
+/// The action expert's HBM map (architecture Section 8.2, NUMA). Every
+/// weight block goes to the slice of the gpc of the SMs that read it
+/// ([`Machine::slice_for`]): a query or output head block to its head SM's
+/// gpc, an expert block to the gpc of the SM of its hidden block, and the
+/// K and V blocks (read by every head SM of the layer) to the gpc of most
+/// of those SMs. Blocks are layer-major within each slice. The prefix KV
+/// cache (read by every attention SM) follows in the slice of most of the
+/// attention SMs.
+pub fn hbm_map(m: &Machine, p: &Params) -> Result<ActionMap, String> {
     let w = parse_dtype(&p.weight_dtype)?;
     let bb = m.round(w.bytes_for(p.d * p.block_cols));
     let hpb = p.head_dim / p.block_cols;
     let nb = p.ffn / p.block_cols;
-    let layer_stride = ((2 * p.heads + 2) * hpb + (p.experts + 1) * 3 * nb) * bb;
-    let base = m.hbm.base;
-    let kv = KvLayout::new(
-        base + p.layers as u64 * layer_stride,
-        p.layers,
-        p.prefix,
-        p.head_dim,
-        m.granule,
-    );
-    if kv.end() > m.hbm.bound {
-        return Err(format!(
-            "weights and KV need {} B of HBM, have {}",
-            kv.end() - base,
-            m.hbm.len()
-        ));
+    let (attn, shared, experts) = sm_lists(m.sms.len(), p)?;
+    let per_layer = (2 * p.heads + 2) * hpb + (p.experts + 1) * 3 * nb;
+    let mut bump = SliceBump::start(m);
+    let mut blocks = Vec::with_capacity(p.layers as usize);
+    for l in 0..p.layers {
+        let mut v = Vec::with_capacity(per_layer as usize);
+        let head = |h: u64| head_sm(p, &attn, l, h);
+        for i in 0..per_layer {
+            let readers: Vec<usize> = if i < p.heads * hpb {
+                vec![head(i / hpb)]
+            } else if i < (p.heads + 2) * hpb {
+                (0..p.heads).map(head).collect()
+            } else if i < (2 * p.heads + 2) * hpb {
+                vec![head(i / hpb - p.heads - 2)]
+            } else {
+                let f = i - (2 * p.heads + 2) * hpb;
+                let (x, b) = (f / (3 * nb), f % nb);
+                let sms = if x < p.experts {
+                    &experts[x as usize]
+                } else {
+                    &shared
+                };
+                vec![sms[ffn_slot(p, l, b, sms.len())]]
+            };
+            v.push(bump.take(m.slice_for(readers), bb)?);
+        }
+        blocks.push(v);
     }
-    Ok((base, layer_stride, kv))
+    let kv_bytes = KvLayout::new(0, p.layers, p.prefix, p.head_dim, m.granule).end();
+    let kv_base = bump.take(m.slice_for(attn.iter().copied()), kv_bytes)?;
+    let kv = KvLayout::new(kv_base, p.layers, p.prefix, p.head_dim, m.granule);
+    Ok(ActionMap {
+        blocks,
+        kv,
+        next: bump.next,
+        weight_bytes: per_layer * bb * p.layers as u64,
+    })
 }

@@ -4,6 +4,9 @@ use func::{Records, Trace};
 use nu_prog::label;
 use sim_core::{build_config_file, ProfileRegistry, Stats};
 
+/// HBM bytes per cycle of configs/2p.yaml: two gpc slices of 512.
+const HBM_RATE: u64 = 1024;
+
 fn synthetic(steps: u32, layers: u32, tokens: usize, experts: u8, seed: u64) -> Records {
     let mut x = seed;
     let mut r = Records::new();
@@ -88,8 +91,8 @@ fn check(quantize: &str) {
         &s.warnings[..s.warnings.len().min(5)]
     );
     assert_eq!(r.step_end.len(), 2);
-    // HBM bound: 273 B/cycle on configs/2p.yaml.
-    let bound = r.hbm_bytes.div_ceil(273);
+    // HBM bound: two slices of 512 B/cycle on configs/2p.yaml.
+    let bound = r.hbm_bytes.div_ceil(HBM_RATE);
     assert!(
         s.end_time >= bound,
         "end {} below the HBM bound {bound}",
@@ -129,7 +132,7 @@ fn ticket_flow_answers_every_request() {
         k("InvokeAck") + k("RetryAck") + k("Reject")
     );
     assert_eq!(k("RetryAck"), s.tickets.iter().sum::<u64>());
-    assert!(s.end_time >= r.hbm_bytes.div_ceil(273));
+    assert!(s.end_time >= r.hbm_bytes.div_ceil(HBM_RATE));
 }
 
 #[test]

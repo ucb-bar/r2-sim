@@ -1,12 +1,37 @@
-# A cluster of the 2p family without cmem: a crossbar and the cluster sync
-# space. The SMs are listed by the including file.
+# A gpc of the 2p family without cmem: two crossbars (data and control),
+# its HBM slice with a copy engine, and four SMs (sm.yaml), addressed
+# root.gpcN.sm0 .. sm3.
 
-# SMEM keeps data (router outputs, activations); HBM (the device) is null:
+# Bridge to the device: 256 B/cycle each way, latency 20 cycles.
+bridge: {data: $parent.sbus, control: $parent.cbus, bw_bytes: 256, latency: 20}
+# SMEM keeps data (router outputs, activations); HBM has no values:
 # weights have no values, and a DMA from HBM copies nothing.
 fidelity: numeric
 fabric:
-  # Crossbar 512 B/cycle: four SM bridges at full rate.
-  - {name: CSBUS, topology: xbar, bw_bytes: 512}
+  # Data crossbar 512 B/cycle: four SM bridges at full rate, and the HBM
+  # slice.
+  - {name: clsbus, topology: xbar, bw_bytes: 512}
+  # Control crossbar 64 B/cycle per port.
+  - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
 memory:
+  # The gpc's HBM slice (NUMA, architecture Section 8.2): 3.75 GiB, half of
+  # the 7.5 GiB of the 2p device; 512 B/cycle at 1 GHz, about the per-GPC
+  # share of a GB200-class part (8 TB/s over 16 GPCs); latency 200 cycles:
+  # DRAM access plus controller.
+  - {name: hbm, type: dram, addr: [[0x0, 0xF0000000]], bw_bytes: 512, latency: 200,
+     slave: $this.clsbus}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
-neutrino: {scoreboard: 128, pending: 256, execution: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+compute:
+  # Copy engine: every write into the slice is a task of the gpc on it, a
+  # pull from the writing SM (Section 3.3); 8 transfers in flight, 4 chunks
+  # each.
+  - {name: dma, type: dma, latency: 100, inflight: 8, outstanding: 4, master: [$this.clsbus]}
+# Version table 1024: one entry per HBM output block in flight (up to 896
+# per window with the current write granularity, one DMA per 128-column
+# block per token tile).
+neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+children:
+  - {name: sm0, config: sm.yaml}
+  - {name: sm1, config: sm.yaml}
+  - {name: sm2, config: sm.yaml}
+  - {name: sm3, config: sm.yaml}

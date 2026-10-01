@@ -1,12 +1,16 @@
-# An SM of tiny.yaml.
+# An SM of tiny.yaml. The bridge's control side runs at 1/8 of its data
+# rate (4 B/cycle).
+bridge: {data: $parent.clsbus, control: $parent.clcbus, bw_bytes: 32, control_bw_bytes: 4, latency: 10}
 fabric:
-  - {name: LBUS}
+  - {name: smsbus}
+  - {name: smcbus, control: true}
+  - {name: lbus}
 memory:
-  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 128, latency: 10, slave: $this.LBUS}
+  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 128, latency: 10, slave: [$this.lbus, $this.smsbus]}
   - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
 compute:
   - {name: atlas, type: tensor, rate: {bf16: 4096, fp8: 4096, mxfp4: 4096}, quantize: none,
-     master: $this.LBUS}
-  - {name: muon, type: vector, rate: {lane_op: 64}, overhead: 10, master: $this.LBUS}
-  - {name: dma, type: dma, latency: 50, inflight: 2, outstanding: 1, master: $this.LBUS}
+     master: [$this.lbus]}
+  - {name: muon, type: vector, rate: {lane_op: 64}, overhead: 10, master: [$this.lbus, $this.smsbus]}
+  - {name: dma, type: dma, latency: 50, inflight: 2, outstanding: 1, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 64, execution: 64, pending: 16, inbound_refs: 16, outbound_deps: 16, outbound_invokes: 16}

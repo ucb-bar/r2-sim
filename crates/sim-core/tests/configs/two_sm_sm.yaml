@@ -1,10 +1,13 @@
 # An SM of two_sm.yaml.
+bridge: {data: $parent.clsbus, control: $parent.clcbus, bw_bytes: 32, latency: 10}
 fabric:
-  - {name: LBUS}
+  - {name: smsbus}
+  - {name: smcbus, control: true}
+  - {name: lbus}
 memory:
-  - {name: smem, type: scratch, addr: [[0x0, 0x80000]], bw_bytes: 128, latency: 10, slave: $this.LBUS}
+  - {name: smem, type: scratch, addr: [[0x0, 0x80000]], bw_bytes: 128, latency: 10, slave: [$this.lbus, $this.smsbus]}
   - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
 compute:
-  - {name: atlas, type: tensor, rate: {bf16: 4096}, master: $this.LBUS}
-  - {name: dma, type: dma, latency: 100, inflight: 2, master: $this.LBUS}
+  - {name: atlas, type: tensor, rate: {bf16: 4096}, master: [$this.lbus]}
+  - {name: dma, type: dma, latency: 100, inflight: 2, master: [$this.lbus, $this.smsbus]}
 neutrino: {inbound_refs: 4, t_retry: 50}

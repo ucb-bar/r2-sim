@@ -53,7 +53,7 @@ fn run() -> (Stats, Report, KvLayout) {
 fn run_p(p: Params) -> (Stats, Report, KvLayout) {
     let b = tiny();
     let m = Machine::from_built(&b, 512).unwrap();
-    let (_, _, kv) = adamoe::hbm_map(&m, &action()).unwrap();
+    let kv = adamoe::hbm_map(&m, &action()).unwrap().kv;
     let d = Driver::new(m, p).unwrap();
     let report = d.report.clone();
     let nu = d.home_nu();
@@ -161,6 +161,9 @@ fn the_chosen_grid_is_within_the_margin_and_reads_the_least_hbm() {
         hbm_rate: 273.0,
         act_rate: 273.0,
         act_in_hbm: true,
+        slice_rates: vec![273.0],
+        act_slice: Some(0),
+        slice_cluster: vec![None],
         quantize: true,
         pass_overhead: 150.0,
         cw: 0,

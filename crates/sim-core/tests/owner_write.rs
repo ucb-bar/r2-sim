@@ -43,8 +43,8 @@ fn v1(range: Range) -> Dep {
 /// and waits for it.
 fn write_into_hbm(sets: &[&str]) -> sim_core::Stats {
     let b = two_sm(sets);
-    let sm0 = b.nu("root.cluster0.sm0");
-    let s0 = b.memory("root.cluster0.sm0.smem").base;
+    let sm0 = b.nu("root.gpc0.sm0");
+    let s0 = b.memory("root.gpc0.sm0.smem").base;
     let h = Range::from_len(b.memory("root.hbm").base, KB64);
     let write = dma(&b, "root.dma", s0, h, KB64).with_inferred_version(1);
     let mut sim = b.sim;
@@ -67,7 +67,7 @@ fn a_write_into_hbm_is_a_pull_by_the_device() {
     // and issues the task on its copy engine at 43.
     let t = &s.tasks[0];
     assert_eq!((t.invoke, t.ready, t.issue), (43, Some(43), Some(43)));
-    // Engine latency 100 + route latency 30 (sm0 bridge 10, cluster0
+    // Engine latency 100 + route latency 30 (sm0 bridge 10, gpc0
     // bridge 20): start 173; 64 KiB on the 32 B/cycle sm0 bridge: 2048
     // cycles, end 2221; c_complete 4 at the device: 2225.
     assert_eq!((t.chunks[0].start, t.chunks[0].end), (173, 2221));
@@ -86,12 +86,12 @@ fn a_consumer_of_a_write_registers_at_the_owner() {
     // its own engine. The copy's dep on X is remote (HBM is the device's):
     // it registers at the device and is released by the device's Resolve.
     let b = two_sm(&[]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let s0 = b.memory("root.cluster0.sm0.smem").base;
-    let s1 = Range::from_len(b.memory("root.cluster0.sm1.smem").base, KB64);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s0 = b.memory("root.gpc0.sm0.smem").base;
+    let s1 = Range::from_len(b.memory("root.gpc0.sm1.smem").base, KB64);
     let h = Range::from_len(b.memory("root.hbm").base, KB64);
     let write = dma(&b, "root.dma", s0, h, KB64).with_inferred_version(1);
-    let mut get = dma(&b, "root.cluster0.sm1.dma", h.base, s1, KB64);
+    let mut get = dma(&b, "root.gpc0.sm1.dma", h.base, s1, KB64);
     get.deps = vec![v1(h)];
     let mut sim = b.sim;
     sim.set_timeline(true);
@@ -119,10 +119,10 @@ fn a_task_on_a_pe_of_another_neutrino_is_fatal() {
     // A DMA into HBM named on sm0's engine: the device owns the dst, and
     // the PE is not the device's.
     let b = two_sm(&[]);
-    let sm0 = b.nu("root.cluster0.sm0");
-    let s0 = b.memory("root.cluster0.sm0.smem").base;
+    let sm0 = b.nu("root.gpc0.sm0");
+    let s0 = b.memory("root.gpc0.sm0.smem").base;
     let h = Range::from_len(b.memory("root.hbm").base, KB64);
-    let write = dma(&b, "root.cluster0.sm0.dma", s0, h, KB64).with_inferred_version(1);
+    let write = dma(&b, "root.gpc0.sm0.dma", s0, h, KB64).with_inferred_version(1);
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.invoke(write).await;

@@ -1,75 +1,43 @@
-# First Radiance-2P configuration for the AdaMoE action-expert study (step 5a).
-# Every number is a knob to be swept; the comments give the reason for the
-# starting value. Clock: 1 GHz reference, so 1 cycle = 1 ns.
+# Radiance-2P for the pi0 forward-pass study. Every number is a knob to be
+# swept; the comments give the reason for the starting value. Clock: 1 GHz
+# reference, so 1 cycle = 1 ns.
 #
 # Flow control of forwarded invokes: ready/valid (2026-09-30; architecture
 # Section 3.3). Every protocol class has its own channel with one message
-# stage per hop; an invoke waits in the channel until the owner's inbound
-# invoke table has room. `--set global.flow=ticket` selects the ticket
-# scheme for comparison.
+# stage per hop of the control buses; an invoke waits in the channel until
+# the owner's inbound invoke table has room. `--set global.flow=ticket`
+# selects the ticket scheme for comparison.
 #
-# The tree: root (the device: HBM, the device sync space, a copy engine),
-# gpc0 and gpc1 (clusters, gpc.yaml), sm0 to sm7 (sm.yaml). The fabric
-# maps the tree model one to one: the device crossbar is SBUS, a cluster
-# crossbar is CSBUS, a parent-child link is the child's bridge, and an SM
-# has an unlimited local bus LBUS (its SMEM port is the only limit).
+# The tree (architecture Section 8): root (the device: its sync space and
+# its Neutrino), gpc0 and gpc1 (gpc.yaml, each with its HBM slice and four
+# SMs, sm.yaml), addressed root.gpc1.sm2. Data buses carry DMA chunks,
+# loads and stores; control buses carry the protocol messages.
 #
-# Own spaces (offset_bits 33 = 8 GiB per node; fields cluster:2, sm:3):
-#   root          0x00_0000_0000   HBM and the device sync space
-#   gpc c         (c + 1) << 36
-#   gpc c, SM s   ((c + 1) << 36) | ((s + 1) << 33)
+# Own spaces (offset_bits 33 = 8 GiB per node; fields gpc:2, sm:3):
+#   root          0x00_0000_0000   the device sync space
+#   gpc g         (g + 1) << 36    its HBM slice and its sync space
+#   gpc g, SM s   ((g + 1) << 36) | ((s + 1) << 33)
 
 global:
   neutrino_granule: 512    # Neutrino2 range alignment
   clock_ghz: 1.0
-  msg_bytes: 64            # one cache-line-sized remote protocol message
+  msg_bytes: 64            # one beat of a protocol message
   flow: readyvalid         # ready/valid channels (Section 3.3)
   hop_queue: 1             # messages per hop stage and class (a pipeline register)
   address:
-    fields: [{name: cluster, bits: 2}, {name: sm, bits: 3}]
+    fields: [{name: gpc, bits: 2}, {name: sm, bits: 3}]
     offset_bits: 33
 
 device:
   name: root
   fabric:
-    # Crossbar 512 B/cycle: traffic between the two clusters.
-    - {name: SBUS, topology: xbar, bw_bytes: 512}
+    # Data between the gpcs: 512 B/cycle per port.
+    - {name: sbus, topology: xbar, bw_bytes: 512}
+    # Control between the gpcs: 64 B/cycle per port, one beat per cycle.
+    - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
   memory:
-    # 273 B/cycle at 1 GHz = 273 GB/s: a stand-in for a Thor-class LPDDR5X
-    # package. Latency 200 cycles: DRAM access plus controller. 7.5 GiB: the
-    # pi0 weights (vision 0.8 GB, VLM 4.0 GB, action 2.4 GB = 6.7 GiB) plus
-    # the prefix KV and prefill activations; below the sync space at 7.75 GiB.
-    - {name: hbm, type: dram, addr: [[0x0, 0x1E0000000]], bw_bytes: 273, latency: 200,
-       slave: $this.SBUS}
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
-  compute:
-    # Copy engine: every write into HBM is a task of the device on it, a
-    # pull from the writing SM (Section 3.3); 8 transfers in flight, 4
-    # chunks each, for the writes of seven SMs.
-    - {name: dma, type: dma, latency: 100, inflight: 8, outstanding: 4, master: $this.SBUS}
-  # Neutrino of the device: it owns HBM, so every write into HBM is its
-  # task (5b item 3). Table sizes as at the SMs (sm.yaml), except the
-  # version table: 1024, one entry per HBM output block in flight (up to
-  # 896 per window with the current write granularity, one DMA per
-  # 128-column block per token tile).
-  neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+  neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
   children:
-    # Device-to-cluster bridges: wide enough not to cap HBM (2 x 256 > 273).
-    # SM bridges 128 B/cycle: half the SMEM port, so one SM cannot saturate
-    # the cluster crossbar alone. Latency 10 cycles per hop.
-    - name: gpc0
-      config: gpc.yaml
-      bridge: {bus: $parent.SBUS, bw_bytes: 256, latency: 20}
-      children:
-        - {name: sm0, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
-        - {name: sm1, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
-        - {name: sm2, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
-        - {name: sm3, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
-    - name: gpc1
-      config: gpc.yaml
-      bridge: {bus: $parent.SBUS, bw_bytes: 256, latency: 20}
-      children:
-        - {name: sm4, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
-        - {name: sm5, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
-        - {name: sm6, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
-        - {name: sm7, config: sm.yaml, bridge: {bus: $parent.CSBUS, bw_bytes: 128, latency: 10}}
+    - {name: gpc0, config: gpc.yaml}
+    - {name: gpc1, config: gpc.yaml}

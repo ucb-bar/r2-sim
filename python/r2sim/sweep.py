@@ -73,10 +73,10 @@ def _every_neutrino(key: str, value: object) -> list[str]:
 
 
 def _versions(v: int) -> list[str]:
-    """--set arguments for a version table of `v` at the clusters and the
-    SMs; the device keeps its own (1024 in 2p.yaml)."""
+    """--set arguments for a version table of `v` at the SMs; the gpcs
+    keep their own (1024 in gpc.yaml)."""
     out = []
-    for path in ("root.*", "root.*.*"):
+    for path in ("root.gpc*.sm*",):
         out += ["--set", f"{path}.neutrino.versions={v}"]
     return out
 
@@ -103,11 +103,11 @@ AXES: dict[str, dict] = {
         "points": [Point(0, [])] + [Point(v, _every_neutrino("c_resolve", v)) for v in LAT],
     },
     "hbm": {
-        "label": "HBM port (B/cycle)",
+        "label": "HBM port per gpc slice (B/cycle)",
         "lines": False,
         "unit": "B/cycle",
-        "baseline": 273,
-        "points": [Point(v, ["--set", f"root.hbm.bw_bytes={v}"]) for v in (137, 273, 546, 1092)],
+        "baseline": 512,
+        "points": [Point(v, ["--set", f"root.gpc*.hbm.bw_bytes={v}"]) for v in (256, 512, 1024, 2048)],
     },
     "smem": {
         "label": "SMEM per SM (MiB)",
@@ -117,7 +117,7 @@ AXES: dict[str, dict] = {
         "points": [
             Point(
                 s,
-                ["--set", f"root.*.*.smem.addr=[[0x0, {s << 20:#x}]]", "--set", f"root.*.*.smem.bw_bytes={p}"],
+                ["--set", f"root.gpc*.sm*.smem.addr=[[0x0, {s << 20:#x}]]", "--set", f"root.gpc*.sm*.smem.bw_bytes={p}"],
                 series=f"{p} B/cycle",
             )
             for p in (256, 512)
@@ -142,16 +142,16 @@ AXES: dict[str, dict] = {
         "points": [Point(k, [], acc=["--acc-buffer", str(k * 1024)]) for k in (0, 256, 512, 1024, 2048)],
     },
     "versions": {
-        "label": "Version table per SM and cluster (entries)",
+        "label": "Version table per SM (entries)",
         "lines": False,
         "baseline": 256,
         "points": [Point(v, _versions(v)) for v in (64, 128, 256, 512)],
     },
     "root_versions": {
-        "label": "Version table at the device (entries)",
+        "label": "Version table at the gpcs (entries)",
         "lines": False,
         "baseline": 1024,
-        "points": [Point(v, ["--set", f"root.neutrino.versions={v}"]) for v in (512, 1024, 2048)],
+        "points": [Point(v, ["--set", f"root.gpc*.neutrino.versions={v}"]) for v in (512, 1024, 2048)],
     },
 }
 

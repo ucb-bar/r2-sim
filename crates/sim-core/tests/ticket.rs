@@ -26,8 +26,8 @@ fn built(flow: &str) -> Built {
     built_with(
         flow,
         &[
-            "root.cluster0.sm1.neutrino.scoreboard=1",
-            "root.cluster0.sm1.neutrino.inbound_invokes=1",
+            "root.gpc0.sm1.neutrino.scoreboard=1",
+            "root.gpc0.sm1.neutrino.inbound_invokes=1",
         ],
     )
 }
@@ -66,7 +66,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>, label: u64) -> Descript
 type Program = Box<dyn FnOnce(NuCtx) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>>;
 
 fn sm1_program(b: &Built, at: impl Fn(u64) -> Range) -> Program {
-    let atlas = "root.cluster0.sm1.atlas";
+    let atlas = "root.gpc0.sm1.atlas";
     let (p1, p2) = (
         matmul(b, atlas, at(0), vec![], 100),
         matmul(b, atlas, at(1), vec![], 101),
@@ -94,10 +94,10 @@ fn one_ticket_on_a_full_inbound_table() {
     // at 392 (the atlas is free); M2 enters the scoreboard then and issues
     // at 584. sm0 holds both requests from their sends to their acks.
     let b = built("ticket");
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
     let at = move |i: u64| Range::from_len(s1 + i * MAT, MAT);
-    let atlas = "root.cluster0.sm1.atlas";
+    let atlas = "root.gpc0.sm1.atlas";
     let prog1 = sm1_program(&b, at);
     let ms: Vec<Descriptor> = (2..4)
         .map(|i| matmul(&b, atlas, at(i), vec![], i).with_inferred_version(1))
@@ -138,23 +138,23 @@ fn one_ticket_on_a_full_inbound_table() {
 
 #[test]
 fn grants_go_round_robin_between_two_ticket_holders() {
-    // sm0 forwards M1, M2, M3 at 8, 16, 24; cluster0 forwards N1 and N2
+    // sm0 forwards M1, M2, M3 at 8, 16, 24; gpc0 forwards N1 and N2
     // after 30 cycles, so they reach sm1 after M1 (at 40) took the one
-    // inbound entry. M2 sets sm0's bit and N1 cluster0's; M3 and N2 are
+    // inbound entry. M2 sets sm0's bit and N1 gpc0's; M3 and N2 are
     // rejected behind them and replayed later. Each freed entry goes to the next set
-    // bit after the last one granted: cluster0 (id 1), sm0 (id 2),
-    // cluster0, sm0. So sm1 accepts M1, N1, M2, N2, M3: each requester's
+    // bit after the last one granted: gpc0 (id 1), sm0 (id 2),
+    // gpc0, sm0. So sm1 accepts M1, N1, M2, N2, M3: each requester's
     // invokes in its program order, the two interleaved.
     let b = built("ticket");
     let (c0, sm0, sm1) = (
-        b.nu("root.cluster0"),
-        b.nu("root.cluster0.sm0"),
-        b.nu("root.cluster0.sm1"),
+        b.nu("root.gpc0"),
+        b.nu("root.gpc0.sm0"),
+        b.nu("root.gpc0.sm1"),
     );
     assert!(c0.0 < sm0.0);
-    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
     let at = move |i: u64| Range::from_len(s1 + i * MAT, MAT);
-    let atlas = "root.cluster0.sm1.atlas";
+    let atlas = "root.gpc0.sm1.atlas";
     let prog1 = sm1_program(&b, at);
     let ms: Vec<Descriptor> = (2..5)
         .map(|i| matmul(&b, atlas, at(i), vec![], i).with_inferred_version(1))
@@ -200,19 +200,19 @@ fn grants_go_round_robin_between_two_ticket_holders() {
 #[test]
 fn a_requester_sends_no_invoke_while_it_holds_a_ticket() {
     // As one_ticket_on_a_full_inbound_table, and at 124 sm0 forwards J, a
-    // join on cluster0's sync memory (a free owner). Under ready/valid J
+    // join on gpc0's sync memory (a free owner). Under ready/valid J
     // leaves at once. Under ticket flow sm0 holds a ticket from 82 to 226,
     // so J waits in its outbound invoke table: M2's replay takes sm0's up
     // bridge [226, 230) and the stage after it until its transmission
     // through the port from sm0 ends at 242; J follows it. J therefore
-    // reaches cluster0 242 - 124 = 118 cycles later than under ready/valid.
+    // reaches gpc0 242 - 124 = 118 cycles later than under ready/valid.
     let run = |flow: &str| {
         let b = built(flow);
-        let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-        let c0 = b.nu("root.cluster0");
-        let s1 = b.memory("root.cluster0.sm1.smem").base;
+        let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+        let c0 = b.nu("root.gpc0");
+        let s1 = b.memory("root.gpc0.sm1.smem").base;
         let at = move |i: u64| Range::from_len(s1 + i * MAT, MAT);
-        let atlas = "root.cluster0.sm1.atlas";
+        let atlas = "root.gpc0.sm1.atlas";
         let prog1 = sm1_program(&b, at);
         let ms: Vec<Descriptor> = (2..4)
             .map(|i| matmul(&b, atlas, at(i), vec![], i).with_inferred_version(1))
@@ -258,10 +258,10 @@ fn a_request_in_flight_behind_the_ticket_is_rejected_and_replayed_in_order() {
     // enters the scoreboard; the second grant (at sm0 at 418) replays M3.
     // M3 enters the scoreboard when M2 issues at 584.
     let b = built("ticket");
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
     let at = move |i: u64| Range::from_len(s1 + i * MAT, MAT);
-    let atlas = "root.cluster0.sm1.atlas";
+    let atlas = "root.gpc0.sm1.atlas";
     let prog1 = sm1_program(&b, at);
     let ms: Vec<Descriptor> = (2..5)
         .map(|i| matmul(&b, atlas, at(i), vec![], i).with_inferred_version(1))
@@ -300,11 +300,11 @@ fn an_outbound_entry_frees_on_its_invoke_ack() {
     // Under ticket flow sm0 holds M1 until its InvokeAck arrives at 66: the
     // program stalls from 16 to 66, and M2 arrives at 66 + 32 = 98.
     let run = |flow: &str| {
-        let b = built_with(flow, &["root.cluster0.sm0.neutrino.outbound_invokes=1"]);
-        let sm0 = b.nu("root.cluster0.sm0");
-        let s1 = b.memory("root.cluster0.sm1.smem").base;
+        let b = built_with(flow, &["root.gpc0.sm0.neutrino.outbound_invokes=1"]);
+        let sm0 = b.nu("root.gpc0.sm0");
+        let s1 = b.memory("root.gpc0.sm1.smem").base;
         let at = move |i: u64| Range::from_len(s1 + i * MAT, MAT);
-        let atlas = "root.cluster0.sm1.atlas";
+        let atlas = "root.gpc0.sm1.atlas";
         let ms: Vec<Descriptor> = (2..4)
             .map(|i| matmul(&b, atlas, at(i), vec![], i).with_inferred_version(1))
             .collect();

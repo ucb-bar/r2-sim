@@ -2,7 +2,7 @@
 //! remote loads. Config: `configs/two_sm.yaml`.
 //!
 //! Paths used below. sm0 -> sm1: sm0's bridge up (32 B/cycle, 10), the
-//! cluster0 crossbar CSBUS (an xbar: sm0's ingress port and sm1's egress
+//! gpc0 crossbar clsbus (an xbar: sm0's ingress port and sm1's egress
 //! port, 64 B/cycle each), sm1's bridge down (32 B/cycle, 10): latency 20.
 //! A 64 B beat takes 2 cycles on a bridge and 1 on a port. Control messages
 //! go store and forward through one-message stages, so a message of b beats
@@ -81,14 +81,14 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
 fn config_builds_owners_and_paths() {
     let b = built();
     let (sm0, sm1, cl) = (
-        b.nu("root.cluster0.sm0"),
-        b.nu("root.cluster0.sm1"),
-        b.nu("root.cluster0"),
+        b.nu("root.gpc0.sm0"),
+        b.nu("root.gpc0.sm1"),
+        b.nu("root.gpc0"),
     );
     assert_eq!(b.own_space(sm0), Range::from_len(0x500_0000, 1 << 24));
     assert_eq!(b.own_space(sm1), Range::from_len(0x600_0000, 1 << 24));
     assert_eq!(
-        b.memory("root.cluster0.sm1.smem"),
+        b.memory("root.gpc0.sm1.smem"),
         Range::from_len(0x600_0000, 512 << 10)
     );
     assert_eq!(b.sync_only(cl), Some(Range::from_len(0x4F0_0000, 1 << 20)));
@@ -103,13 +103,13 @@ fn config_builds_owners_and_paths() {
     assert_eq!(
         names,
         vec![
-            "root.cluster0.sm0.bridge.up",
-            "root.cluster0.CSBUS.sm0.in",
-            "root.cluster0.CSBUS.sm1.out",
-            "root.cluster0.sm1.bridge.down"
+            "root.gpc0.sm0.bridge.up",
+            "root.gpc0.clsbus.sm0.in",
+            "root.gpc0.clsbus.sm1.out",
+            "root.gpc0.sm1.bridge.down"
         ]
     );
-    // From the cluster's Neutrino (an attachment of CSBUS) to sm0: its
+    // From the cluster's Neutrino (an attachment of clsbus) to sm0: its
     // ingress port, sm0's egress port, sm0's bridge down.
     let p = topo.path(cl, sm0);
     assert_eq!(p.latency, 10);
@@ -121,9 +121,9 @@ fn config_builds_owners_and_paths() {
     assert_eq!(
         names,
         vec![
-            "root.cluster0.CSBUS.neutrino.in",
-            "root.cluster0.CSBUS.sm0.out",
-            "root.cluster0.sm0.bridge.down"
+            "root.gpc0.clsbus.neutrino.in",
+            "root.gpc0.clsbus.sm0.out",
+            "root.gpc0.sm0.bridge.down"
         ]
     );
     // Up to the device: two links.
@@ -135,11 +135,11 @@ fn config_builds_owners_and_paths() {
 /// holds SM1 back so that the consumer comes first.
 fn remote_dep(delay: u64) -> Stats {
     let b = built();
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
-    let c = Range::from_len(b.memory("root.cluster0.sm0.smem").base, MAT);
-    let p = matmul(&b, "root.cluster0.sm1.atlas", x, vec![]);
-    let q = matmul(&b, "root.cluster0.sm0.atlas", c, vec![v1(x)]);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let x = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let c = Range::from_len(b.memory("root.gpc0.sm0.smem").base, MAT);
+    let p = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]);
+    let q = matmul(&b, "root.gpc0.sm0.atlas", c, vec![v1(x)]);
     let mut sim = b.sim;
     // Each producer program waits for its output: its return frees its
     // version table (Section 3.2), which a later remote lookup needs.
@@ -197,10 +197,10 @@ fn remote_dep_consumer_first_goes_through_the_owners_pending() {
 fn reject_and_retry() {
     // SM1 has room for one inbound ref. Two consumers on SM0 depend on X and
     // Y at SM1; Y's Await is rejected until X's ref frees.
-    let b = two_sm(&["root.cluster0.sm1.neutrino.inbound_refs=1"]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let smem1 = b.memory("root.cluster0.sm1.smem").base;
-    let smem0 = b.memory("root.cluster0.sm0.smem").base;
+    let b = two_sm(&["root.gpc0.sm1.neutrino.inbound_refs=1"]);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let smem1 = b.memory("root.gpc0.sm1.smem").base;
+    let smem0 = b.memory("root.gpc0.sm0.smem").base;
     let (x, y) = (
         Range::from_len(smem1, MAT),
         Range::from_len(smem1 + MAT, MAT),
@@ -210,12 +210,12 @@ fn reject_and_retry() {
         Range::from_len(smem0 + MAT, MAT),
     );
     let (px, py) = (
-        matmul(&b, "root.cluster0.sm1.atlas", x, vec![]),
-        matmul(&b, "root.cluster0.sm1.atlas", y, vec![]),
+        matmul(&b, "root.gpc0.sm1.atlas", x, vec![]),
+        matmul(&b, "root.gpc0.sm1.atlas", y, vec![]),
     );
     let (qx, qy) = (
-        matmul(&b, "root.cluster0.sm0.atlas", cx, vec![v1(x)]),
-        matmul(&b, "root.cluster0.sm0.atlas", cy, vec![v1(y)]),
+        matmul(&b, "root.gpc0.sm0.atlas", cx, vec![v1(x)]),
+        matmul(&b, "root.gpc0.sm0.atlas", cy, vec![v1(y)]),
     );
     let mut sim = b.sim;
     sim.spawn(sm1, move |ctx: NuCtx| async move {
@@ -255,7 +255,7 @@ fn reject_and_retry() {
 #[test]
 fn parent_spawns_two_children_and_waits() {
     let b = built();
-    let cl = b.nu("root.cluster0");
+    let cl = b.nu("root.gpc0");
     let so = b.sync_only(cl).unwrap();
     let (d0, d1) = (
         Range::from_len(so.base, 512),
@@ -298,15 +298,15 @@ fn a_program_start_resets_the_version_table() {
     // writes X again: the start of the second program cleared the table,
     // so the write gets version 1.
     let b = built();
-    let cl = b.nu("root.cluster0");
+    let cl = b.nu("root.gpc0");
     let kids = b.sim.topology().node(cl).children.clone();
     let so = b.sync_only(cl).unwrap();
     let (d0, d1) = (
         Range::from_len(so.base, 512),
         Range::from_len(so.base + 512, 512),
     );
-    let x = Range::from_len(b.memory("root.cluster0.sm0.smem").base, MAT);
-    let w1 = matmul(&b, "root.cluster0.sm0.atlas", x, vec![]);
+    let x = Range::from_len(b.memory("root.gpc0.sm0.smem").base, MAT);
+    let w1 = matmul(&b, "root.gpc0.sm0.atlas", x, vec![]);
     let w2 = w1.clone();
     let mut sim = b.sim;
     sim.spawn(cl, move |ctx: NuCtx| async move {
@@ -336,7 +336,7 @@ fn a_program_start_resets_the_version_table() {
 #[test]
 fn spawn_on_a_non_child_is_fatal() {
     let b = built();
-    let (cl, dev) = (b.nu("root.cluster0"), b.nu("root"));
+    let (cl, dev) = (b.nu("root.gpc0"), b.nu("root"));
     let d = Range::from_len(b.sync_only(cl).unwrap().base, 512);
     let mut sim = b.sim;
     sim.spawn(cl, move |ctx: NuCtx| async move {
@@ -350,14 +350,14 @@ fn spawn_on_a_non_child_is_fatal() {
 #[test]
 fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     let b = built();
-    let sm0 = b.nu("root.cluster0.sm0");
+    let sm0 = b.nu("root.gpc0.sm0");
     let (src, dst) = (
-        b.memory("root.cluster0.sm1.smem").base,
-        b.memory("root.cluster0.sm0.smem").base,
+        b.memory("root.gpc0.sm1.smem").base,
+        b.memory("root.gpc0.sm0.smem").base,
     );
     let d = Descriptor {
         opcode: b.sim.profiles().lookup("dma").unwrap(),
-        pe: Some(b.pe("root.cluster0.sm0.dma")),
+        pe: Some(b.pe("root.gpc0.sm0.dma")),
         dst: Range::from_len(dst, 8192),
         versioned: true,
         inferred_version: None,
@@ -384,10 +384,10 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     assert_eq!((t.chunks[0].start, t.chunks[0].end), (128, 384));
     assert_eq!(t.complete, Some(388));
     for name in [
-        "root.cluster0.sm1.bridge.up",
-        "root.cluster0.CSBUS.sm1.in",
-        "root.cluster0.CSBUS.sm0.out",
-        "root.cluster0.sm0.bridge.down",
+        "root.gpc0.sm1.bridge.up",
+        "root.gpc0.clsbus.sm1.in",
+        "root.gpc0.clsbus.sm0.out",
+        "root.gpc0.sm0.bridge.down",
     ] {
         assert_eq!(
             s.resources[res(&s, name).0 as usize].busy_cycles,
@@ -398,7 +398,7 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     // Two bridges tie at 256; the tie goes to the lower resource id.
     assert_eq!(
         t.chunks[0].culprit,
-        Some(res(&s, "root.cluster0.sm0.bridge.down"))
+        Some(res(&s, "root.gpc0.sm0.bridge.down"))
     );
 }
 
@@ -407,8 +407,8 @@ fn remote_load_charges_the_path_twice_in_latency() {
     // Numeric fidelity for the whole tree, inherited from the device.
     let b = two_sm(&["root.fidelity=numeric"]);
     assert!(b.numeric);
-    let sm0 = b.nu("root.cluster0.sm0");
-    let src = b.memory("root.cluster0.sm1.smem").base;
+    let sm0 = b.nu("root.gpc0.sm0");
+    let src = b.memory("root.gpc0.sm1.smem").base;
     let mut sim = b.sim;
     sim.set_functional(Box::new(func::Numeric::new()));
     sim.spawn(sm0, move |ctx: NuCtx| async move {
@@ -424,9 +424,9 @@ fn remote_load_charges_the_path_twice_in_latency() {
 #[test]
 fn remote_load_race_check_reads_the_owners_tables() {
     let b = built();
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
-    let p = matmul(&b, "root.cluster0.sm1.atlas", x, vec![]);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let x = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let p = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]);
     let mut sim = b.sim;
     sim.set_functional(Box::new(func::Numeric::new()));
     sim.spawn(sm1, move |ctx: NuCtx| async move {
@@ -451,9 +451,9 @@ fn remote_load_race_check_reads_the_owners_tables() {
 #[test]
 fn remote_wait_blocks_until_ready() {
     let b = built();
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
-    let p = matmul(&b, "root.cluster0.sm1.atlas", x, vec![]);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let x = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let p = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]);
     let mut sim = b.sim;
     sim.spawn(sm1, move |ctx: NuCtx| async move {
         let h = ctx.invoke(p).await;
@@ -473,8 +473,8 @@ fn remote_wait_blocks_until_ready() {
 #[test]
 fn null_fidelity_rejects_a_load() {
     let b = built();
-    let sm0 = b.nu("root.cluster0.sm0");
-    let src = b.memory("root.cluster0.sm1.smem").base;
+    let sm0 = b.nu("root.gpc0.sm0");
+    let src = b.memory("root.gpc0.sm1.smem").base;
     let mut sim = b.sim;
     sim.set_functional(Box::new(func::Numeric::new()));
     sim.spawn(sm0, move |ctx: NuCtx| async move {

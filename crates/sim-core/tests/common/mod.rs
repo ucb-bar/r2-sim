@@ -98,7 +98,7 @@ pub fn node(k: Knobs) -> Node {
     sim.add_memory(MemBlock {
         name: "dram".into(),
         owner: nu,
-        attach: None,
+        attach: Vec::new(),
         numeric: true,
         range: Range::new(DRAM, SMEM),
         port: dram_port,
@@ -107,7 +107,7 @@ pub fn node(k: Knobs) -> Node {
     sim.add_memory(MemBlock {
         name: "smem".into(),
         owner: nu,
-        attach: None,
+        attach: Vec::new(),
         numeric: true,
         range: Range::new(SMEM, SMEM + 0x8_0000),
         port: smem_port,
@@ -122,6 +122,7 @@ pub fn node(k: Knobs) -> Node {
             params: PeParams::Dma {
                 links: vec![link],
                 latency: k.dma_latency,
+                masters: Vec::new(),
             },
         },
     );

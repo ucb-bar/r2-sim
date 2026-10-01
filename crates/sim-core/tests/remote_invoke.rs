@@ -19,7 +19,7 @@ fn two_sm(sets: &[&str]) -> Built {
 fn built_with(sm1: &[&str]) -> Built {
     let sets: Vec<String> = sm1
         .iter()
-        .map(|kv| format!("root.cluster0.sm1.neutrino.{kv}"))
+        .map(|kv| format!("root.gpc0.sm1.neutrino.{kv}"))
         .collect();
     let sets: Vec<&str> = sets.iter().map(String::as_str).collect();
     two_sm(&sets)
@@ -67,11 +67,11 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
 #[test]
 fn forwarded_invoke_with_a_dep_back_on_the_invoker() {
     let b = built_with(&[]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let a = Range::from_len(b.memory("root.cluster0.sm0.smem").base, MAT);
-    let c = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
-    let p0 = matmul(&b, "root.cluster0.sm0.atlas", a, vec![]);
-    let m = matmul(&b, "root.cluster0.sm1.atlas", c, vec![v1(a)]).with_inferred_version(1);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let a = Range::from_len(b.memory("root.gpc0.sm0.smem").base, MAT);
+    let c = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let p0 = matmul(&b, "root.gpc0.sm0.atlas", a, vec![]);
+    let m = matmul(&b, "root.gpc0.sm1.atlas", c, vec![v1(a)]).with_inferred_version(1);
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.invoke(p0).await;
@@ -109,18 +109,18 @@ fn forwarded_invoke_with_a_dep_back_on_the_invoker() {
 #[test]
 fn a_full_scoreboard_holds_forwarded_invokes_in_the_inbound_table() {
     let b = built_with(&["scoreboard=1"]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
     let (x, y, c) = (
         Range::from_len(s1, MAT),
         Range::from_len(s1 + MAT, MAT),
         Range::from_len(s1 + 2 * MAT, MAT),
     );
     let (p1, p2) = (
-        matmul(&b, "root.cluster0.sm1.atlas", x, vec![]),
-        matmul(&b, "root.cluster0.sm1.atlas", y, vec![]),
+        matmul(&b, "root.gpc0.sm1.atlas", x, vec![]),
+        matmul(&b, "root.gpc0.sm1.atlas", y, vec![]),
     );
-    let m = matmul(&b, "root.cluster0.sm1.atlas", c, vec![]).with_inferred_version(1);
+    let m = matmul(&b, "root.gpc0.sm1.atlas", c, vec![]).with_inferred_version(1);
     let mut sim = b.sim;
     sim.spawn(sm1, move |ctx: NuCtx| async move {
         // P1 runs [8,200); P2 waits for the atlas in the scoreboard (full) until 200.
@@ -154,9 +154,9 @@ fn a_full_scoreboard_holds_forwarded_invokes_in_the_inbound_table() {
 fn forwarded_invoke_of_a_matmul_on_the_invokers_atlas_is_fatal() {
     // The descriptor's PE must be the owner's (Section 3.3).
     let b = built_with(&[]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let c = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
-    let m = matmul(&b, "root.cluster0.sm0.atlas", c, vec![]).with_inferred_version(1);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let c = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let m = matmul(&b, "root.gpc0.sm0.atlas", c, vec![]).with_inferred_version(1);
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.invoke(m).await;
@@ -173,14 +173,14 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
     // The canonical case: sm0 forwards a DMA that copies its smem into
     // sm1's smem; sm1 runs it on its engine and charges the path.
     let b = built_with(&[]);
-    let sm0 = b.nu("root.cluster0.sm0");
+    let sm0 = b.nu("root.gpc0.sm0");
     let (src, dst) = (
-        b.memory("root.cluster0.sm0.smem").base,
-        b.memory("root.cluster0.sm1.smem").base,
+        b.memory("root.gpc0.sm0.smem").base,
+        b.memory("root.gpc0.sm1.smem").base,
     );
     let d = Descriptor {
         opcode: b.sim.profiles().lookup("dma").unwrap(),
-        pe: Some(b.pe("root.cluster0.sm1.dma")),
+        pe: Some(b.pe("root.gpc0.sm1.dma")),
         dst: Range::from_len(dst, 8192),
         versioned: true,
         inferred_version: Some(1),
@@ -216,9 +216,9 @@ fn a_forwarded_invoke_gets_the_owners_version_and_the_inference_matches() {
     // the owner assigns 1 and 2 on arrival, and the inferences (1, 2) match
     // (checked by the owner in debug builds).
     let b = built_with(&[]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
-    let atlas = "root.cluster0.sm1.atlas";
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let x = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let atlas = "root.gpc0.sm1.atlas";
     let w1 = matmul(&b, atlas, x, vec![]).with_inferred_version(1);
     let w2 = matmul(&b, atlas, x, vec![v1(x)]).with_inferred_version(2);
     let mut sim = b.sim;
@@ -238,9 +238,9 @@ fn a_forwarded_invoke_gets_the_owners_version_and_the_inference_matches() {
 #[cfg(debug_assertions)]
 fn a_wrong_inference_is_fatal_in_debug_builds() {
     let b = built_with(&[]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
-    let w = matmul(&b, "root.cluster0.sm1.atlas", x, vec![]).with_inferred_version(3);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let x = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let w = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]).with_inferred_version(3);
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.invoke(w).await;
@@ -265,12 +265,8 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
     // counter (none) is below 1, so a pending entry for (X, 1) waits, and
     // P adopts it.
     let b = built_with(&[]);
-    let (sm0, sm1, dev) = (
-        b.nu("root.cluster0.sm0"),
-        b.nu("root.cluster0.sm1"),
-        b.nu("root"),
-    );
-    let x = Range::from_len(b.memory("root.cluster0.sm1.smem").base, MAT);
+    let (sm0, sm1, dev) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"), b.nu("root"));
+    let x = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
     let h = Range::from_len(b.memory("root.hbm").base, MAT);
     let c = Descriptor {
         opcode: b.sim.profiles().lookup("dma").unwrap(),
@@ -287,7 +283,7 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
             tile_bytes: MAT,
         },
     };
-    let p = matmul(&b, "root.cluster0.sm1.atlas", x, vec![]).with_inferred_version(1);
+    let p = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]).with_inferred_version(1);
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.invoke(c).await;
@@ -342,10 +338,10 @@ fn backpressure_holds_invokes_across_two_hops() {
     // there for M2. At 392 M1 issues, M2 enters and M3 moves into the
     // table; at 584 M2 issues and M3 enters.
     let b = built_with(&["scoreboard=1", "inbound_invokes=1"]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
     let at = |i: u64| Range::from_len(s1 + i * MAT, MAT);
-    let atlas = "root.cluster0.sm1.atlas";
+    let atlas = "root.gpc0.sm1.atlas";
     let (p1, p2) = (
         matmul(&b, atlas, at(0), vec![]),
         matmul(&b, atlas, at(1), vec![]),
@@ -382,10 +378,10 @@ fn backpressure_holds_invokes_across_two_hops() {
     // and M3 [214,392); the stage after the port to sm1 M3 [58,200); none
     // after the port from sm0; sm0's source queue M2 [16,24) and M3
     // [24,40).
-    assert_eq!(hol("root.cluster0.sm1.bridge.down.ctl.invoke"), 144 + 178);
-    assert_eq!(hol("root.cluster0.CSBUS.sm1.out.ctl.invoke"), 142);
-    assert_eq!(hol("root.cluster0.CSBUS.sm0.in.ctl.invoke"), 0);
-    assert_eq!(hol("root.cluster0.sm0.source.invoke"), 8 + 16);
+    assert_eq!(hol("root.gpc0.sm1.bridge.down.ctl.invoke"), 144 + 178);
+    assert_eq!(hol("root.gpc0.clcbus.sm1.out.invoke"), 142);
+    assert_eq!(hol("root.gpc0.clcbus.sm0.in.invoke"), 0);
+    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 8 + 16);
 }
 
 #[test]
@@ -396,13 +392,13 @@ fn the_deadlock_detector_fires_on_a_cycle() {
     // M2 in the channel for M1. No event is left: the run ends with a
     // Deadlock that names the stage holding M2.
     let b = built_with(&["scoreboard=1", "inbound_invokes=1"]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
     let at = |i: u64| Range::from_len(s1 + i * MAT, MAT);
-    let t = matmul(&b, "root.cluster0.sm1.atlas", at(0), vec![v1(at(5))]);
+    let t = matmul(&b, "root.gpc0.sm1.atlas", at(0), vec![v1(at(5))]);
     let (m1, m2) = (
-        matmul(&b, "root.cluster0.sm1.atlas", at(1), vec![]).with_inferred_version(1),
-        matmul(&b, "root.cluster0.sm1.atlas", at(2), vec![]).with_inferred_version(1),
+        matmul(&b, "root.gpc0.sm1.atlas", at(1), vec![]).with_inferred_version(1),
+        matmul(&b, "root.gpc0.sm1.atlas", at(2), vec![]).with_inferred_version(1),
     );
     let mut sim = b.sim;
     sim.spawn(sm1, move |ctx: NuCtx| async move {
@@ -421,7 +417,7 @@ fn the_deadlock_detector_fires_on_a_cycle() {
     assert_eq!((t1.scoreboard, t1.inbound_invokes, t1.pending), (1, 1, 1));
     assert_eq!(tables[sm0.0 as usize].outbound_invokes, 0);
     assert_eq!(stages.len(), 1, "{stages:?}");
-    assert_eq!(stages[0].stage, "root.cluster0.sm1.bridge.down.ctl.invoke");
+    assert_eq!(stages[0].stage, "root.gpc0.sm1.bridge.down.ctl.invoke");
     assert_eq!(stages[0].messages, 1);
 }
 
@@ -431,8 +427,8 @@ fn a_join_with_20_deps_travels_in_3_beats() {
     // first writes version 1 of 20 ranges with local joins (done by 208);
     // sm0 forwards the join on them at 208, so it is ready on arrival.
     let b = built_with(&[]);
-    let (sm0, sm1) = (b.nu("root.cluster0.sm0"), b.nu("root.cluster0.sm1"));
-    let s1 = b.memory("root.cluster0.sm1.smem").base;
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
     let at = |i: u64| Range::from_len(s1 + i * 512, 512);
     let j = at(0);
     let signals: Vec<Descriptor> = (1..21)

@@ -10,7 +10,7 @@ fn trace(records: Records) -> Trace {
         &[MemBlock {
             name: "m".into(),
             owner: NeutrinoId(0),
-            attach: None,
+            attach: Vec::new(),
             numeric: true,
             range: Range::new(0, 0x10_0000),
             port: ResourceId(0),
@@ -44,6 +44,7 @@ fn task(label: Option<u64>, dst: Range) -> Descriptor {
             ops: 1,
             bytes_in: 0,
             bytes_out: 0,
+            src: None,
         },
     }
 }

@@ -85,10 +85,12 @@ pub enum Args {
     Vector {
         /// Lane-ops of the task.
         ops: u64,
-        /// SMEM bytes read.
+        /// Bytes read, from the block that holds `src`.
         bytes_in: u64,
-        /// SMEM bytes written.
+        /// Bytes written, to the block that holds `dst`.
         bytes_out: u64,
+        /// The address the task reads; `None`: the block of `dst`.
+        src: Option<Addr>,
     },
     /// Start a program on the child Neutrino.
     Spawn {
@@ -195,7 +197,8 @@ impl Descriptor {
         let args = match self.args {
             Args::Dma { .. } => 32,
             Args::Matmul { .. } => 52,
-            Args::Vector { .. } => 24,
+            Args::Vector { src: None, .. } => 24,
+            Args::Vector { src: Some(_), .. } => 32,
             Args::Join => 0,
             Args::Spawn { .. } => 4,
         };
@@ -337,9 +340,10 @@ impl ProfileRegistry {
 }
 
 /// DMA: one chunk per `tile_bytes`; bandwidth on the source port, the
-/// engine's extra links, the fabric path from the source block's node to the
-/// destination block's node, and the destination port. Chunk latency is the
-/// engine latency plus the path latency.
+/// engine's extra links, the fabric route from the source block to the
+/// engine and from the engine to the destination block (each over the
+/// engine's master bus with the fewest bridges), and the destination port.
+/// Chunk latency is the engine latency plus the two route latencies.
 pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Dma {
         src,
@@ -350,13 +354,27 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     else {
         panic!("dma with args {:?}", desc.args);
     };
-    let PeParams::Dma { links, latency } = &node.pe.params else {
+    let PeParams::Dma {
+        links,
+        latency,
+        masters,
+    } = &node.pe.params
+    else {
         panic!("dma opcode on PE {}", node.pe.name);
     };
     assert!(tile_bytes > 0, "dma with tile_bytes 0");
     let (sm, dm) = (node.memory(src), node.memory(dst));
     let (src_port, dst_port) = (sm.port, dm.port);
-    let path = node.topology.attach_path(sm.attach, dm.attach);
+    let route =
+        |from: &[crate::topology::AttachId], to: &[crate::topology::AttachId], what: &str| {
+            node.topology
+                .best_path(from, to)
+                .unwrap_or_else(|| panic!("{}: no route {what}", node.pe.name))
+        };
+    let (inp, out) = (
+        route(&sm.attach, masters, "from the source"),
+        route(masters, &dm.attach, "to the destination"),
+    );
     let mut chunks = Vec::with_capacity(bytes.div_ceil(tile_bytes) as usize);
     let mut left = bytes;
     while left > 0 {
@@ -364,11 +382,12 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         left -= n;
         let mut demand = vec![Demand::new(src_port, n)];
         demand.extend(links.iter().map(|l| Demand::new(*l, n)));
-        demand.extend(path.resources.iter().map(|r| Demand::new(*r, n)));
+        demand.extend(inp.resources.iter().map(|r| Demand::new(*r, n)));
+        demand.extend(out.resources.iter().map(|r| Demand::new(*r, n)));
         demand.push(Demand::new(dst_port, n));
         chunks.push(Chunk {
             demand,
-            latency: *latency + path.latency,
+            latency: *latency + inp.latency + out.latency,
         });
     }
     Profile {
@@ -475,31 +494,56 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
 }
 
 /// Muon vector task: one chunk; lane-ops on the vector resource at the
-/// configured utilization plus SMEM bytes, after the fixed overhead.
+/// configured utilization, plus the task's bytes on the port of the block
+/// that holds `dst` and on the route to it, after the fixed overhead and
+/// the route latency.
 pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Vector {
         ops,
         bytes_in,
         bytes_out,
+        src,
     } = desc.args
     else {
         panic!("vector op with args {:?}", desc.args);
     };
     let PeParams::Muon {
         vector,
-        smem_port,
+        ref masters,
         utilization,
         overhead,
     } = node.pe.params
     else {
         panic!("vector opcode on PE {}", node.pe.name);
     };
+    // The blocks it reads and writes: the SM's SMEM over lbus, a remote
+    // range over the SM's data bus. A resource on both routes is charged
+    // once for both byte counts.
     let mut v = Demand::new(vector, ops);
     v.utilization = utilization;
+    let mut demand = vec![v];
+    let mut latency = 0;
+    let out_block = node.memory(Addr(desc.dst.base));
+    let in_block = src.map_or(out_block, |a| node.memory(a));
+    for (block, bytes, to) in [(in_block, bytes_in, false), (out_block, bytes_out, true)] {
+        let route = if to {
+            node.topology.best_path(masters, &block.attach)
+        } else {
+            node.topology.best_path(&block.attach, masters)
+        }
+        .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
+        latency = latency.max(route.latency);
+        for r in route.resources.iter().chain([&block.port]) {
+            match demand.iter_mut().find(|d| d.resource == *r) {
+                Some(d) => d.amount += bytes,
+                None => demand.push(Demand::new(*r, bytes)),
+            }
+        }
+    }
     Profile {
         chunks: vec![Chunk {
-            demand: vec![v, Demand::new(smem_port, bytes_in + bytes_out)],
-            latency: overhead,
+            demand,
+            latency: overhead + latency,
         }],
         holds: Vec::new(),
     }

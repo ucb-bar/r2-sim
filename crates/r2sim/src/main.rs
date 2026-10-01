@@ -301,16 +301,20 @@ fn run(argv: &[String]) -> Result<(), String> {
         b.sim.set_atlas_acc_buffer(bytes);
     }
     let launch = nu_prog::launch(&program, &b, granule, &params_text, &overrides)?;
-    // HBM rate for the bound.
-    let hbm_port = b
+    // HBM rate for the bound: every slice.
+    let rate_f: f64 = b
         .sim
         .memories()
         .iter()
-        .find(|m| m.name.ends_with(".hbm"))
-        .map(|m| m.port)
-        .ok_or("no memory named hbm")?;
-    let rate = b.sim.resources().flow(hbm_port).rate();
-    let rate_f = rate.num as f64 / rate.den as f64;
+        .filter(|m| m.name.ends_with(".hbm"))
+        .map(|m| {
+            let r = b.sim.resources().flow(m.port).rate();
+            r.num as f64 / r.den as f64
+        })
+        .sum();
+    if rate_f == 0.0 {
+        return Err("no memory named hbm".into());
+    }
 
     let driver_scalar = format!("{}.scalar", b.sim.topology().path_name(launch.nu));
     let home_path = b.sim.topology().path_name(launch.nu);

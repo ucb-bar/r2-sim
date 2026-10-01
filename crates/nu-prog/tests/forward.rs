@@ -23,7 +23,7 @@ fn reserve(copies: bool) -> (Vec<u64>, u64) {
 #[test]
 fn prefill_activations_and_action_weights_share_cmem_without_overlap() {
     // Prefill activations (VLM 40 MB, vision 18 MB) take the start of
-    // cluster0's cmem; with copies, of every cluster's. The action expert's
+    // gpc0's cmem; with copies, of every cluster's. The action expert's
     // weights fill the rest.
     let (r, placed) = reserve(false);
     assert!(r[0] > 50 << 20 && r[0] < 64 << 20);
