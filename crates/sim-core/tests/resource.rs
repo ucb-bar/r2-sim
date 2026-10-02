@@ -5,20 +5,43 @@ fn reserve(r: &mut Resources, d: &[Demand], t: u64) -> Grant {
 }
 
 #[test]
-fn fractional_carry_keeps_the_rate() {
-    // Rate 2/3 unit per cycle: one unit takes 1.5 cycles.
+fn transfers_take_whole_cycles_without_carry() {
+    // A link moves whole beats: two half-width messages take two cycles.
     let mut r = Resources::new();
-    let f = r.add_flow("f", Kind::Bandwidth, Ratio::new(2, 3));
-    let ends: Vec<u64> = (0..4)
-        .map(|_| reserve(&mut r, &[Demand::work(f, 1)], 0).end)
+    let f = r.add_flow("ctl", Kind::Bandwidth, Ratio::int(128));
+    let ends: Vec<u64> = (0..2)
+        .map(|_| reserve(&mut r, &[Demand::write(f, 64)], 0).end)
         .collect();
-    assert_eq!(ends, vec![2, 3, 5, 6]);
-    // 100 more units at the rate: exactly 150 cycles in total from 6.
-    let mut end = 0;
-    for _ in 0..100 {
-        end = reserve(&mut r, &[Demand::work(f, 1)], 0).end;
-    }
-    assert_eq!(end, 156);
+    assert_eq!(ends, vec![1, 2]);
+    // 64 KiB on a 273 B/cycle port: ceil(65536 / 273) = 241 cycles, and
+    // the next chunk starts fresh: 241 again.
+    let p = r.add_flow("port", Kind::Bandwidth, Ratio::int(273));
+    let g = reserve(&mut r, &[Demand::read(p, 65536)], 0);
+    assert_eq!((g.start, g.end), (0, 241));
+    let g = reserve(&mut r, &[Demand::read(p, 65536)], 0);
+    assert_eq!((g.start, g.end), (241, 482));
+    // A rational rate: one unit at 2/3 per cycle takes 2 cycles each time.
+    let q = r.add_flow("q", Kind::Bandwidth, Ratio::new(2, 3));
+    let ends: Vec<u64> = (0..3)
+        .map(|_| reserve(&mut r, &[Demand::work(q, 1)], 0).end)
+        .collect();
+    assert_eq!(ends, vec![2, 4, 6]);
+}
+
+#[test]
+fn a_small_transfer_takes_one_cycle() {
+    // 1 B on a 273 B/cycle port and 1 lane-op on a half-used 256-wide
+    // vector unit: one whole cycle each, never zero.
+    let mut r = Resources::new();
+    let p = r.add_flow("port", Kind::Bandwidth, Ratio::int(273));
+    let mut v = Demand::work(r.add_flow("muon", Kind::VectorOps, Ratio::int(256)), 1);
+    v.utilization = Ratio::new(1, 2);
+    let g = reserve(&mut r, &[Demand::read(p, 1)], 5);
+    assert_eq!((g.start, g.end), (5, 6));
+    let g = reserve(&mut r, &[Demand::read(p, 1)], 5);
+    assert_eq!((g.start, g.end), (6, 7));
+    let g = reserve(&mut r, &[v], 0);
+    assert_eq!((g.start, g.end), (0, 1));
 }
 
 #[test]
@@ -80,23 +103,6 @@ fn occupancy_is_fifo() {
     assert!(r.try_acquire(s, 1));
     assert!(!r.fits(s, 1));
     let _: ResourceId = s;
-}
-
-#[test]
-fn carry_only_on_resources_charged_their_own_duration() {
-    let mut r = Resources::new();
-    r.set_cocharge(CoCharge::Longest);
-    let a = r.add_flow("a", Kind::TensorOps, Ratio::ONE);
-    let b = r.add_flow("b", Kind::Bandwidth, Ratio::new(2, 3));
-    // b needs 1.5 cycles (2 with a carry of 0.5), but is charged 10 with a.
-    let g = reserve(&mut r, &[Demand::work(a, 10), Demand::work(b, 1)], 0);
-    assert_eq!((g.start, g.end, g.culprit), (0, 10, a));
-    // No carry on b: its next unit takes 2 cycles, not 1.
-    let g = reserve(&mut r, &[Demand::work(b, 1)], 100);
-    assert_eq!((g.start, g.end), (100, 102));
-    // Carry kept where the own duration is the charged one.
-    let g = reserve(&mut r, &[Demand::work(b, 1)], 100);
-    assert_eq!((g.start, g.end), (102, 103));
 }
 
 #[test]

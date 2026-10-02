@@ -1,9 +1,10 @@
 //! The resource plane (architecture Section 5).
 //!
 //! A flow resource has a rational rate and a calendar of busy intervals.
-//! A chunk occupies it exclusively for whole cycles; a per-resource
-//! fractional carry keeps the long-run throughput equal to the rate. An
-//! occupancy resource has a size and a FIFO of waiters.
+//! A chunk occupies it exclusively for whole cycles: a link moves whole
+//! beats, so a transfer takes `ceil(amount / (rate * utilization))`
+//! cycles, at least one, and nothing carries over to the next transfer
+//! (Section 5.2). An occupancy resource has a size and a FIFO of waiters.
 //!
 //! [`Resources::reserve`] co-charges one chunk over all resources of its
 //! demand vector (Section 5.4) and returns the granted interval and the
@@ -11,7 +12,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::time::{gcd, Cycle, Ratio};
+use crate::time::{Cycle, Ratio};
 
 /// Index of one resource instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
@@ -129,25 +130,12 @@ pub struct Grant {
     pub queue_culprit: Option<ResourceId>,
 }
 
-/// Sub-cycle remainder in cycles, `num / den`, `num < den`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Carry {
-    num: u128,
-    den: u128,
-}
-
-impl Carry {
-    const ZERO: Carry = Carry { num: 0, den: 1 };
-}
-
 /// A flow resource: a rate and a calendar.
 #[derive(Debug, Clone)]
 pub struct FlowResource {
     rate: Ratio,
     /// Busy intervals, start -> end; disjoint, merged when adjacent.
     busy: BTreeMap<Cycle, Cycle>,
-    /// Credit from earlier round-ups; subtracted from the next duration.
-    carry: Carry,
     busy_total: u64,
     /// `busy_total` by direction.
     busy_dir: DirCycles,
@@ -173,7 +161,6 @@ impl FlowResource {
         Self {
             rate,
             busy: BTreeMap::new(),
-            carry: Carry::ZERO,
             busy_total: 0,
             busy_dir: [0; 3],
             culprit_total: 0,
@@ -186,38 +173,23 @@ impl FlowResource {
         self.rate
     }
 
-    /// Whole cycles for `amount` at `util`, after the carry, and the new
-    /// carry. The exact duration is `amount / (rate * util)`.
-    fn duration(&self, amount: u64, util: Ratio) -> (u64, Carry) {
+    /// Whole cycles for `amount` at `util`: `ceil(amount / (rate * util))`,
+    /// at least one for a nonzero amount; 0 for none.
+    fn duration(&self, amount: u64, util: Ratio) -> u64 {
         assert!(
             util.num > 0 && util.num <= util.den,
             "utilization must be in (0, 1]"
         );
-        // Fast path: integer rate, full utilization, no carry, exact.
-        if self.carry.num == 0 && self.rate.den == 1 && util.num == util.den {
-            let r = self.rate.num;
-            if amount.is_multiple_of(r) {
-                return (amount / r, Carry::ZERO);
-            }
+        if amount == 0 {
+            return 0;
+        }
+        // Fast path: integer rate, full utilization.
+        if self.rate.den == 1 && util.num == util.den {
+            return amount.div_ceil(self.rate.num);
         }
         let e_num = amount as u128 * self.rate.den as u128 * util.den as u128;
         let e_den = self.rate.num as u128 * util.num as u128;
-        let c = self.carry;
-        // x = e - c over den = e_den * c.den. On overflow, drop the carry.
-        let (Some(a), Some(b), Some(den)) = (
-            e_num.checked_mul(c.den),
-            c.num.checked_mul(e_den),
-            e_den.checked_mul(c.den),
-        ) else {
-            let d = e_num.div_ceil(e_den);
-            return (d as u64, reduce(d * e_den - e_num, e_den));
-        };
-        if a <= b {
-            return (0, reduce(b - a, den));
-        }
-        let x = a - b;
-        let d = x.div_ceil(den);
-        (d as u64, reduce(d * den - x, den))
+        e_num.div_ceil(e_den).max(1) as u64
     }
 
     /// The earliest `t' >= t` with `[t', t' + d)` free.
@@ -275,17 +247,6 @@ impl FlowResource {
             }
             self.busy.remove(&s);
         }
-    }
-}
-
-fn reduce(num: u128, den: u128) -> Carry {
-    if num == 0 {
-        return Carry::ZERO;
-    }
-    let g = gcd(num, den);
-    Carry {
-        num: num / g,
-        den: den / g,
     }
 }
 
@@ -389,7 +350,7 @@ pub struct Resources {
     merged: Vec<Demand>,
     /// Per merged demand: its amount by direction.
     merged_dir: Vec<DirCycles>,
-    own: Vec<(ResourceId, u64, Carry, Cycle)>,
+    own: Vec<(ResourceId, u64, Cycle)>,
 }
 
 impl Resources {
@@ -522,7 +483,7 @@ impl Resources {
         &mut self,
         merged: &[Demand],
         merged_dir: &[DirCycles],
-        own: &mut Vec<(ResourceId, u64, Carry, Cycle)>,
+        own: &mut Vec<(ResourceId, u64, Cycle)>,
         earliest: Cycle,
     ) -> Option<Grant> {
         if merged.is_empty() {
@@ -531,11 +492,11 @@ impl Resources {
         // Step 1: own durations and own earliest starts.
         own.extend(merged.iter().map(|d| {
             let f = self.flow(d.resource);
-            let (dur, carry) = f.duration(d.amount, d.utilization);
-            (d.resource, dur, carry, f.earliest(earliest, dur))
+            let dur = f.duration(d.amount, d.utilization);
+            (d.resource, dur, f.earliest(earliest, dur))
         }));
         // Step 2.
-        let mut t = own.iter().map(|o| o.3).max().expect("nonempty");
+        let mut t = own.iter().map(|o| o.2).max().expect("nonempty");
         let big_d = own.iter().map(|o| o.1).max().expect("nonempty");
         // Step 3: fixpoint; t only advances. Each resource must be free for
         // the length it is charged.
@@ -552,14 +513,9 @@ impl Resources {
             }
             t = next;
         }
-        // Step 4. A resource charged longer than its own duration keeps no
-        // carry: the extra charge already exceeds its sub-cycle remainder.
-        for (i, &(r, d, carry, _)) in own.iter().enumerate() {
-            let f = self.flow_mut(r);
-            let parts = f.charge(t, charged(d), &merged_dir[i]);
-            f.carry = if charged(d) == d { carry } else { Carry::ZERO };
-            // A charge of 0 cycles (a carry) is recorded too: its amount
-            // still moves.
+        // Step 4.
+        for (i, &(r, d, _)) in own.iter().enumerate() {
+            let parts = self.flow_mut(r).charge(t, charged(d), &merged_dir[i]);
             if self.record {
                 for (k, dir) in [Dir::Read, Dir::Write, Dir::Work].into_iter().enumerate() {
                     if merged_dir[i][k] > 0 {
@@ -578,14 +534,14 @@ impl Resources {
         // Culprit: longest own duration; on a tie, the latest own start.
         let culprit = own
             .iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then(a.3.cmp(&b.3)).then(b.0.cmp(&a.0)))
+            .max_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)).then(b.0.cmp(&a.0)))
             .expect("nonempty")
             .0;
         self.flow_mut(culprit).culprit_total += big_d;
         let queue_culprit = (t > earliest).then(|| {
             let queued = own
                 .iter()
-                .max_by(|a, b| a.3.cmp(&b.3).then(b.0.cmp(&a.0)))
+                .max_by(|a, b| a.2.cmp(&b.2).then(b.0.cmp(&a.0)))
                 .expect("nonempty")
                 .0;
             self.flow_mut(queued).delay_total += t - earliest;

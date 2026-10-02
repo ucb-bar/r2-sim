@@ -139,19 +139,20 @@ fn one_moe_dispatch() {
     assert_eq!(r.tokens_per_expert, vec![vec![vec![14, 2]]]);
     // Critical path (by hand, own co-charging, control lanes; a 1-beat
     // message between SMs takes 68 cycles, see one_linear_layer): rmsnorm
-    // [18, 274); router [278, 351); the load of its output; the first
-    // forward of the MoE window starts on sm0's up bridge at 374 and enters
-    // sm1 at 442. sm1's x DMA [512, 736) holds sm1's bridge; expert 0's
-    // gate weight follows [736, 2784). The two experts run in parallel.
-    // Expert 1 on sm2 (2 tokens): gate weight [1760, 3808) (it queued on
+    // [18, 274); router [278, 351); the load of its output (16 B on the
+    // 128 B/cycle SMEM port: one whole cycle, [366, 367)); the first
+    // forward of the MoE window starts on sm0's up bridge at 375 and enters
+    // sm1 at 443. sm1's x DMA [513, 737) holds sm1's bridge; expert 0's
+    // gate weight follows [737, 2785). The two experts run in parallel.
+    // Expert 1 on sm2 (2 tokens): gate weight [1761, 3809) (it queued on
     // HBM behind expert 0's gate weight for HBM's own 1024 cycles), up
-    // [3808, 5856), down weight [5856, 7904) (back to back on sm2's bridge;
-    // expert 0's down weight holds HBM only until 5856), down matmul
-    // 2 x 264 cycles [7908, 8436), done 8440. Home depends on the down
+    // [3809, 5857), down weight [5857, 7905) (back to back on sm2's bridge;
+    // expert 0's down weight holds HBM only until 5857), down matmul
+    // 2 x 264 cycles [7909, 8437), done 8441. Home depends on the down
     // matmul's output directly (a pin, no end join): Resolve reaches home
-    // at 8508; pull [8578, 8610); add [8624, 8648), done 8652; the driver
-    // resumes at 8652.
-    assert_eq!(r.step_end[0], 8652);
+    // at 8509; pull [8579, 8611); add [8625, 8649), done 8653; the driver
+    // resumes at 8653.
+    assert_eq!(r.step_end[0], 8653);
     // 16 Invoke, 2 Await, 2 AwaitAck, 2 Resolve.
     assert_eq!(s.messages, 22);
 }
