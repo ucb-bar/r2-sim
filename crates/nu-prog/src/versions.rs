@@ -94,11 +94,53 @@ impl VersionState {
         self.mode = mode;
     }
 
+    /// The same owners and policy, nothing tracked yet (another driver's
+    /// own bookkeeping).
+    pub(crate) fn fresh(&self) -> Self {
+        Self {
+            mode: self.mode,
+            owners: self
+                .owners
+                .iter()
+                .map(|o| Owner {
+                    nu: o.nu,
+                    own: o.own,
+                    capacity: o.capacity,
+                    live: HashMap::new(),
+                    signals: Vec::new(),
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// A program Start reset the version tables of the owners whose own
+    /// spaces are `spaces` (the gpcs at a stage start): their counters and
+    /// live ranges start again, and nothing is left to reset there.
+    pub(crate) fn reset_spaces(&mut self, spaces: &[Range]) {
+        let inside = |a: u64| spaces.iter().any(|r| r.covers(&Range::from_len(a, 1)));
+        self.remote.retain(|a, _| !inside(*a));
+        self.queued_data.retain(|a| !inside(*a));
+        self.queued_signal.retain(|a| !inside(*a));
+        self.kept.retain(|a| !inside(*a));
+        for o in &mut self.owners {
+            if spaces.contains(&o.own) {
+                o.live.clear();
+                o.signals.clear();
+            }
+        }
+    }
+
     /// The inferred version of the next forwarded invoke on base `addr`.
     pub(crate) fn next_version(&mut self, addr: u64) -> u64 {
         let v = self.remote.entry(addr).or_insert(0);
         *v += 1;
         *v
+    }
+
+    /// A local invoke on base `addr` got version `v` from its owner.
+    pub(crate) fn note_version(&mut self, addr: u64, v: u64) {
+        self.remote.insert(addr, v);
     }
 
     /// A versioned invoke on `dst` in the current window; `signal` for a

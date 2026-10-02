@@ -40,6 +40,26 @@ impl Kind {
     }
 }
 
+/// What a demand's amount is: bytes read, bytes written, or work (MACs,
+/// lane-ops, instructions). Reads and writes are charged alike; the
+/// direction is recorded in the statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum Dir {
+    /// Bytes read: toward the reader (a memory read, a DMA's source side).
+    Read,
+    /// Bytes written: toward the target (a memory write, a DMA's
+    /// destination side, a message).
+    Write,
+    /// Compute: tensor ops, vector ops, scalar instructions.
+    Work,
+}
+
+impl Dir {
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// One demand of a chunk on one flow resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Demand {
@@ -49,17 +69,50 @@ pub struct Demand {
     pub amount: u64,
     /// Exclusive efficiency in (0, 1] (Section 5.6).
     pub utilization: Ratio,
+    /// Read, write or work.
+    pub dir: Dir,
 }
 
 impl Demand {
     /// A demand of `amount` on `resource` at full utilization.
-    pub fn new(resource: ResourceId, amount: u64) -> Self {
+    pub fn new(resource: ResourceId, amount: u64, dir: Dir) -> Self {
         Self {
             resource,
             amount,
             utilization: Ratio::ONE,
+            dir,
         }
     }
+
+    /// `amount` bytes read on `resource`.
+    pub fn read(resource: ResourceId, amount: u64) -> Self {
+        Self::new(resource, amount, Dir::Read)
+    }
+
+    /// `amount` bytes written on `resource`.
+    pub fn write(resource: ResourceId, amount: u64) -> Self {
+        Self::new(resource, amount, Dir::Write)
+    }
+
+    /// `amount` units of work on `resource`.
+    pub fn work(resource: ResourceId, amount: u64) -> Self {
+        Self::new(resource, amount, Dir::Work)
+    }
+}
+
+/// Cycles split by direction, indexed by [`Dir`] (read, write, work).
+pub type DirCycles = [u64; 3];
+
+/// Splits `d` charged cycles in proportion to `amounts` (by direction);
+/// the parts sum to `d`.
+fn split(d: u64, amounts: &DirCycles) -> DirCycles {
+    let tot: u128 = amounts.iter().map(|&a| a as u128).sum();
+    if tot == 0 {
+        return [0, 0, d];
+    }
+    let part = |a: u64| (d as u128 * a as u128 / tot) as u64;
+    let (r, k) = (part(amounts[0]), part(amounts[2]));
+    [r, d - r - k, k]
 }
 
 /// The interval granted to one chunk.
@@ -93,9 +146,23 @@ pub struct FlowResource {
     /// Credit from earlier round-ups; subtracted from the next duration.
     carry: Carry,
     busy_total: u64,
+    /// `busy_total` by direction.
+    busy_dir: DirCycles,
     culprit_total: u64,
     delay_total: u64,
-    log: Option<Vec<(Cycle, Cycle)>>,
+    log: Option<Vec<LogEntry>>,
+}
+
+/// One charged interval and its cycles by direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LogEntry {
+    /// First cycle.
+    pub start: Cycle,
+    /// End (exclusive).
+    pub end: Cycle,
+    /// Its cycles by direction (read, write, work); they sum to
+    /// `end - start`.
+    pub dir: DirCycles,
 }
 
 impl FlowResource {
@@ -106,6 +173,7 @@ impl FlowResource {
             busy: BTreeMap::new(),
             carry: Carry::ZERO,
             busy_total: 0,
+            busy_dir: [0; 3],
             culprit_total: 0,
             delay_total: 0,
             log: log.then(Vec::new),
@@ -168,9 +236,13 @@ impl FlowResource {
         t
     }
 
-    fn charge(&mut self, start: Cycle, d: u64) {
+    fn charge(&mut self, start: Cycle, d: u64, amounts: &DirCycles) {
         if d == 0 {
             return;
+        }
+        let parts = split(d, amounts);
+        for (b, p) in self.busy_dir.iter_mut().zip(parts) {
+            *b += p;
         }
         let mut s = start;
         let mut e = start + d;
@@ -191,7 +263,11 @@ impl FlowResource {
         self.busy.insert(s, e);
         self.busy_total += d;
         if let Some(log) = &mut self.log {
-            log.push((start, start + d));
+            log.push(LogEntry {
+                start,
+                end: start + d,
+                dir: parts,
+            });
         }
     }
 
@@ -271,10 +347,16 @@ pub struct ResourceStats {
     pub kind: Kind,
     /// Flow: charged cycles. Occupancy: 0.
     pub busy_cycles: u64,
+    /// The part of `busy_cycles` charged for reads.
+    pub busy_read: u64,
+    /// The part charged for writes.
+    pub busy_write: u64,
+    /// The part charged for work (compute).
+    pub busy_work: u64,
     /// Occupancy: the largest amount held at once.
     pub peak: u64,
     /// Flow: charged intervals, when logging is on.
-    pub log: Option<Vec<(Cycle, Cycle)>>,
+    pub log: Option<Vec<LogEntry>>,
     /// Flow: cycles of the chunks for which this resource was the culprit
     /// (the longest own duration).
     pub culprit_cycles: u64,
@@ -306,6 +388,8 @@ pub struct Resources {
     cocharge: CoCharge,
     /// Scratch buffers of `reserve`, kept to avoid allocation.
     merged: Vec<Demand>,
+    /// Per merged demand: its amount by direction.
+    merged_dir: Vec<DirCycles>,
     own: Vec<(ResourceId, u64, Carry, Cycle)>,
 }
 
@@ -328,6 +412,7 @@ impl Resources {
             log,
             cocharge: CoCharge::Own,
             merged: Vec::new(),
+            merged_dir: Vec::new(),
             own: Vec::new(),
         }
     }
@@ -424,11 +509,13 @@ impl Resources {
     /// `None` for an empty demand vector.
     pub fn reserve(&mut self, demand: &[Demand], earliest: Cycle) -> Option<Grant> {
         let mut merged = std::mem::take(&mut self.merged);
+        let mut merged_dir = std::mem::take(&mut self.merged_dir);
         let mut own = std::mem::take(&mut self.own);
-        merge(demand, &mut merged);
+        merge(demand, &mut merged, &mut merged_dir);
         own.clear();
-        let grant = self.co_charge(&merged, &mut own, earliest);
+        let grant = self.co_charge(&merged, &merged_dir, &mut own, earliest);
         self.merged = merged;
+        self.merged_dir = merged_dir;
         self.own = own;
         grant
     }
@@ -436,6 +523,7 @@ impl Resources {
     fn co_charge(
         &mut self,
         merged: &[Demand],
+        merged_dir: &[DirCycles],
         own: &mut Vec<(ResourceId, u64, Carry, Cycle)>,
         earliest: Cycle,
     ) -> Option<Grant> {
@@ -468,9 +556,9 @@ impl Resources {
         }
         // Step 4. A resource charged longer than its own duration keeps no
         // carry: the extra charge already exceeds its sub-cycle remainder.
-        for &(r, d, carry, _) in own.iter() {
+        for (i, &(r, d, carry, _)) in own.iter().enumerate() {
             let f = self.flow_mut(r);
-            f.charge(t, charged(d));
+            f.charge(t, charged(d), &merged_dir[i]);
             f.carry = if charged(d) == d { carry } else { Carry::ZERO };
         }
         // Culprit: longest own duration; on a tie, the latest own start.
@@ -552,6 +640,9 @@ impl Resources {
                     name: r.name.clone(),
                     kind: r.kind,
                     busy_cycles: f.busy_total,
+                    busy_read: f.busy_dir[0],
+                    busy_write: f.busy_dir[1],
+                    busy_work: f.busy_dir[2],
                     peak: 0,
                     log: f.log.clone(),
                     culprit_cycles: f.culprit_total,
@@ -561,6 +652,9 @@ impl Resources {
                     name: r.name.clone(),
                     kind: r.kind,
                     busy_cycles: 0,
+                    busy_read: 0,
+                    busy_write: 0,
+                    busy_work: 0,
                     peak: o.peak,
                     log: None,
                     culprit_cycles: 0,
@@ -573,18 +667,25 @@ impl Resources {
 
 /// Sums demands on the same resource and utilization into `out`; drops
 /// zero amounts.
-fn merge(demand: &[Demand], out: &mut Vec<Demand>) {
+fn merge(demand: &[Demand], out: &mut Vec<Demand>, dirs: &mut Vec<DirCycles>) {
     out.clear();
+    dirs.clear();
     for d in demand.iter().filter(|d| d.amount > 0) {
-        match out.iter_mut().find(|o| o.resource == d.resource) {
-            Some(o) => {
+        match out.iter().position(|o| o.resource == d.resource) {
+            Some(i) => {
                 assert_eq!(
-                    o.utilization, d.utilization,
+                    out[i].utilization, d.utilization,
                     "two demands on one resource with different utilization"
                 );
-                o.amount += d.amount;
+                out[i].amount += d.amount;
+                dirs[i][d.dir.index()] += d.amount;
             }
-            None => out.push(*d),
+            None => {
+                out.push(*d);
+                let mut a = [0; 3];
+                a[d.dir.index()] = d.amount;
+                dirs.push(a);
+            }
         }
     }
 }

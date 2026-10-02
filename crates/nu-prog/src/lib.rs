@@ -40,8 +40,14 @@ pub type ProgramFn = Box<dyn FnOnce(NuCtx) -> Pin<Box<dyn Future<Output = ()>>>>
 
 /// A program ready to spawn.
 pub struct Launch {
-    /// The Neutrino that runs the program (the home SM).
+    /// The Neutrino that runs the program (the home SM, or the device
+    /// with per-gpc drivers).
     pub nu: NeutrinoId,
+    /// The Neutrinos whose programs invoke the tasks (the home SM, or the
+    /// gpcs).
+    pub drivers: Vec<NeutrinoId>,
+    /// The home SM (it runs no GEMM work).
+    pub home: NeutrinoId,
     /// The program to spawn on `nu`.
     pub program: ProgramFn,
     /// The action expert's report (`adamoe`; the action stage of `forward`).
@@ -90,6 +96,8 @@ pub fn launch(
             let nu = d.home_nu();
             Ok(Launch {
                 nu,
+                drivers: vec![nu],
+                home: nu,
                 program: Box::new(move |ctx| Box::pin(d.run(ctx))),
                 report,
                 prefill: None,
@@ -101,9 +109,11 @@ pub fn launch(
             let m = Machine::from_built(built, granule)?;
             let d = forward::Driver::new(m, p)?;
             let (report, fwd) = (d.action_report.clone(), d.report.clone());
-            let nu = d.home_nu();
+            let (nu, drivers, home) = (d.home_nu(), d.drivers(), d.home_sm());
             Ok(Launch {
                 nu,
+                drivers,
+                home,
                 program: Box::new(move |ctx| Box::pin(d.run(ctx))),
                 report,
                 prefill: None,
@@ -118,6 +128,8 @@ pub fn launch(
             let nu = d.home_nu();
             Ok(Launch {
                 nu,
+                drivers: vec![nu],
+                home: nu,
                 program: Box::new(move |ctx| Box::pin(d.run(ctx))),
                 report: Default::default(),
                 prefill: Some(report),

@@ -182,6 +182,10 @@ struct ResourceOut {
     name: String,
     kind: String,
     busy_cycles: u64,
+    /// `busy_cycles` by direction (they sum to it).
+    busy_read: u64,
+    busy_write: u64,
+    busy_work: u64,
     utilization: f64,
     culprit_cycles: u64,
     culprit_share: f64,
@@ -210,6 +214,7 @@ struct Out<'a> {
     end_over_hbm_bound: f64,
     /// The central driver's instruction throughput used (busy / end): at 1
     /// the driver is the bottleneck.
+    /// The busiest driver's scalar utilization.
     driver_scalar_utilization: f64,
     wall_seconds: f64,
     events: u64,
@@ -316,8 +321,12 @@ fn run(argv: &[String]) -> Result<(), String> {
         return Err("no memory named hbm".into());
     }
 
-    let driver_scalar = format!("{}.scalar", b.sim.topology().path_name(launch.nu));
-    let home_path = b.sim.topology().path_name(launch.nu);
+    let driver_scalars: Vec<String> = launch
+        .drivers
+        .iter()
+        .map(|&n| format!("{}.scalar", b.sim.topology().path_name(n)))
+        .collect();
+    let home_path = b.sim.topology().path_name(launch.home);
     // The tracer export needs the timeline, the marks and the resource logs.
     let tracing = a.trace_out.is_some();
     b.sim.set_timeline(a.timeline || tracing);
@@ -449,8 +458,9 @@ fn run(argv: &[String]) -> Result<(), String> {
         end_over_hbm_bound: stats.end_time as f64 / bound.max(1) as f64,
         driver_scalar_utilization: res
             .iter()
-            .find(|r| r.name == driver_scalar)
-            .map_or(0.0, |r| r.utilization),
+            .filter(|r| driver_scalars.contains(&r.name))
+            .map(|r| r.utilization)
+            .fold(0.0, f64::max),
         wall_seconds: wall,
         events: stats.events,
         events_per_second: stats.events as f64 / wall.max(1e-9),
@@ -497,6 +507,9 @@ fn resource_outs(stats: &Stats) -> Vec<ResourceOut> {
             name: r.name.clone(),
             kind: format!("{:?}", r.kind),
             busy_cycles: r.busy_cycles,
+            busy_read: r.busy_read,
+            busy_write: r.busy_write,
+            busy_work: r.busy_work,
             utilization: r.busy_cycles as f64 / end as f64,
             culprit_cycles: r.culprit_cycles,
             culprit_share: r.culprit_cycles as f64 / total_culprit.max(1) as f64,

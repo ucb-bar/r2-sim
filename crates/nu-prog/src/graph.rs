@@ -23,6 +23,11 @@
 //! * The versioned ranges of a window must fit the owners' version tables;
 //!   the releases that make room, and the releases of the previous
 //!   window's one-off signals, go out before the window's first invoke.
+//! * With several drivers (per-gpc programs), every driver builds the
+//!   whole window and counts the version of every task, but invokes only
+//!   the tasks whose `dst` lies in its subtree ([`Graph::set_subtree`]):
+//!   every producer of a range is invoked by one driver, so each driver's
+//!   count of the other drivers' tasks is exact (replicated planning).
 //! * A dependency on data at another node names the data directly: the
 //!   version disambiguates, so no fresh signal is needed. [`Graph::pin`]
 //!   names the producer that is current when it is called, for a consumer
@@ -117,6 +122,16 @@ pub(crate) struct Graph {
     pub(crate) dropped: u64,
     /// Tasks invoked through this graph, all windows.
     pub(crate) invoked: u64,
+    /// Tasks built (planned), all windows: the invoked ones and, with a
+    /// subtree, the other drivers' ones.
+    pub(crate) planned: u64,
+    /// The driver's subtree: only tasks with `dst` in it are invoked, and
+    /// only version resets in it are sent (`None`: every task).
+    subtree: Option<Range>,
+    /// With a subtree: the own spaces of the gpcs when a write into one of
+    /// them (a DMA whose `dst` is there) is invoked by the driver of the
+    /// writing SM (its source) instead of the owner's.
+    writer_invokes: Option<Vec<Range>>,
     /// Carried tasks of this window, and the (dst, key) usable in the
     /// next.
     carry_out: Vec<TaskIx>,
@@ -143,6 +158,35 @@ impl Graph {
             versions,
             ..Self::default()
         }
+    }
+
+    /// Invoke only the tasks whose `dst` lies in `r` (a per-gpc driver).
+    pub(crate) fn set_subtree(&mut self, r: Range) {
+        self.subtree = Some(r);
+    }
+
+    /// Writes into the gpc spaces `spaces` are invoked by the writer's
+    /// driver.
+    pub(crate) fn set_writer_invokes(&mut self, spaces: Vec<Range>) {
+        self.writer_invokes = Some(spaces);
+    }
+
+    /// True when this driver invokes a task on `dst`.
+    fn mine(&self, dst: &Range) -> bool {
+        self.subtree.is_none_or(|t| t.covers(dst))
+    }
+
+    /// True when this driver invokes task `d`.
+    fn invokes(&self, d: &Descriptor) -> bool {
+        let Some(t) = self.subtree else {
+            return true;
+        };
+        if let (Some(spaces), sim_core::Args::Dma { src, .. }) = (&self.writer_invokes, &d.args) {
+            if spaces.iter().any(|r| r.covers(&d.dst)) {
+                return t.covers(&Range::from_len(src.0, 1));
+            }
+        }
+        t.covers(&d.dst)
     }
 
     /// Adds a task; its `dst` is versioned. The deps are addresses (see
@@ -281,7 +325,9 @@ impl Graph {
     pub(crate) async fn flush(&mut self, ctx: &NuCtx) {
         let releases = self.versions.borrow_mut().take_releases();
         for a in releases {
-            ctx.vreset(a).await;
+            if self.mine(&Range::from_len(a, 1)) {
+                ctx.vreset(a).await;
+            }
         }
         let mut keys: Vec<(Range, Dep)> = Vec::with_capacity(self.tasks.len());
         for (mut d, refs) in std::mem::take(&mut self.tasks) {
@@ -295,11 +341,23 @@ impl Graph {
             let dst = d.dst;
             let local = self.driver_own.is_some_and(|o| o.covers(&dst));
             // The owner assigns the version; for a forwarded invoke the
-            // driver infers it (and the owner checks the inference).
-            let inferred = (!local).then(|| self.versions.borrow_mut().next_version(dst.base));
-            d.inferred_version = inferred;
-            let h = ctx.invoke(d).await;
-            let version = inferred.unwrap_or(h.version);
+            // driver infers it (and the owner checks the inference), and
+            // so it does for another driver's task.
+            self.planned += 1;
+            let version = if self.invokes(&d) {
+                let inferred = (!local).then(|| self.versions.borrow_mut().next_version(dst.base));
+                d.inferred_version = inferred;
+                let h = ctx.invoke(d).await;
+                self.invoked += 1;
+                if local {
+                    // Another driver may write this range later (its write
+                    // is counted from here).
+                    self.versions.borrow_mut().note_version(dst.base, h.version);
+                }
+                inferred.unwrap_or(h.version)
+            } else {
+                self.versions.borrow_mut().next_version(dst.base)
+            };
             keys.push((
                 dst,
                 Dep::Versioned {
@@ -307,7 +365,6 @@ impl Graph {
                     version,
                 },
             ));
-            self.invoked += 1;
         }
         self.carry_in = std::mem::take(&mut self.carry_out)
             .into_iter()

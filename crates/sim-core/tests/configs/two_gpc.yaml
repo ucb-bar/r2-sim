@@ -1,0 +1,26 @@
+# Two gpcs of two SMs under a device, for the per-gpc driver tests
+# (hierarchy2.rs). Own spaces (offset_bits 24, fields gpc:2 sm:2):
+#   root 0x000_0000, gpc g ((g + 1) << 26), its SM s | ((s + 1) << 24).
+# Control at the data rate (as two_sm.yaml): a 1-beat message takes 1
+# cycle on a gpc bridge (64 B/cycle) or a crossbar port, 2 on an SM bridge
+# (32 B/cycle).
+
+global:
+  neutrino_granule: 512
+  msg_bytes: 64
+  cocharge: longest
+  address:
+    fields: [{name: gpc, bits: 2}, {name: sm, bits: 2}]
+    offset_bits: 24
+
+device:
+  name: root
+  fabric:
+    - {name: sbus}
+    - {name: cbus, control: true}
+  memory:
+    - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+  neutrino: {}
+  children:
+    - {name: gpc0, config: two_gpc_gpc.yaml}
+    - {name: gpc1, config: two_gpc_gpc.yaml}

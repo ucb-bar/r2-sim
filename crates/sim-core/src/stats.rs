@@ -280,12 +280,18 @@ pub struct Stats {
     /// Program cycles stalled on a full outbound invoke table, per
     /// Neutrino.
     pub outbound_stall: Vec<Cycle>,
+    /// Program cycles stalled on a local invoke (a full scoreboard or no
+    /// issue headroom), per Neutrino.
+    pub table_stall: Vec<Cycle>,
     /// Per channel stage: head-of-line cycles and peak occupancy.
     pub stages: Vec<StageStat>,
     /// Messages by beats (1 to 4).
     pub beats: [u64; 4],
     /// Messages sent, by kind.
     pub messages_by_kind: std::collections::BTreeMap<String, u64>,
+    /// Messages between different subtrees of the root (between gpcs, or
+    /// to or from the device), by kind.
+    pub cross_messages_by_kind: std::collections::BTreeMap<String, u64>,
     /// Ticket flow: tickets per requester (its bit set at an owner).
     pub tickets: Vec<u64>,
     /// Ticket flow: `Reject`s per requester.

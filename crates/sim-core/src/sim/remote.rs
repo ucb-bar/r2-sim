@@ -270,6 +270,18 @@ impl Sim {
         self.advance(src);
     }
 
+    /// The child of the root that `nu` is in (`None`: the root).
+    fn subtree_of(&self, nu: NeutrinoId) -> Option<NeutrinoId> {
+        let mut cur = nu;
+        loop {
+            match self.topo.node(cur).parent {
+                None => return None,
+                Some(p) if self.topo.node(p).parent.is_none() => return Some(cur),
+                Some(p) => cur = p,
+            }
+        }
+    }
+
     /// Builds a message on the control route from `from` to `to` and
     /// counts it; `None` (and a fatal error) for more than 4 beats.
     fn make_msg(
@@ -318,6 +330,13 @@ impl Sim {
             .entry(kind.name().to_string())
             .or_insert(0) += 1;
         self.stats.messages += 1;
+        if self.subtree_of(from) != self.subtree_of(to) {
+            *self
+                .stats
+                .cross_messages_by_kind
+                .entry(kind.name().to_string())
+                .or_insert(0) += 1;
+        }
         let class = kind.class();
         let msg = Msg {
             from,
@@ -396,7 +415,8 @@ impl Sim {
                 self.sent_from_source(s, id);
                 let earliest = self.now + if next == 0 { lead } else { 0 };
                 let bytes = beats * self.msg_bytes;
-                let end = self.reserve(&[Demand::new(hop.lane, bytes)], earliest).1;
+                // A message is a write toward its receiver.
+                let end = self.reserve(&[Demand::write(hop.lane, bytes)], earliest).1;
                 self.msgs[id as usize].as_mut().expect("message").next += 1;
                 self.queue.push(end, Event::StageFree { stage: s });
                 self.queue

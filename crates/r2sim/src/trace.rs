@@ -129,7 +129,7 @@ pub fn write(o: &Opts, names: &Names, stats: &Stats, phases: &[Phase]) -> std::i
     };
     // Resources, binned.
     let mut f = gz(&o.dir.join("resources.csv.gz"))?;
-    writeln!(f, "resource,kind,node,bin_start,busy")?;
+    writeln!(f, "resource,kind,node,bin_start,busy,read,write,work")?;
     let bin = o.bin.max(1);
     for (i, r) in stats.resources.iter().enumerate() {
         let owner = names.res_owner.get(i).copied().flatten();
@@ -139,27 +139,38 @@ pub fn write(o: &Opts, names: &Names, stats: &Stats, phases: &[Phase]) -> std::i
             }
         }
         let Some(log) = &r.log else { continue };
-        let mut bins: BTreeMap<u64, u64> = BTreeMap::new();
-        for &(s, e) in log {
-            let (s, e) = (s.max(w0), e.min(w1));
+        // Per bin: busy cycles, and their read, write and work parts (an
+        // interval's direction split spread evenly over it).
+        let mut bins: BTreeMap<u64, (u64, [f64; 3])> = BTreeMap::new();
+        for x in log {
+            let len = (x.end - x.start).max(1) as f64;
+            let (s, e) = (x.start.max(w0), x.end.min(w1));
             let mut t = s;
             while t < e {
                 let b = t / bin * bin;
                 let end = (b + bin).min(e);
-                *bins.entry(b).or_default() += end - t;
+                let entry = bins.entry(b).or_default();
+                entry.0 += end - t;
+                for (k, part) in x.dir.iter().enumerate() {
+                    entry.1[k] += *part as f64 * (end - t) as f64 / len;
+                }
                 t = end;
             }
         }
         let node = owner.map_or("", |n| names.nodes[n].as_str());
-        for (b, busy) in bins {
+        for (b, (busy, d)) in bins {
+            let w = bin as f64;
             writeln!(
                 f,
-                "{},{:?},{},{},{:.4}",
+                "{},{:?},{},{},{:.4},{:.4},{:.4},{:.4}",
                 r.name,
                 r.kind,
                 node,
                 b,
-                busy as f64 / bin as f64
+                busy as f64 / w,
+                d[0] / w,
+                d[1] / w,
+                d[2] / w
             )?;
         }
     }

@@ -860,6 +860,9 @@ pub struct Report {
     pub w_once: u64,
     /// Tasks invoked, all windows.
     pub tasks: u64,
+    /// Tasks built (planned), all windows: with per-gpc drivers also the
+    /// other drivers' tasks, whose versions this driver counts.
+    pub planned: u64,
     /// Writes into HBM or cmem.
     pub writes: u64,
     /// Joins (fresh signals).
@@ -888,6 +891,9 @@ pub struct Driver {
     w_dtype: Dtype,
     order: Order,
     g: Graph,
+    /// Per-gpc driver: the index of this driver's gpc in `Machine::gpcs`
+    /// (`None`: the single driver on the home SM).
+    gpc: Option<usize>,
     workers: Vec<usize>,
     /// SMs then memory nodes: sync pool.
     pools: Vec<SyncPool>,
@@ -1059,6 +1065,7 @@ impl Driver {
             w_dtype,
             order,
             g: Graph::new(driver_own, versions),
+            gpc: None,
             workers,
             pools,
             mem_nodes,
@@ -1104,6 +1111,55 @@ impl Driver {
     /// The Neutrino of the home SM.
     pub fn home_nu(&self) -> NeutrinoId {
         self.m.sms[self.p.home].nu
+    }
+
+    /// Makes this the driver of gpc `g` (index in `Machine::gpcs`): it runs
+    /// on the gpc's Neutrino and invokes only the tasks in the gpc's
+    /// subtree (Section 6.1, per-gpc drivers).
+    pub(crate) fn for_gpc(&mut self, g: usize) -> Result<(), String> {
+        let (own, subtree) = self.m.gpc_spaces[g];
+        if !self.mem_nodes.iter().any(|n| n.nu == self.m.gpcs[g].0) {
+            return Err(format!(
+                "per-gpc drivers need a memory node at {}",
+                self.m.gpcs[g].1
+            ));
+        }
+        self.g = Graph::new(own, self.m.versions.clone());
+        self.g.set_subtree(subtree);
+        self.gpc = Some(g);
+        Ok(())
+    }
+
+    /// Writes into the gpc spaces `spaces` are invoked by the writer's
+    /// driver.
+    pub(crate) fn writer_invokes(&mut self, spaces: Vec<Range>) {
+        self.g.set_writer_invokes(spaces);
+    }
+
+    /// The gpc (index in `Machine::gpcs`) of graph node `n`.
+    fn gpc_of_node(&self, n: Node) -> usize {
+        let sms = self.m.sms.len();
+        let nu = if n < sms {
+            self.m.sms[n].cluster.expect("an SM in a gpc")
+        } else {
+            self.mem_nodes[n - sms].nu
+        };
+        self.m
+            .gpcs
+            .iter()
+            .position(|g| g.0 == nu)
+            .expect("an owner in a gpc")
+    }
+
+    /// The graph node of gpc `g`: its first memory node.
+    fn gpc_node(&self, g: usize) -> Node {
+        let nu = self.m.gpcs[g].0;
+        self.m.sms.len()
+            + self
+                .mem_nodes
+                .iter()
+                .position(|n| n.nu == nu)
+                .expect("a memory node at the gpc")
     }
 
     fn tokens(&self) -> u64 {
@@ -2280,8 +2336,32 @@ impl Driver {
                 &deps,
                 label::label(Kind::Join, 0, layer, n as u32, 0xffff),
             );
-            waits.push(r);
+            waits.push((n, r));
         }
+        let waits: Vec<Range> = if self.gpc.is_some() {
+            // Per-gpc drivers: one window-done join per gpc over its owners'
+            // joins, at the gpc's node; every driver waits on all of them
+            // (its own locally, the others' by version).
+            let mut per: Vec<Vec<Option<Range>>> = vec![Vec::new(); self.m.gpcs.len()];
+            for (n, r) in waits {
+                per[self.gpc_of_node(n)].push(Some(r));
+            }
+            let mut out = Vec::new();
+            for (g, deps) in per.into_iter().enumerate() {
+                if deps.is_empty() {
+                    continue;
+                }
+                let node = self.gpc_node(g);
+                out.push(self.signal(
+                    node,
+                    &deps,
+                    label::label(Kind::Join, 0, layer, node as u32, 0xfffe),
+                ));
+            }
+            out
+        } else {
+            waits.into_iter().map(|w| w.1).collect()
+        };
         let before = self.g.invoked;
         self.g.flush(ctx).await;
         for r in waits {
@@ -2295,6 +2375,7 @@ impl Driver {
         let mut rep = self.report.borrow_mut();
         rep.windows += 1;
         rep.tasks = self.g.invoked;
+        rep.planned = self.g.planned;
         rep.writes += self.writes;
         rep.joins += self.joins;
         rep.phases.push(PhaseLog {

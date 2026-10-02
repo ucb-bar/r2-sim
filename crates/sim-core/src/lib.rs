@@ -33,7 +33,9 @@ pub use profile::{
     ProfileRegistry,
 };
 pub use program::{NeutrinoProgram, NuCtx, TaskHandle};
-pub use resource::{CoCharge, Demand, Grant, Kind, ResourceId, ResourceStats, Resources};
+pub use resource::{
+    CoCharge, Demand, Dir, DirCycles, Grant, Kind, LogEntry, ResourceId, ResourceStats, Resources,
+};
 pub use sim::{Flow, Sim};
 pub use stats::{
     Blocked, ChunkRec, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats,

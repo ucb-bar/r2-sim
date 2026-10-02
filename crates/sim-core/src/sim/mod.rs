@@ -152,6 +152,9 @@ struct Neutrino {
     held_len: usize,
     /// The last request sequence number.
     next_seq: u64,
+    /// Since when the program is stalled on a full scoreboard or on issue
+    /// headroom (a local invoke).
+    table_stall_since: Option<Cycle>,
     /// Ticket flow, requester side: the tickets held, by owner.
     ticket: std::collections::BTreeMap<u32, remote::Ticket>,
     /// The most tickets held at once.
@@ -600,6 +603,7 @@ impl Sim {
             next_seq: 0,
             ticket: Default::default(),
             ticket_peak: 0,
+            table_stall_since: None,
             outbound_peak: 0,
             inbound: VecDeque::new(),
             inbound_peak: 0,
@@ -722,6 +726,7 @@ impl Sim {
             wait: vec![0; n],
         };
         self.stats.outbound_stall = vec![0; self.nus.len()];
+        self.stats.table_stall = vec![0; self.nus.len()];
         while let Some((t, ev)) = self.queue.pop() {
             debug_assert!(t >= self.now, "event in the past");
             self.now = t;
@@ -922,7 +927,7 @@ impl Sim {
     }
 
     fn charge(&mut self, r: ResourceId, cost: u64) -> Cycle {
-        self.reserve(&[Demand::new(r, cost)], self.now).1
+        self.reserve(&[Demand::work(r, cost)], self.now).1
     }
 
     /// Co-charges `demand` at or after `earliest`: (start, end, culprit).
@@ -960,7 +965,15 @@ impl Sim {
     fn exec(&mut self, nu: NeutrinoId) {
         let req = self.nus[nu.0 as usize].op.take().expect("pending request");
         match req {
-            Request::Invoke(desc) => self.exec_invoke(nu, desc),
+            Request::Invoke(desc) => {
+                self.exec_invoke(nu, desc);
+                if !matches!(
+                    self.nus[nu.0 as usize].state,
+                    ProgState::Stalled(Stall::Scoreboard | Stall::Headroom)
+                ) {
+                    self.table_stall_end(nu);
+                }
+            }
             Request::Wait(key) => {
                 let range = Range::from_len(key.addr(), 1);
                 match self.owners.owner_of_range(&range) {
@@ -1081,12 +1094,18 @@ impl Sim {
             1
         };
         let latency = block_latency + trips * path.latency;
+        // A load reads, a store writes.
+        let dir = if trips == 2 {
+            crate::resource::Dir::Read
+        } else {
+            crate::resource::Dir::Write
+        };
         let mut demand: Vec<Demand> = path
             .resources
             .iter()
-            .map(|r| Demand::new(*r, len))
+            .map(|r| Demand::new(*r, len, dir))
             .collect();
-        demand.push(Demand::new(port, len));
+        demand.push(Demand::new(port, len, dir));
         let earliest = self.now + if self.zero_time { 0 } else { latency };
         let end = self.reserve(&demand, earliest).1;
         self.nus[nu.0 as usize].op = Some(req);
@@ -1358,9 +1377,13 @@ impl Sim {
 
     /// Parks the request until a slot of `why` frees.
     fn stall(&mut self, nu: NeutrinoId, req: Request, why: Stall) {
+        let now = self.now;
         let n = &mut self.nus[nu.0 as usize];
         n.op = Some(req);
         n.state = ProgState::Stalled(why);
+        if matches!(why, Stall::Scoreboard | Stall::Headroom) {
+            n.table_stall_since.get_or_insert(now);
+        }
     }
 
     /// Retries a stalled request. It stalls again if the slot is still
@@ -1377,6 +1400,14 @@ impl Sim {
         if let ProgState::Stalled(_) = n.state {
             n.state = ProgState::Busy;
             self.queue.push(self.now, Event::NuExec(nu));
+        }
+    }
+
+    /// The program of `nu` issued its stalled request: the time it waited
+    /// for a scoreboard entry or issue headroom ends.
+    fn table_stall_end(&mut self, nu: NeutrinoId) {
+        if let Some(t) = self.nus[nu.0 as usize].table_stall_since.take() {
+            self.stats.table_stall[nu.0 as usize] += self.now - t;
         }
     }
 

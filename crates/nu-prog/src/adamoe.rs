@@ -208,6 +208,9 @@ pub struct Report {
     pub weight_bytes: std::collections::BTreeMap<String, u64>,
     /// Tasks invoked, all windows.
     pub tasks: u64,
+    /// Tasks built (planned), all windows: with per-gpc drivers also the
+    /// other drivers' tasks, whose versions this driver counts.
+    pub planned: u64,
     /// Graph windows run.
     pub windows: u64,
     /// Joins (fan-in signals), all windows.
@@ -497,6 +500,22 @@ impl Driver {
     /// The Neutrino of the home SM.
     pub fn home_nu(&self) -> nu_model::NeutrinoId {
         self.m.sms[self.p.home].nu
+    }
+
+    /// Makes this the driver of gpc `g` (index in `Machine::gpcs`): it runs
+    /// on the gpc's Neutrino and invokes only the tasks in the gpc's
+    /// subtree. The router stays on the home SM; the other gpcs' drivers
+    /// wait for its output by version and load it (Section 6.1).
+    pub(crate) fn for_gpc(&mut self, g: usize) {
+        let (own, subtree) = self.m.gpc_spaces[g];
+        self.g = Graph::new(own, self.m.versions.clone());
+        self.g.set_subtree(subtree);
+    }
+
+    /// Writes into the gpc spaces `spaces` are invoked by the writer's
+    /// driver.
+    pub(crate) fn writer_invokes(&mut self, spaces: Vec<Range>) {
+        self.g.set_writer_invokes(spaces);
     }
 
     /// Fills each SM's resident region with its weight blocks in the
@@ -1651,6 +1670,7 @@ impl Driver {
         let mut r = self.report.borrow_mut();
         r.windows += 1;
         r.tasks = self.g.invoked;
+        r.planned = self.g.planned;
         r.joins = self.g.joins;
         r.dropped_deps = self.g.dropped;
         drop(r);

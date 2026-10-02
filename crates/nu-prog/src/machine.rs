@@ -141,6 +141,11 @@ pub struct Machine {
     /// The parents of the SMs (gpcs), in configuration order, and their
     /// dotted names.
     pub(crate) gpcs: Vec<(NeutrinoId, String)>,
+    /// Per gpc (as `gpcs`): its own space, and its subtree (its space and
+    /// its SMs').
+    pub(crate) gpc_spaces: Vec<(Range, Range)>,
+    /// The sync-only space of the device (the root), if any.
+    pub(crate) root_sync: Option<Range>,
     /// Clusters with a cmem block, in configuration order.
     pub(crate) cmem_nodes: Vec<MemNode>,
     pub(crate) granule: u64,
@@ -270,6 +275,18 @@ impl Machine {
         if hbm.is_empty() {
             return Err("no memory named hbm".into());
         }
+        let gpc_spaces = gpcs
+            .iter()
+            .map(|g| {
+                let own = b.own_space(g.0);
+                let bound = sms
+                    .iter()
+                    .filter(|s| s.cluster == Some(g.0))
+                    .map(|s| s.own.bound)
+                    .fold(own.bound, u64::max);
+                (own, Range::new(own.base, bound))
+            })
+            .collect();
         let reg = b.sim.profiles();
         let owners = (0..topo.len())
             .map(|i| {
@@ -282,6 +299,8 @@ impl Machine {
             sms,
             hbm,
             gpcs,
+            gpc_spaces,
+            root_sync: b.sync_only(NeutrinoId(0)),
             cmem_nodes,
             granule,
             dma_op: reg.lookup("dma").ok_or("no dma profile")?,
@@ -292,6 +311,14 @@ impl Machine {
 
     pub(crate) fn round(&self, bytes: u64) -> u64 {
         bytes.div_ceil(self.granule) * self.granule
+    }
+
+    /// The same machine with its own version bookkeeping (another
+    /// driver's).
+    pub(crate) fn with_own_versions(&self) -> Self {
+        let mut m = self.clone();
+        m.versions = Rc::new(RefCell::new(self.versions.borrow().fresh()));
+        m
     }
 
     /// The HBM bandwidth of all slices, bytes per cycle.

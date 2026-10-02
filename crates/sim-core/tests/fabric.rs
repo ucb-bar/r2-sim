@@ -395,3 +395,94 @@ device:
     assert_eq!(span(0), (10, 16));
     assert_eq!(span(1), (30, 64));
 }
+
+#[test]
+fn demands_record_reads_and_writes() {
+    // sm0's DMA copies 8 KiB from HBM (at the device) into its SMEM: the
+    // HBM port and the route up to the engine are reads (HBM port, gpc0's
+    // bridge down, sm0's bridge down), the SMEM port is a write. sm1 runs a
+    // 64^3 bf16 matmul: A and B (16 KiB) are reads and C (8 KiB) a write
+    // on its SMEM port, 192 cycles at 128 B/cycle: 128 read, 64 write; the
+    // array's cycles are work. Every split sums to the busy total.
+    let b = two_sm(&[]).unwrap();
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let hbm = b.memory("root.hbm");
+    let s0 = b.memory("root.gpc0.sm0.smem");
+    let s1 = b.memory("root.gpc0.sm1.smem");
+    let dst = Range::from_len(s0.base, 8192);
+    let dma = Descriptor {
+        opcode: b.sim.profiles().lookup("dma").unwrap(),
+        pe: Some(b.pe("root.gpc0.sm0.dma")),
+        dst,
+        versioned: false,
+        inferred_version: None,
+        deps: vec![],
+        label: None,
+        args: Args::Dma {
+            src: Addr(hbm.base),
+            dst: Addr(dst.base),
+            bytes: 8192,
+            tile_bytes: 8192,
+        },
+    };
+    let c = Range::from_len(s1.base, MAT);
+    let mm = Descriptor {
+        opcode: b.sim.profiles().lookup("atlas.matmul").unwrap(),
+        pe: Some(b.pe("root.gpc0.sm1.atlas")),
+        dst: c,
+        versioned: false,
+        inferred_version: None,
+        deps: vec![],
+        label: None,
+        args: Args::Matmul {
+            a: Addr(c.base),
+            b: Addr(c.base),
+            lda: 64,
+            ldb: 64,
+            ldc: 64,
+            m: 64,
+            n: 64,
+            k: 64,
+            in_dtype: Dtype::Bf16,
+            b_dtype: Dtype::Bf16,
+            out_dtype: Dtype::Bf16,
+            accumulate: false,
+            keep: false,
+            tile: [64, 64],
+        },
+    };
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(dma).await;
+        ctx.wait_unversioned(h.addr).await;
+    });
+    sim.spawn(sm1, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(mm).await;
+        ctx.wait_unversioned(h.addr).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let r = |n: &str| {
+        let x = s.resources.iter().find(|r| r.name == n).unwrap();
+        (x.busy_read, x.busy_write, x.busy_work)
+    };
+    let (hr, hw, _) = r("root.hbm.port");
+    assert!(hr > 0 && hw == 0, "HBM port: read");
+    for n in ["root.gpc0.bridge.down", "root.gpc0.sm0.bridge.down"] {
+        let (rd, wr, _) = r(n);
+        assert!(rd > 0 && wr == 0, "{n}: on the route to the engine, read");
+    }
+    let (sr, sw, _) = r("root.gpc0.sm0.smem.port");
+    assert!(sr == 0 && sw > 0, "destination SMEM port: write");
+    assert_eq!(r("root.gpc0.sm1.smem.port"), (128, 64, 0));
+    let (ar, aw, ak) = r("root.gpc0.sm1.atlas.array");
+    assert!(ar == 0 && aw == 0 && ak > 0, "array: work");
+    for x in &s.resources {
+        assert_eq!(
+            x.busy_read + x.busy_write + x.busy_work,
+            x.busy_cycles,
+            "{}",
+            x.name
+        );
+    }
+}

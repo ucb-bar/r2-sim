@@ -8,7 +8,7 @@
 use nu_model::{Addr, Dep, NeutrinoId, Range};
 
 use crate::config::{MemBlock, PeConfig, PeParams};
-use crate::resource::{Demand, ResourceId};
+use crate::resource::{Demand, Dir, ResourceId};
 use crate::time::{Cycle, Ratio};
 use crate::topology::Topology;
 
@@ -380,11 +380,14 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     while left > 0 {
         let n = left.min(tile_bytes);
         left -= n;
-        let mut demand = vec![Demand::new(src_port, n)];
-        demand.extend(links.iter().map(|l| Demand::new(*l, n)));
-        demand.extend(inp.resources.iter().map(|r| Demand::new(*r, n)));
-        demand.extend(out.resources.iter().map(|r| Demand::new(*r, n)));
-        demand.push(Demand::new(dst_port, n));
+        // Reads: the source port, the engine's links and the route to the
+        // engine. Writes: the route from the engine and the destination
+        // port.
+        let mut demand = vec![Demand::read(src_port, n)];
+        demand.extend(links.iter().map(|l| Demand::read(*l, n)));
+        demand.extend(inp.resources.iter().map(|r| Demand::read(*r, n)));
+        demand.extend(out.resources.iter().map(|r| Demand::write(*r, n)));
+        demand.push(Demand::write(dst_port, n));
         chunks.push(Chunk {
             demand,
             latency: *latency + inp.latency + out.latency,
@@ -459,7 +462,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             } else {
                 (tm, tn)
             };
-            let mut ops = Demand::new(array, qm * qn * k);
+            let mut ops = Demand::work(array, qm * qn * k);
             ops.utilization = utilization;
             // Operands in, C out, and C in when accumulating. C is exact.
             let c_bytes = tm * tn * out_dtype.bytes();
@@ -480,9 +483,15 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             } else {
                 0
             };
-            let bytes = a_bytes + b_dtype.bytes_for(k * qn) + c_out + c_in + flush;
+            // A and B and C in are reads; C out and the accumulator flush
+            // are writes (one resource: charged as their sum).
+            let read = a_bytes + b_dtype.bytes_for(k * qn) + c_in;
             chunks.push(Chunk {
-                demand: vec![ops, Demand::new(smem_port, bytes)],
+                demand: vec![
+                    ops,
+                    Demand::read(smem_port, read),
+                    Demand::write(smem_port, c_out + flush),
+                ],
                 latency: 0,
             });
         }
@@ -517,9 +526,9 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         panic!("vector opcode on PE {}", node.pe.name);
     };
     // The blocks it reads and writes: the SM's SMEM over lbus, a remote
-    // range over the SM's data bus. A resource on both routes is charged
-    // once for both byte counts.
-    let mut v = Demand::new(vector, ops);
+    // range over the SM's data bus. bytes_in are reads, bytes_out writes;
+    // a resource on both routes is charged once for both.
+    let mut v = Demand::work(vector, ops);
     v.utilization = utilization;
     let mut demand = vec![v];
     let mut latency = 0;
@@ -533,11 +542,9 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         }
         .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
         latency = latency.max(route.latency);
+        let dir = if to { Dir::Write } else { Dir::Read };
         for r in route.resources.iter().chain([&block.port]) {
-            match demand.iter_mut().find(|d| d.resource == *r) {
-                Some(d) => d.amount += bytes,
-                None => demand.push(Demand::new(*r, bytes)),
-            }
+            demand.push(Demand::new(*r, bytes, dir));
         }
     }
     Profile {

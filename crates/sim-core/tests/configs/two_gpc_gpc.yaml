@@ -1,0 +1,14 @@
+# A gpc of two_gpc.yaml: its HBM slice, a copy engine, two SMs.
+bridge: {data: $parent.sbus, control: $parent.cbus, bw_bytes: 64, latency: 20}
+fabric:
+  - {name: clsbus, bw_bytes: 64}
+  - {name: clcbus, bw_bytes: 64, control: true}
+memory:
+  - {name: hbm, type: dram, addr: [[0x0, 0x400000]], bw_bytes: 256, latency: 200, slave: $this.clsbus}
+  - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+compute:
+  - {name: dma, type: dma, latency: 100, inflight: 2, master: [$this.clsbus]}
+neutrino: {}
+children:
+  - {name: sm0, config: two_sm_sm.yaml}
+  - {name: sm1, config: two_sm_sm.yaml}

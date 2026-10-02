@@ -15,7 +15,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use nu_model::NeutrinoId;
+use nu_model::{NeutrinoId, Range};
 use serde::{Deserialize, Serialize};
 use sim_core::NuCtx;
 
@@ -23,6 +23,7 @@ use crate::adamoe;
 use crate::machine::Machine;
 use crate::prefill::{self, Place};
 use crate::versions::{VersionState, VresetPolicy};
+use crate::ProgramFn;
 
 /// Program parameters (a TOML file, every key optional).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -56,6 +57,14 @@ pub struct Params {
     /// Action expert parameters. `weight_dtype`, `cmem_reserve` and a
     /// non-empty `expert_prob` come from this struct.
     pub action: adamoe::Params,
+    /// "single": one driver on the home SM runs the three stages; "gpc":
+    /// the device program starts, per stage, one driver per gpc on the
+    /// gpc's Neutrino, each invoking the tasks of its gpc (Section 6.1).
+    pub drivers: String,
+    /// With per-gpc drivers: who invokes a write into a gpc's slice or
+    /// cmem: "owner" (the gpc that owns it) or "writer" (the gpc of the
+    /// writing SM; a cross-gpc invoke when they differ).
+    pub slice_writes: String,
 }
 
 impl Default for Params {
@@ -74,6 +83,8 @@ impl Default for Params {
             },
             vlm: prefill::Params::default(),
             action: adamoe::Params::default(),
+            drivers: "single".into(),
+            slice_writes: "owner".into(),
         }
     }
 }
@@ -110,6 +121,21 @@ pub struct Stage {
     pub roofline: u64,
 }
 
+/// One driver's tasks in one stage.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DriverStat {
+    /// The Neutrino that ran the driver.
+    pub nu: u32,
+    /// "vision", "vlm" or "action".
+    pub stage: String,
+    /// Tasks it invoked.
+    pub invoked: u64,
+    /// Tasks it built (planned), its own and the other drivers'.
+    pub planned: u64,
+    /// Windows it ran.
+    pub windows: u64,
+}
+
 /// What the forward pass measured, per stage, for the CLI.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Report {
@@ -131,89 +157,181 @@ pub struct Report {
     pub vreset_data: u64,
     /// Releases of one-off signals after their window's barrier.
     pub vreset_signal: u64,
+    /// Per driver and stage: tasks invoked and planned, windows.
+    pub drivers: Vec<DriverStat>,
     /// The parameters used.
     pub params: Option<Params>,
 }
 
-/// The forward-pass driver: runs the vision, VLM and action-expert
-/// drivers on the home SM, one after the other.
-pub struct Driver {
+/// The three stage drivers of one program, and the version bookkeeping
+/// they share.
+struct Stages {
+    /// The Neutrino the program runs on: the home SM, or a gpc.
+    nu: NeutrinoId,
     vision: prefill::Driver,
     vlm: prefill::Driver,
     action: adamoe::Driver,
+    versions: Rc<RefCell<VersionState>>,
+}
+
+/// The forward-pass driver: runs the vision, VLM and action-expert
+/// drivers on the home SM, one after the other; or, with per-gpc drivers,
+/// the device program that starts one driver per gpc and stage.
+pub struct Driver {
+    /// One entry (the home SM), or one per gpc.
+    stages: Vec<Stages>,
+    /// Per-gpc drivers: the device Neutrino, its sync space for the spawn
+    /// tasks, and the own spaces of the gpcs (reset at every Start).
+    root: Option<(NeutrinoId, Range, Vec<Range>)>,
     home: NeutrinoId,
     hbm_rate: f64,
     /// Action weight bytes per denoise step, and steps.
     action_w: (u64, u32),
-    versions: Rc<RefCell<VersionState>>,
     /// The per-stage report.
     pub report: Rc<RefCell<Report>>,
     /// The action expert's report.
     pub action_report: Rc<RefCell<adamoe::Report>>,
 }
 
+/// The three stage drivers on `m` in one HBM map, the cmem reserve and the
+/// action weights per step.
+#[allow(clippy::type_complexity)]
+fn build(
+    m: &Machine,
+    p: &Params,
+) -> Result<
+    (
+        prefill::Driver,
+        prefill::Driver,
+        adamoe::Driver,
+        Vec<u64>,
+        (u64, u32),
+    ),
+    String,
+> {
+    m.versions
+        .borrow_mut()
+        .set_mode(VresetPolicy::parse(&p.vreset_policy)?);
+    let mut vp = p.vision.clone();
+    let mut lp = p.vlm.clone();
+    let mut ap = p.action.clone();
+    // Before the copies below: the prefill drivers compute the action
+    // expert's HBM map (and so the KV cache address) from it.
+    ap.weight_dtype = p.weight_dtype.clone();
+    if !p.expert_prob.is_empty() {
+        ap.expert_prob = p.expert_prob.clone();
+    }
+    vp.model = "vision".into();
+    lp.model = "vlm".into();
+    for x in [&mut vp, &mut lp] {
+        x.weight_dtype = p.weight_dtype.clone();
+        x.act_mem = p.act_mem.clone();
+        x.act_copies = p.act_copies;
+        x.single_accumulator = p.single_accumulator;
+        x.action = ap.clone();
+    }
+    lp.last_layer = p.vlm_last_layer.clone();
+    let vlm = prefill::Driver::new_at(m.clone(), lp, Place::default())?;
+    let vision = prefill::Driver::new_at(
+        m.clone(),
+        vp,
+        Place {
+            hbm_next: Some(vlm.hbm_end()),
+            act_base: Some(vlm.act_end()),
+            out_x: Some(vlm.x_in()),
+        },
+    )?;
+    // The action expert's cmem placement starts after the prefill
+    // activations, in every cmem block that holds a copy of them.
+    let act = vision.act_mem();
+    let used = vision.act_end().saturating_sub(act.base);
+    let copies = vision.act_copy_mems();
+    let reserve: Vec<u64> = m
+        .cmem_nodes
+        .iter()
+        .map(|c| if copies.contains(&c.mem) { used } else { 0 })
+        .collect();
+    ap.cmem_reserve = reserve.clone();
+    let action_w = (adamoe::hbm_map(m, &ap)?.weight_bytes, ap.steps);
+    let action = adamoe::Driver::new(m.clone(), ap)?;
+    if vlm.kv() != action.kv() {
+        return Err(format!(
+            "the VLM writes the KV cache at {:?}, the action expert reads {:?}",
+            vlm.kv(),
+            action.kv()
+        ));
+    }
+    let home = action.home_nu();
+    if vlm.home_nu() != home || vision.home_nu() != home {
+        return Err("the three stages need the same home SM".into());
+    }
+    Ok((vision, vlm, action, reserve, action_w))
+}
+
 impl Driver {
-    /// Builds the three stage drivers in one HBM map. Errors when the VLM
-    /// writes the KV cache at a layout other than the one the action expert
-    /// reads, or when the stages have different home SMs.
+    /// Builds the three stage drivers in one HBM map (one set per gpc with
+    /// `drivers = "gpc"`, each with its own version bookkeeping). Errors
+    /// when the VLM writes the KV cache at a layout other than the one the
+    /// action expert reads, or when the stages have different home SMs.
     pub fn new(m: Machine, p: Params) -> Result<Self, String> {
-        m.versions
-            .borrow_mut()
-            .set_mode(VresetPolicy::parse(&p.vreset_policy)?);
-        let versions = m.versions.clone();
-        let mut vp = p.vision.clone();
-        let mut lp = p.vlm.clone();
-        let mut ap = p.action.clone();
-        // Before the copies below: the prefill drivers compute the action
-        // expert's HBM map (and so the KV cache address) from it.
-        ap.weight_dtype = p.weight_dtype.clone();
-        if !p.expert_prob.is_empty() {
-            ap.expert_prob = p.expert_prob.clone();
-        }
-        vp.model = "vision".into();
-        lp.model = "vlm".into();
-        for x in [&mut vp, &mut lp] {
-            x.weight_dtype = p.weight_dtype.clone();
-            x.act_mem = p.act_mem.clone();
-            x.act_copies = p.act_copies;
-            x.single_accumulator = p.single_accumulator;
-            x.action = ap.clone();
-        }
-        lp.last_layer = p.vlm_last_layer.clone();
-        let vlm = prefill::Driver::new_at(m.clone(), lp, Place::default())?;
-        let vision = prefill::Driver::new_at(
-            m.clone(),
-            vp,
-            Place {
-                hbm_next: Some(vlm.hbm_end()),
-                act_base: Some(vlm.act_end()),
-                out_x: Some(vlm.x_in()),
-            },
-        )?;
-        // The action expert's cmem placement starts after the prefill
-        // activations, in every cmem block that holds a copy of them.
-        let act = vision.act_mem();
-        let used = vision.act_end().saturating_sub(act.base);
-        let copies = vision.act_copy_mems();
-        let reserve: Vec<u64> = m
-            .cmem_nodes
-            .iter()
-            .map(|c| if copies.contains(&c.mem) { used } else { 0 })
-            .collect();
-        ap.cmem_reserve = reserve.clone();
-        let action_w = (adamoe::hbm_map(&m, &ap)?.weight_bytes, ap.steps);
         let hbm_rate = m.hbm_rate();
-        let action = adamoe::Driver::new(m, ap)?;
-        if vlm.kv() != action.kv() {
-            return Err(format!(
-                "the VLM writes the KV cache at {:?}, the action expert reads {:?}",
-                vlm.kv(),
-                action.kv()
-            ));
-        }
-        let home = action.home_nu();
-        if vlm.home_nu() != home || vision.home_nu() != home {
-            return Err("the three stages need the same home SM".into());
+        let mut stages = Vec::new();
+        let (root, home, reserve, action_w) = match p.drivers.as_str() {
+            "single" => {
+                let (vision, vlm, action, reserve, action_w) = build(&m, &p)?;
+                let home = action.home_nu();
+                stages.push(Stages {
+                    nu: home,
+                    vision,
+                    vlm,
+                    action,
+                    versions: m.versions.clone(),
+                });
+                (None, home, reserve, action_w)
+            }
+            "gpc" => {
+                let root_sync = m
+                    .root_sync
+                    .ok_or("per-gpc drivers need a sync space at the device")?;
+                let mut reserve = Vec::new();
+                let mut action_w = (0, 0);
+                for g in 0..m.gpcs.len() {
+                    let mg = m.with_own_versions();
+                    let (mut vision, mut vlm, mut action, r, w) = build(&mg, &p)?;
+                    vision.for_gpc(g)?;
+                    vlm.for_gpc(g)?;
+                    action.for_gpc(g);
+                    match p.slice_writes.as_str() {
+                        "owner" => {}
+                        "writer" => {
+                            let spaces: Vec<Range> = m.gpc_spaces.iter().map(|x| x.0).collect();
+                            vision.writer_invokes(spaces.clone());
+                            vlm.writer_invokes(spaces.clone());
+                            action.writer_invokes(spaces);
+                        }
+                        w => return Err(format!("unknown slice_writes {w:?} (owner, writer)")),
+                    }
+                    (reserve, action_w) = (r, w);
+                    stages.push(Stages {
+                        nu: m.gpcs[g].0,
+                        vision,
+                        vlm,
+                        action,
+                        versions: mg.versions.clone(),
+                    });
+                }
+                let spaces = m.gpc_spaces.iter().map(|x| x.0).collect();
+                (
+                    Some((NeutrinoId(0), root_sync, spaces)),
+                    NeutrinoId(0),
+                    reserve,
+                    action_w,
+                )
+            }
+            d => return Err(format!("unknown drivers {d:?} (single, gpc)")),
+        };
+        if stages.is_empty() {
+            return Err("per-gpc drivers need gpcs".into());
         }
         let report = Rc::new(RefCell::new(Report {
             hbm_rate,
@@ -221,49 +339,143 @@ impl Driver {
             params: Some(p),
             ..Report::default()
         }));
-        let action_report = action.report.clone();
+        let action_report = stages[0].action.report.clone();
         Ok(Self {
-            vision,
-            vlm,
-            action,
+            stages,
+            root,
             home,
             hbm_rate,
             action_w,
-            versions,
             report,
             action_report,
         })
     }
 
-    /// The Neutrino of the home SM.
+    /// The Neutrino that runs the program: the home SM, or the device with
+    /// per-gpc drivers.
     pub fn home_nu(&self) -> NeutrinoId {
         self.home
+    }
+
+    /// The Neutrinos whose programs invoke the tasks.
+    pub fn drivers(&self) -> Vec<NeutrinoId> {
+        self.stages.iter().map(|s| s.nu).collect()
+    }
+
+    /// The home SM.
+    pub fn home_sm(&self) -> NeutrinoId {
+        self.stages[0].action.home_nu()
     }
 
     /// Runs the vision, VLM and action stages in order and fills `report`.
     pub async fn run(self, ctx: NuCtx) {
         let Self {
-            vision,
-            vlm,
-            action,
+            stages,
+            root,
             hbm_rate,
             action_w,
             report,
             action_report,
-            versions,
             ..
         } = self;
-        let (vr, lr) = (vision.report.clone(), vlm.report.clone());
-        let t0 = ctx.now();
-        vision.run(ctx.clone()).await;
-        ctx.mark("vision end").await;
-        let t1 = ctx.now();
-        vlm.run(ctx.clone()).await;
-        ctx.mark("vlm end").await;
-        let t2 = ctx.now();
-        action.run(ctx.clone()).await;
-        ctx.mark("action end").await;
-        let t3 = ctx.now();
+        let (vr, lr) = (
+            stages[0].vision.report.clone(),
+            stages[0].vlm.report.clone(),
+        );
+        let versions = stages[0].versions.clone();
+        let reports: Vec<_> = stages
+            .iter()
+            .map(|s| {
+                (
+                    s.nu,
+                    s.vision.report.clone(),
+                    s.vlm.report.clone(),
+                    s.action.report.clone(),
+                )
+            })
+            .collect();
+        let mut t = [ctx.now(); 4];
+        match root {
+            None => {
+                let Stages {
+                    vision,
+                    vlm,
+                    action,
+                    ..
+                } = stages.into_iter().next().expect("one driver");
+                vision.run(ctx.clone()).await;
+                ctx.mark("vision end").await;
+                t[1] = ctx.now();
+                vlm.run(ctx.clone()).await;
+                ctx.mark("vlm end").await;
+                t[2] = ctx.now();
+                action.run(ctx.clone()).await;
+                ctx.mark("action end").await;
+                t[3] = ctx.now();
+            }
+            Some((_, sync, spaces)) => {
+                // Per stage, a Start per gpc with that gpc's driver; the
+                // stage ends when every gpc's program returns. Each Start
+                // resets the gpc's version table, and so each driver's view
+                // of the gpcs' ranges.
+                let n = stages.len() as u64;
+                let mut programs: Vec<[Option<ProgramFn>; 3]> = Vec::new();
+                let mut nus = Vec::new();
+                for s in stages {
+                    let Stages {
+                        nu,
+                        vision,
+                        vlm,
+                        action,
+                        versions,
+                    } = s;
+                    nus.push(nu);
+                    let reset = |v: Rc<RefCell<VersionState>>, sp: Vec<Range>| {
+                        move || v.borrow_mut().reset_spaces(&sp)
+                    };
+                    let (r0, r1, r2) = (
+                        reset(versions.clone(), spaces.clone()),
+                        reset(versions.clone(), spaces.clone()),
+                        reset(versions, spaces.clone()),
+                    );
+                    programs.push([
+                        Some(Box::new(move |c: NuCtx| {
+                            Box::pin(async move {
+                                r0();
+                                vision.run(c).await
+                            })
+                        })),
+                        Some(Box::new(move |c: NuCtx| {
+                            Box::pin(async move {
+                                r1();
+                                vlm.run(c).await
+                            })
+                        })),
+                        Some(Box::new(move |c: NuCtx| {
+                            Box::pin(async move {
+                                r2();
+                                action.run(c).await
+                            })
+                        })),
+                    ]);
+                }
+                for (stage, name) in ["vision", "vlm", "action"].iter().enumerate() {
+                    let mut handles = Vec::new();
+                    for (g, p) in programs.iter_mut().enumerate() {
+                        let prog = p[stage].take().expect("a stage program");
+                        let done =
+                            Range::from_len(sync.base + (stage as u64 * n + g as u64) * 512, 512);
+                        handles.push(ctx.spawn_child(nus[g], done, vec![], prog).await);
+                    }
+                    for h in handles {
+                        ctx.wait_key(h.key()).await;
+                    }
+                    ctx.mark(&format!("{name} end")).await;
+                    t[stage + 1] = ctx.now();
+                }
+            }
+        }
+        let [t0, t1, t2, t3] = t;
         let roof = |r: &prefill::Report| -> u64 {
             r.phases
                 .iter()
@@ -349,6 +561,36 @@ impl Driver {
         );
         total.hbm_by_gpc = all;
         let mut r = report.borrow_mut();
+        for (nu, v, l, a) in &reports {
+            for (stage, invoked, planned, windows) in [
+                (
+                    "vision",
+                    v.borrow().tasks,
+                    v.borrow().planned,
+                    v.borrow().windows,
+                ),
+                (
+                    "vlm",
+                    l.borrow().tasks,
+                    l.borrow().planned,
+                    l.borrow().windows,
+                ),
+                (
+                    "action",
+                    a.borrow().tasks,
+                    a.borrow().planned,
+                    a.borrow().windows,
+                ),
+            ] {
+                r.drivers.push(DriverStat {
+                    nu: nu.0,
+                    stage: stage.into(),
+                    invoked,
+                    planned,
+                    windows,
+                });
+            }
+        }
         r.stages = stages;
         r.total = total;
         r.vision = Some(v);
