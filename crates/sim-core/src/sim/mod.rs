@@ -33,14 +33,26 @@ use crate::profile::{
 use crate::program::{Mailbox, NeutrinoProgram, NuCtx, Request, Response, StartFn, TaskHandle};
 use crate::resource::{Demand, Kind, ResourceId, Resources};
 use crate::stats::{
-    Blocked, ChunkRec, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats,
-    TaskTimeline, WarningRec,
+    Blocked, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats, WarningRec,
 };
 use crate::time::Cycle;
 use crate::topology::{AttachId, Attachment, Bus, BusId, BusTopology, Lane, Topology};
+use crate::tracer::{
+    ChunkGrant, Collector, CollectorConfig, RouteUse, TaskCall, TaskEntered, Tee, Tracer, Who,
+};
 use crate::writers::LastWriters;
-pub use remote::Flow;
 use remote::Msg;
+pub use remote::{Flow, MESSAGE_KINDS};
+
+/// Calls the tracer `$t` with `$e` when one is installed: one branch.
+macro_rules! trace {
+    ($s:ident, $t:ident => $e:expr) => {
+        if let Some($t) = $s.tracer.as_mut() {
+            $e;
+        }
+    };
+}
+pub(crate) use trace;
 
 /// Calendars are pruned every this many events. Measured: 16 gives 3.8 M
 /// events/s on the benchmark against 2.8 M at 1024 (deeper calendars).
@@ -76,6 +88,27 @@ struct TaskRec {
     spawn: Option<StartFn>,
 }
 
+/// The interval a reservation was granted.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Reserved {
+    start: Cycle,
+    pub(super) end: Cycle,
+    culprit: Option<ResourceId>,
+    queue_culprit: Option<ResourceId>,
+}
+
+impl Reserved {
+    /// An empty interval at `t`.
+    fn at(t: Cycle) -> Self {
+        Self {
+            start: t,
+            end: t,
+            culprit: None,
+            queue_culprit: None,
+        }
+    }
+}
+
 /// A task that entered the tables.
 pub(super) struct Entered {
     task: TaskId,
@@ -101,8 +134,9 @@ pub(super) enum Entry {
     Local,
     /// A forwarded invoke leaving the inbound invoke table: it enters only
     /// when all of it fits (a scoreboard entry, pending entries, outbound
-    /// dep entries); otherwise it stays in the table.
-    Inbound,
+    /// dep entries); otherwise it stays in the table. The call is the
+    /// requester's, for a tracer.
+    Inbound(TaskCall),
 }
 
 /// Something that waits for an execution table slot.
@@ -124,6 +158,10 @@ struct Neutrino {
     mb: Rc<RefCell<Mailbox>>,
     /// The request whose cost is charged, or that stalled.
     op: Option<Request>,
+    /// The cycle the program made the request in `op`.
+    op_call: Cycle,
+    /// The name of the program (for a tracer).
+    prog_name: &'static str,
     state: ProgState,
     /// Indexed by `TaskId`; `None` after retire.
     tasks: Vec<Option<TaskRec>>,
@@ -268,23 +306,26 @@ pub struct Sim {
     func_seq: u64,
     next_gid: u64,
     zero_time: bool,
-    timeline: bool,
-    /// Record resource totals at program marks.
-    marks: bool,
+    /// What the in-memory [`Collector`] keeps.
+    collect: CollectorConfig,
+    /// A tracer installed with [`Sim::set_tracer`]; it moves into
+    /// `tracer` at the start of the run.
+    extra: Option<Box<dyn Tracer>>,
+    /// The tracer of the run; `None`: no observation point does anything.
+    tracer: Option<Box<dyn Tracer>>,
     race: RaceCheck,
     stats: Stats,
 }
 
 impl Sim {
-    /// `log` turns on the per-interval log of every flow resource.
-    pub fn new(profiles: ProfileRegistry, log: bool) -> Self {
+    pub fn new(profiles: ProfileRegistry) -> Self {
         Self {
             now: 0,
             clock: Rc::new(Cell::new(0)),
             queue: EventQueue::default(),
             nus: Vec::new(),
             pes: Vec::new(),
-            res: Resources::new(log),
+            res: Resources::new(),
             memories: Vec::new(),
             profiles,
             backend: Some(Box::new(NullBackend)),
@@ -312,8 +353,12 @@ impl Sim {
             func_seq: 0,
             next_gid: 0,
             zero_time: false,
-            timeline: true,
-            marks: false,
+            collect: CollectorConfig {
+                tasks: true,
+                ..CollectorConfig::default()
+            },
+            extra: None,
+            tracer: None,
             race: RaceCheck::Fatal,
             stats: Stats::default(),
         }
@@ -328,13 +373,25 @@ impl Sim {
     /// Turns the per-task timeline in [`Stats::tasks`] on or off (default
     /// on).
     pub fn set_timeline(&mut self, on: bool) {
-        self.timeline = on;
+        self.collect.tasks = on;
     }
 
     /// Record the resource totals (busy, culprit and delay cycles) at each
-    /// program [`NuCtx::mark`] (default off).
+    /// program [`NuCtx::mark`] in [`Stats::marks`] (default off).
     pub fn set_marks(&mut self, on: bool) {
-        self.marks = on;
+        self.collect.marks = on;
+    }
+
+    /// Turns the per-interval log of every flow resource
+    /// ([`crate::ResourceStats::log`]) on or off (default off).
+    pub fn set_log(&mut self, on: bool) {
+        self.collect.log = on;
+    }
+
+    /// Installs a tracer for the run, beside the in-memory collector of
+    /// [`Sim::set_timeline`], [`Sim::set_marks`] and [`Sim::set_log`].
+    pub fn set_tracer(&mut self, t: Box<dyn Tracer>) {
+        self.extra = Some(t);
     }
 
     /// Warn when a lookup creates a pending entry over a range that a completed
@@ -587,6 +644,8 @@ impl Sim {
             program: None,
             mb: Rc::new(RefCell::new(Mailbox::default())),
             op: None,
+            op_call: 0,
+            prog_name: "",
             state: ProgState::Idle,
             tasks: Vec::new(),
             execution_waiters: VecDeque::new(),
@@ -657,6 +716,32 @@ impl Sim {
         &self.pes[pe.0 as usize].cfg
     }
 
+    /// The Neutrino of PE `pe`.
+    pub fn pe_neutrino(&self, pe: PeId) -> NeutrinoId {
+        self.pes[pe.0 as usize].nu
+    }
+
+    /// Number of PEs.
+    pub fn pe_count(&self) -> usize {
+        self.pes.len()
+    }
+
+    /// The scalar resource and the completion port of Neutrino `nu`.
+    pub fn neutrino_resources(&self, nu: NeutrinoId) -> (ResourceId, ResourceId) {
+        let n = &self.nus[nu.0 as usize];
+        (n.scalar, n.complete_port)
+    }
+
+    /// The dependency resolution latency (`c_resolve`) of Neutrino `nu`
+    /// (0 in zero-time mode).
+    pub fn resolve_cost(&self, nu: NeutrinoId) -> Cycle {
+        if self.zero_time {
+            0
+        } else {
+            self.nus[nu.0 as usize].cfg.costs.resolve
+        }
+    }
+
     /// Atlas accumulator memory in bytes (H3; 0 = none).
     pub fn set_atlas_acc_buffer(&mut self, bytes: u64) {
         self.each_atlas(|_, a, _| *a = bytes);
@@ -675,6 +760,16 @@ impl Sim {
 
     /// Starts `program` on `nu` at the current time.
     pub fn spawn(&mut self, nu: NeutrinoId, program: impl NeutrinoProgram) {
+        self.spawn_named(nu, "main", program);
+    }
+
+    /// [`Sim::spawn`] with a program name for a tracer.
+    pub fn spawn_named(
+        &mut self,
+        nu: NeutrinoId,
+        name: &'static str,
+        program: impl NeutrinoProgram,
+    ) {
         let n = &mut self.nus[nu.0 as usize];
         assert!(
             n.program.is_none(),
@@ -689,7 +784,10 @@ impl Sim {
         // A program start resets the Neutrino's version table (Section 3.2).
         n.tables.vreset_all();
         n.program = Some(Box::pin(program.run(ctx)));
+        n.prog_name = name;
         n.state = ProgState::Busy;
+        let now = self.now;
+        trace!(self, t => t.program_start(nu, name, None, now));
         self.queue.push(self.now, Event::NuResume(nu));
     }
 
@@ -727,6 +825,7 @@ impl Sim {
         };
         self.stats.outbound_stall = vec![0; self.nus.len()];
         self.stats.table_stall = vec![0; self.nus.len()];
+        self.start_tracer();
         while let Some((t, ev)) = self.queue.pop() {
             debug_assert!(t >= self.now, "event in the past");
             self.now = t;
@@ -744,6 +843,27 @@ impl Sim {
             }
         }
         self.finish()
+    }
+
+    /// Installs the tracer of the run: the collector and the tracer of
+    /// [`Sim::set_tracer`]. Programs spawned before the run start now.
+    fn start_tracer(&mut self) {
+        let mut list: Vec<Box<dyn Tracer>> = Vec::new();
+        if self.collect.any() {
+            list.push(Box::new(Collector::new(self.collect)));
+        }
+        list.extend(self.extra.take());
+        let mut t = match list.len() {
+            0 => return,
+            1 => list.pop().expect("one tracer"),
+            _ => Box::new(Tee(list)),
+        };
+        self.res.set_record(t.wants_charges());
+        t.begin(self);
+        for n in self.nus.iter().filter(|n| n.program.is_some()) {
+            t.program_start(n.id, n.prog_name, None, self.now);
+        }
+        self.tracer = Some(t);
     }
 
     fn plane(&self) -> &FuncPlane {
@@ -828,6 +948,9 @@ impl Sim {
             };
             self.stats.unfinished.push((n.id, blocked));
         }
+        if let Some(t) = self.tracer.take() {
+            t.finish(&mut self.stats);
+        }
         (self.stats, backend)
     }
 
@@ -867,6 +990,9 @@ impl Sim {
             Poll::Ready(()) => {
                 n.program = None;
                 n.state = ProgState::Idle;
+                let now = self.now;
+                trace!(self, t => t.program_return(nu, now));
+                let n = &mut self.nus[nu.0 as usize];
                 let parent = n.parent_task.take();
                 // Program return frees the done unversioned entries
                 // (Section 3.2); the version table resets at the next start.
@@ -908,13 +1034,14 @@ impl Sim {
         let end = self.charge_scalar(nu, cost);
         let n = &mut self.nus[nu.0 as usize];
         n.op = Some(req);
+        n.op_call = self.now;
         n.state = ProgState::Busy;
         self.queue.push(end, Event::NuExec(nu));
     }
 
     fn charge_scalar(&mut self, nu: NeutrinoId, cost: u64) -> Cycle {
         let r = self.nus[nu.0 as usize].scalar;
-        self.charge(r, cost)
+        self.charge(r, cost, Who::Program(nu))
     }
 
     /// Charges `c_complete` on `nu`'s completion port; the completion of
@@ -922,36 +1049,36 @@ impl Sim {
     pub(super) fn complete_after_charge(&mut self, nu: NeutrinoId, t: TaskId) {
         let n = &self.nus[nu.0 as usize];
         let (r, cost) = (n.complete_port, n.cfg.costs.complete);
-        let end = self.charge(r, cost);
+        let gid = n.rec(t).gid;
+        let end = self.charge(r, cost, Who::Task(gid));
         self.queue.push(end, Event::Complete { nu, task: t });
     }
 
-    fn charge(&mut self, r: ResourceId, cost: u64) -> Cycle {
-        self.reserve(&[Demand::work(r, cost)], self.now).1
+    fn charge(&mut self, r: ResourceId, cost: u64, who: Who) -> Cycle {
+        self.reserve(&[Demand::work(r, cost)], self.now, who).end
     }
 
-    /// Co-charges `demand` at or after `earliest`: (start, end, culprit).
-    /// In zero-time mode everything takes place at now.
-    fn reserve(
-        &mut self,
-        demand: &[Demand],
-        earliest: Cycle,
-    ) -> (Cycle, Cycle, Option<ResourceId>) {
+    /// Co-charges `demand` for `who` at or after `earliest`. In zero-time
+    /// mode everything takes place at now.
+    fn reserve(&mut self, demand: &[Demand], earliest: Cycle, who: Who) -> Reserved {
         if self.zero_time {
-            return (self.now, self.now, None);
+            return Reserved::at(self.now);
         }
-        match self.res.reserve(demand, earliest) {
-            Some(g) => (g.start, g.end, Some(g.culprit)),
-            None => (earliest, earliest, None),
+        let g = match self.res.reserve(demand, earliest) {
+            Some(g) => Reserved {
+                start: g.start,
+                end: g.end,
+                culprit: Some(g.culprit),
+                queue_culprit: g.queue_culprit,
+            },
+            None => Reserved::at(earliest),
+        };
+        if let Some(t) = self.tracer.as_mut() {
+            for c in self.res.charges.drain(..) {
+                t.charge(&c, who);
+            }
         }
-    }
-
-    fn timeline(&mut self, gid: u64) -> Option<&mut TaskTimeline> {
-        if self.timeline {
-            Some(&mut self.stats.tasks[gid as usize])
-        } else {
-            None
-        }
+        g
     }
 
     fn respond(&mut self, nu: NeutrinoId, r: Response) {
@@ -1026,18 +1153,16 @@ impl Sim {
             }
             Request::Cycles(_) => self.respond(nu, Response::Done),
             Request::Mark(name) => {
-                if self.marks {
-                    let res = self
-                        .res
-                        .stats()
-                        .into_iter()
-                        .map(|r| [r.busy_cycles, r.culprit_cycles, r.delay_cycles])
-                        .collect();
-                    self.stats.marks.push(crate::stats::Mark {
-                        time: self.now,
-                        name,
-                        res,
-                    });
+                if let Some(mut t) = self.tracer.take() {
+                    let res = &self.res;
+                    let totals = || {
+                        res.stats()
+                            .into_iter()
+                            .map(|r| [r.busy_cycles, r.culprit_cycles, r.delay_cycles])
+                            .collect()
+                    };
+                    t.mark(self.now, nu, &name, &totals);
+                    self.tracer = Some(t);
                 }
                 self.respond(nu, Response::Done)
             }
@@ -1107,9 +1232,23 @@ impl Sim {
             .collect();
         demand.push(Demand::new(port, len, dir));
         let earliest = self.now + if self.zero_time { 0 } else { latency };
-        let end = self.reserve(&demand, earliest).1;
+        let pair = self
+            .tracer
+            .is_some()
+            .then(|| self.topo.best_pair(self.topo.data_hub(nu), &mem.attach))
+            .flatten();
+        let g = self.reserve(&demand, earliest, Who::Program(nu));
+        if let Some((from, to)) = pair {
+            let r = RouteUse {
+                from,
+                to,
+                bytes: len,
+                dir,
+            };
+            trace!(self, t => t.route(&r, g.start, g.end, Who::Program(nu)));
+        }
         self.nus[nu.0 as usize].op = Some(req);
-        self.queue.push(end, Event::MemDone(nu));
+        self.queue.push(g.end, Event::MemDone(nu));
     }
 
     /// The memory access of a load or store is done: sync or emit.
@@ -1239,6 +1378,15 @@ impl Sim {
         entry: Entry,
     ) -> Result<Entered, EnterFail> {
         let forwarded = entry != Entry::Local;
+        let call = match entry {
+            Entry::Local => TaskCall {
+                src: nu,
+                call: self.nus[nu.0 as usize].op_call,
+                queued: None,
+                sent: None,
+            },
+            Entry::Inbound(call) => call,
+        };
         if let Some(pe) = desc.pe {
             // The PE must be the owner's (Section 3.3): a write into another
             // node's memory is a pull by that memory owner's DMA engine.
@@ -1253,14 +1401,20 @@ impl Sim {
         // Split the deps by owner; remote ones count as external deps.
         let mut local = Vec::with_capacity(desc.deps.len());
         let mut remote = Vec::new();
-        for d in &desc.deps {
+        let mut remote_deps = 0u64;
+        for (i, d) in desc.deps.iter().enumerate() {
             match self.owners.owner_of(Addr(d.addr())) {
                 None => {
                     let r = Range::from_len(d.addr(), 1);
                     return Err(EnterFail::Fatal(FatalError::Unowned(r)));
                 }
                 Some(o) if o == nu => local.push(*d),
-                Some(o) => remote.push((o, *d)),
+                Some(o) => {
+                    if i < 64 {
+                        remote_deps |= 1 << i;
+                    }
+                    remote.push((o, *d));
+                }
             }
         }
         let reqs = &self.nus[nu.0 as usize].reqs;
@@ -1317,22 +1471,17 @@ impl Sim {
         let gid = self.next_gid;
         self.next_gid += 1;
         self.stats.invoked += 1;
-        if self.timeline {
-            self.stats.tasks.push(TaskTimeline {
-                nu,
-                task: inv.task,
-                opcode: desc.opcode,
-                pe: desc.pe,
-                label: desc.label,
-                invoke: self.now,
-                ready: None,
-                issue: None,
-                chunks: Vec::new(),
-                complete: None,
-                retire: None,
-                version: inv.version,
-            });
-        }
+        let now = self.now;
+        trace!(self, t => t.task_invoke(&TaskEntered {
+            gid,
+            nu,
+            task: inv.task,
+            desc: &desc,
+            version: inv.version,
+            call,
+            time: now,
+            remote_deps,
+        }));
         let dst = desc.dst;
         let n = &mut self.nus[nu.0 as usize];
         let slot = inv.task.0 as usize;
@@ -1461,9 +1610,7 @@ impl Sim {
             let n = &mut self.nus[nu.0 as usize];
             let rec = n.tasks[t.0 as usize].take().expect("retired task record");
             let now = self.now;
-            if let Some(tl) = self.timeline(rec.gid) {
-                tl.retire = Some(now);
-            }
+            trace!(self, t => t.task_retire(rec.gid, now));
         }
         for t in fx.ready {
             self.resolved(nu, t);
@@ -1510,9 +1657,7 @@ impl Sim {
         let rec = self.nus[nu.0 as usize].rec(t);
         let (gid, pe) = (rec.gid, rec.desc.pe);
         let now = self.now;
-        if let Some(tl) = self.timeline(gid) {
-            tl.ready = Some(now);
-        }
+        trace!(self, t => t.task_ready(gid, now));
         match pe {
             None => self.issue_no_pe(nu, t),
             Some(pe) => {
@@ -1526,9 +1671,7 @@ impl Sim {
     /// issue time, and the invokes that waited for room.
     fn issued(&mut self, nu: NeutrinoId, gid: u64) {
         let now = self.now;
-        if let Some(tl) = self.timeline(gid) {
-            tl.issue = Some(now);
-        }
+        trace!(self, t => t.task_issue(gid, now, 0));
         self.unstall(nu);
     }
 
@@ -1613,10 +1756,7 @@ impl Sim {
             let desc = rec.desc.clone();
             self.pes[pe.0 as usize].ready.pop_front();
             let now = self.now;
-            if let Some(tl) = self.timeline(gid) {
-                tl.issue = Some(now);
-                tl.chunks = vec![ChunkRec::default(); profile.chunks.len()];
-            }
+            trace!(self, t => t.task_issue(gid, now, profile.chunks.len()));
             let seq = self.emit(nu, Some(gid), OpKind::Task(desc));
             self.nus[nu.0 as usize].rec_mut(t).seq = seq;
             self.unstall(nu);
@@ -1654,18 +1794,23 @@ impl Sim {
         let gid = r.gid;
         // The profile lives in the PE; a moved-out demand avoids a borrow of
         // `self.pes` across the reservation.
+        let routes = chunk.routes;
         let demand = std::mem::take(&mut r.profile.chunks[i].demand);
-        let (start, end, culprit) = self.reserve(&demand, earliest);
-        let rec = ChunkRec {
-            start,
-            end,
-            culprit,
-        };
-        if let Some(tl) = self.timeline(gid) {
-            tl.chunks[i] = rec;
+        let g = self.reserve(&demand, earliest, Who::Task(gid));
+        if let Some(tr) = self.tracer.as_mut() {
+            tr.chunk_grant(&ChunkGrant {
+                gid,
+                index: i,
+                start: g.start,
+                end: g.end,
+                culprit: g.culprit,
+                queue_culprit: g.queue_culprit,
+            });
+            for u in routes.iter().flatten().filter(|u| u.bytes > 0) {
+                tr.route(u, g.start, g.end, Who::Task(gid));
+            }
         }
-        self.queue
-            .push(rec.end, Event::ChunkEnd { pe, nu, task: t });
+        self.queue.push(g.end, Event::ChunkEnd { pe, nu, task: t });
     }
 
     fn chunk_end(&mut self, pe: PeId, nu: NeutrinoId, t: TaskId) {
@@ -1704,9 +1849,7 @@ impl Sim {
         let holds = std::mem::take(&mut n.rec_mut(t).holds);
         let fx = n.tables.complete(t);
         let now = self.now;
-        if let Some(tl) = self.timeline(gid) {
-            tl.complete = Some(now);
-        }
+        trace!(self, t => t.task_complete(gid, now));
         if self.track_writers {
             self.writers.insert(dst, seq, Some(gid));
         }

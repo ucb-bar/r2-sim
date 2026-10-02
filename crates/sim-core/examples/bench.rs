@@ -22,7 +22,7 @@ fn main() {
     let timeline = a.get(3).is_none_or(|s| s != "off");
     let groups_per_nu = tasks / 3 / nnu;
 
-    let mut sim = Sim::new(ProfileRegistry::with_builtins(), false);
+    let mut sim = Sim::new(ProfileRegistry::with_builtins());
     sim.set_timeline(timeline);
     // Diagnostics off: they keep a writer map that grows with the number
     // of distinct buffers, and this benchmark never reuses one.

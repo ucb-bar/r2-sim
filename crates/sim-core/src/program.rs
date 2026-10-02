@@ -103,8 +103,15 @@ pub(crate) enum Response {
     Done,
 }
 
-/// A program value ready to start on a Neutrino.
-pub(crate) type StartFn = Box<dyn FnOnce(NuCtx) -> Pin<Box<dyn Future<Output = ()>>>>;
+/// A running program.
+pub(crate) type ProgramFuture = Pin<Box<dyn Future<Output = ()>>>;
+
+/// A program value ready to start on a Neutrino, and its name for a
+/// tracer.
+pub(crate) struct StartFn {
+    pub run: Box<dyn FnOnce(NuCtx) -> ProgramFuture>,
+    pub name: &'static str,
+}
 
 #[derive(Default)]
 pub(crate) struct Mailbox {
@@ -169,7 +176,23 @@ impl NuCtx {
         deps: Vec<Dep>,
         program: impl NeutrinoProgram + 'static,
     ) -> TaskHandle {
-        let start: StartFn = Box::new(move |ctx| Box::pin(program.run(ctx)));
+        self.spawn_named(child, "child", done, deps, program).await
+    }
+
+    /// [`NuCtx::spawn_child`] with a program name for a tracer: a short
+    /// static name per program type.
+    pub async fn spawn_named(
+        &self,
+        child: NeutrinoId,
+        name: &'static str,
+        done: Range,
+        deps: Vec<Dep>,
+        program: impl NeutrinoProgram + 'static,
+    ) -> TaskHandle {
+        let start = StartFn {
+            run: Box::new(move |ctx| Box::pin(program.run(ctx))),
+            name,
+        };
         self.mb.borrow_mut().spawn = Some(start);
         match self.call(Request::Spawn { child, done, deps }).await {
             Response::Invoked(h) => h,

@@ -465,7 +465,7 @@ impl Driver {
                         let prog = p[stage].take().expect("a stage program");
                         let done =
                             Range::from_len(sync.base + (stage as u64 * n + g as u64) * 512, 512);
-                        handles.push(ctx.spawn_child(nus[g], done, vec![], prog).await);
+                        handles.push(ctx.spawn_named(nus[g], name, done, vec![], prog).await);
                     }
                     for h in handles {
                         ctx.wait_key(h.key()).await;

@@ -10,7 +10,8 @@ use nu_model::{Addr, Dep, NeutrinoId, Range};
 use crate::config::{MemBlock, PeConfig, PeParams};
 use crate::resource::{Demand, Dir, ResourceId};
 use crate::time::{Cycle, Ratio};
-use crate::topology::Topology;
+use crate::topology::{AttachId, Topology};
+use crate::tracer::RouteUse;
 
 /// Index of an opcode in the [`ProfileRegistry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -230,6 +231,9 @@ pub struct Chunk {
     pub demand: Vec<Demand>,
     /// Cycles after the request before the demand may start (Section 5.7).
     pub latency: Cycle,
+    /// The fabric routes the chunk's bytes take, for a tracer (the
+    /// unlimited links of a route have no demand).
+    pub routes: [Option<RouteUse>; 2],
 }
 
 /// The timing of one task: its chunks and the occupancy it holds.
@@ -319,6 +323,11 @@ impl ProfileRegistry {
         OpcodeId(self.fns.len() as u16 - 1)
     }
 
+    /// The opcode names, by opcode id.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.fns.iter().map(|(n, _)| n.as_str())
+    }
+
     /// The opcode registered under `name`.
     pub fn lookup(&self, name: &str) -> Option<OpcodeId> {
         self.fns
@@ -375,6 +384,10 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         route(&sm.attach, masters, "from the source"),
         route(masters, &dm.attach, "to the destination"),
     );
+    let (in_pair, out_pair) = (
+        node.topology.best_pair(&sm.attach, masters),
+        node.topology.best_pair(masters, &dm.attach),
+    );
     let mut chunks = Vec::with_capacity(bytes.div_ceil(tile_bytes) as usize);
     let mut left = bytes;
     while left > 0 {
@@ -388,9 +401,18 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         demand.extend(inp.resources.iter().map(|r| Demand::read(*r, n)));
         demand.extend(out.resources.iter().map(|r| Demand::write(*r, n)));
         demand.push(Demand::write(dst_port, n));
+        let use_of = |p: Option<(AttachId, AttachId)>, dir| {
+            p.map(|(from, to)| RouteUse {
+                from,
+                to,
+                bytes: n,
+                dir,
+            })
+        };
         chunks.push(Chunk {
             demand,
             latency: *latency + inp.latency + out.latency,
+            routes: [use_of(in_pair, Dir::Read), use_of(out_pair, Dir::Write)],
         });
     }
     Profile {
@@ -493,6 +515,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                     Demand::write(smem_port, c_out + flush),
                 ],
                 latency: 0,
+                routes: [None; 2],
             });
         }
     }
@@ -532,17 +555,30 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     v.utilization = utilization;
     let mut demand = vec![v];
     let mut latency = 0;
+    let mut routes = [None; 2];
     let out_block = node.memory(Addr(desc.dst.base));
     let in_block = src.map_or(out_block, |a| node.memory(a));
     for (block, bytes, to) in [(in_block, bytes_in, false), (out_block, bytes_out, true)] {
-        let route = if to {
-            node.topology.best_path(masters, &block.attach)
+        let (from, dest): (&[AttachId], &[AttachId]) = if to {
+            (masters, &block.attach)
         } else {
-            node.topology.best_path(&block.attach, masters)
-        }
-        .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
+            (&block.attach, masters)
+        };
+        let route = node
+            .topology
+            .best_path(from, dest)
+            .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
         latency = latency.max(route.latency);
         let dir = if to { Dir::Write } else { Dir::Read };
+        routes[to as usize] = node
+            .topology
+            .best_pair(from, dest)
+            .map(|(from, to)| RouteUse {
+                from,
+                to,
+                bytes,
+                dir,
+            });
         for r in route.resources.iter().chain([&block.port]) {
             demand.push(Demand::new(*r, bytes, dir));
         }
@@ -551,6 +587,7 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         chunks: vec![Chunk {
             demand,
             latency: overhead + latency,
+            routes,
         }],
         holds: Vec::new(),
     }

@@ -50,6 +50,8 @@ pub struct Launch {
     pub home: NeutrinoId,
     /// The program to spawn on `nu`.
     pub program: ProgramFn,
+    /// The program name (for a tracer).
+    pub name: &'static str,
     /// The action expert's report (`adamoe`; the action stage of `forward`).
     pub report: Rc<RefCell<adamoe::Report>>,
     /// The prefill programs' report (their `report` stays empty).
@@ -99,6 +101,7 @@ pub fn launch(
                 drivers: vec![nu],
                 home: nu,
                 program: Box::new(move |ctx| Box::pin(d.run(ctx))),
+                name: "adamoe",
                 report,
                 prefill: None,
                 forward: None,
@@ -115,6 +118,7 @@ pub fn launch(
                 drivers,
                 home,
                 program: Box::new(move |ctx| Box::pin(d.run(ctx))),
+                name: "forward",
                 report,
                 prefill: None,
                 forward: Some(fwd),
@@ -131,6 +135,7 @@ pub fn launch(
                 drivers: vec![nu],
                 home: nu,
                 program: Box::new(move |ctx| Box::pin(d.run(ctx))),
+                name: "prefill",
                 report: Default::default(),
                 prefill: Some(report),
                 forward: None,

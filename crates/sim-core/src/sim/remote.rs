@@ -40,7 +40,7 @@ use nu_model::{
     handle_await, AckAction, AwaitAck, AwaitMsg, Dep, NeutrinoId, Purpose, RequestId, TaskId,
 };
 
-use super::{EnterFail, Entry, ProgState, Sim};
+use super::{trace, EnterFail, Entry, ProgState, Sim};
 use crate::event::{Event, Stage};
 use crate::profile::{Descriptor, OpcodeId};
 use crate::program::{NuCtx, Response, StartFn};
@@ -48,6 +48,7 @@ use crate::program::{Request, TaskHandle};
 use crate::resource::Demand;
 use crate::stats::{FatalError, Stall};
 use crate::time::Cycle;
+use crate::tracer::{TaskCall, Who};
 
 /// Most beats of one message.
 pub(crate) const MAX_BEATS: u64 = 4;
@@ -73,8 +74,9 @@ pub(crate) enum MsgKind {
     Start { task: TaskId, start: StartFn },
     /// Child to parent: the program of spawn task `task` returned.
     Return { task: TaskId },
-    /// Invoker to owner: a forwarded invoke with its descriptor.
-    Invoke { desc: Descriptor },
+    /// Invoker to owner: a forwarded invoke with its descriptor, and the
+    /// invoker's call for a tracer.
+    Invoke { desc: Descriptor, call: TaskCall },
     /// Requester to owner: free the version table entry at base address
     /// `addr` (an absent entry is a no-op).
     VersionReset { addr: u64 },
@@ -91,21 +93,41 @@ pub(crate) enum MsgKind {
     PCrdGrant,
 }
 
+/// The names of the protocol message kinds.
+pub const MESSAGE_KINDS: [&str; 11] = [
+    "Await",
+    "AwaitAck",
+    "Resolve",
+    "Start",
+    "Return",
+    "Invoke",
+    "VersionReset",
+    "InvokeAck",
+    "RetryAck",
+    "Reject",
+    "PCrdGrant",
+];
+
 impl MsgKind {
-    fn name(&self) -> &'static str {
+    /// The kind's index in [`MESSAGE_KINDS`].
+    fn index(&self) -> u8 {
         match self {
-            MsgKind::Await { .. } => "Await",
-            MsgKind::AwaitAck { .. } => "AwaitAck",
-            MsgKind::Resolve { .. } => "Resolve",
-            MsgKind::Start { .. } => "Start",
-            MsgKind::Return { .. } => "Return",
-            MsgKind::Invoke { .. } => "Invoke",
-            MsgKind::VersionReset { .. } => "VersionReset",
-            MsgKind::InvokeAck => "InvokeAck",
-            MsgKind::RetryAck => "RetryAck",
-            MsgKind::Reject => "Reject",
-            MsgKind::PCrdGrant => "PCrdGrant",
+            MsgKind::Await { .. } => 0,
+            MsgKind::AwaitAck { .. } => 1,
+            MsgKind::Resolve { .. } => 2,
+            MsgKind::Start { .. } => 3,
+            MsgKind::Return { .. } => 4,
+            MsgKind::Invoke { .. } => 5,
+            MsgKind::VersionReset { .. } => 6,
+            MsgKind::InvokeAck => 7,
+            MsgKind::RetryAck => 8,
+            MsgKind::Reject => 9,
+            MsgKind::PCrdGrant => 10,
         }
+    }
+
+    fn name(&self) -> &'static str {
+        MESSAGE_KINDS[self.index() as usize]
     }
 
     /// The channel of the message.
@@ -125,7 +147,7 @@ impl MsgKind {
     /// Bytes on the wire before rounding to beats.
     fn bytes(&self) -> u64 {
         match self {
-            MsgKind::Invoke { desc } => desc.wire_bytes(),
+            MsgKind::Invoke { desc, .. } => desc.wire_bytes(),
             _ => 1,
         }
     }
@@ -168,7 +190,7 @@ pub(crate) struct Held {
 
 #[derive(Debug, Clone)]
 enum HeldKind {
-    Invoke(Descriptor),
+    Invoke(Box<Descriptor>, TaskCall),
     VersionReset(u64),
 }
 
@@ -294,7 +316,7 @@ impl Sim {
         let beats = kind.bytes().div_ceil(self.msg_bytes).max(1);
         if beats > MAX_BEATS {
             let what = match &kind {
-                MsgKind::Invoke { desc } => format!(
+                MsgKind::Invoke { desc, .. } => format!(
                     " (opcode {}, {} deps, label {:?})",
                     desc.opcode.0,
                     desc.deps.len(),
@@ -404,6 +426,7 @@ impl Sim {
                 }
             }
             let (to, class, next, retry) = (m.to, m.class, m.next, m.retry);
+            let (from, kind) = (m.from, m.kind.index());
             if let Some(&hop) = m.hops.get(next) {
                 let t = Stage::Hop(hop.lane, class);
                 if self.stage_occ(t) >= self.stage_cap(t) {
@@ -415,8 +438,17 @@ impl Sim {
                 self.sent_from_source(s, id);
                 let earliest = self.now + if next == 0 { lead } else { 0 };
                 let bytes = beats * self.msg_bytes;
+                let who = Who::Message {
+                    kind,
+                    from,
+                    to,
+                    hop: next,
+                    bytes,
+                };
                 // A message is a write toward its receiver.
-                let end = self.reserve(&[Demand::write(hop.lane, bytes)], earliest).1;
+                let end = self
+                    .reserve(&[Demand::write(hop.lane, bytes)], earliest, who)
+                    .end;
                 self.msgs[id as usize].as_mut().expect("message").next += 1;
                 self.queue.push(end, Event::StageFree { stage: s });
                 self.queue
@@ -426,6 +458,13 @@ impl Sim {
                 // the owner's inbound invoke table.
                 let is_invoke = matches!(m.kind, MsgKind::Invoke { .. });
                 let lead = if m.hops.is_empty() { m.lead } else { 0 };
+                let free = (m.hops.is_empty() && self.tracer.is_some()).then(|| Who::Message {
+                    kind,
+                    from,
+                    to,
+                    hop: 0,
+                    bytes: m.beats * self.msg_bytes,
+                });
                 if is_invoke && self.flow == Flow::ReadyValid {
                     let n = &self.nus[to.0 as usize];
                     if n.inbound.len() + n.inbound_reserved >= n.cfg.inbound_invokes {
@@ -439,6 +478,10 @@ impl Sim {
                 q.occ -= 1;
                 self.queue
                     .push(self.now + lead, Event::MsgArrive { msg: id });
+                if let Some(w) = free {
+                    let now = self.now;
+                    trace!(self, t => t.message_free(w, now, now + lead));
+                }
                 self.wake(s);
             }
             if !retry {
@@ -586,7 +629,10 @@ impl Sim {
                 self.send_msg(to, from, kind, ack == AwaitAck::Reject);
             }
             MsgKind::AwaitAck { req, ack } => match self.nus[to.0 as usize].reqs.on_ack(req, ack) {
-                AckAction::Satisfied(purpose) => self.dep_satisfied(to, purpose),
+                AckAction::Satisfied(purpose) => {
+                    self.trace_dep_done(to, req.0, purpose);
+                    self.dep_satisfied(to, purpose)
+                }
                 AckAction::Wait => {}
                 AckAction::Retry { msg, .. } => {
                     let t = self.nus[to.0 as usize].cfg.t_retry;
@@ -602,15 +648,16 @@ impl Sim {
             },
             MsgKind::Resolve { req } => {
                 let purpose = self.nus[to.0 as usize].reqs.on_resolve(req);
+                self.trace_dep_done(to, req.0, purpose);
                 self.dep_satisfied(to, purpose);
             }
             MsgKind::Start { task, start } => self.start_child(from, to, task, start),
-            MsgKind::Invoke { desc } => {
+            MsgKind::Invoke { desc, call } => {
                 if self.flow == Flow::ReadyValid {
                     self.nus[to.0 as usize].inbound_reserved -= 1;
                 }
                 let n = &mut self.nus[to.0 as usize];
-                n.inbound.push_back((Entry::Inbound, desc));
+                n.inbound.push_back((Entry::Inbound(call), desc));
                 n.inbound_peak = n.inbound_peak.max(n.inbound.len());
                 self.drain_inbound(to);
             }
@@ -694,6 +741,12 @@ impl Sim {
         let Stage::Source(nu, INVOKE) = s else {
             return;
         };
+        let now = self.now;
+        if let Some(MsgKind::Invoke { call, .. }) =
+            self.msgs[id as usize].as_mut().map(|m| &mut m.kind)
+        {
+            call.sent = Some(now);
+        }
         if self.flow != Flow::Ticket {
             return;
         }
@@ -800,7 +853,7 @@ impl Sim {
             .expect("held request to replay");
         h.state = HeldState::Sent;
         let kind = match h.kind.clone() {
-            HeldKind::Invoke(desc) => MsgKind::Invoke { desc },
+            HeldKind::Invoke(desc, call) => MsgKind::Invoke { desc: *desc, call },
             HeldKind::VersionReset(addr) => MsgKind::VersionReset { addr },
         };
         self.stats.resends += 1;
@@ -822,7 +875,7 @@ impl Sim {
     /// acknowledged, and sends it into the invoke source queue.
     fn send_held(&mut self, nu: NeutrinoId, owner: NeutrinoId, kind: MsgKind) {
         let held = match &kind {
-            MsgKind::Invoke { desc } => HeldKind::Invoke(desc.clone()),
+            MsgKind::Invoke { desc, call } => HeldKind::Invoke(Box::new(desc.clone()), *call),
             MsgKind::VersionReset { addr } => HeldKind::VersionReset(*addr),
             _ => unreachable!("only requests are held"),
         };
@@ -897,7 +950,13 @@ impl Sim {
             return;
         };
         let addr = desc.dst.base;
-        self.send_request(nu, owner, MsgKind::Invoke { desc });
+        let call = TaskCall {
+            src: nu,
+            call: self.nus[nu.0 as usize].op_call,
+            queued: Some(self.now),
+            sent: None,
+        };
+        self.send_request(nu, owner, MsgKind::Invoke { desc, call });
         self.respond(
             nu,
             Response::Invoked(TaskHandle {
@@ -968,7 +1027,19 @@ impl Sim {
             .reqs
             .open(owner, key, purpose)
             .expect("remote dependency capacity checked");
+        if let (Some(t), Purpose::TaskDep(task)) = (self.tracer.as_mut(), purpose) {
+            let gid = self.nus[nu.0 as usize].rec(task).gid;
+            t.dep_remote_open(nu, msg.request.0, gid, key);
+        }
         self.send(nu, owner, MsgKind::Await { msg });
+    }
+
+    /// The tracer's view of a satisfied remote request of `nu`.
+    fn trace_dep_done(&mut self, nu: NeutrinoId, req: u32, purpose: Purpose) {
+        if let Purpose::TaskDep(_) = purpose {
+            let now = self.now;
+            trace!(self, t => t.dep_remote_done(nu, req, now));
+        }
     }
 
     /// A program wait on a key that `owner` owns.
@@ -1054,9 +1125,14 @@ impl Sim {
         );
         // A program start resets the Neutrino's version table (Section 3.2).
         n.tables.vreset_all();
-        n.program = Some(start(ctx));
+        n.program = Some((start.run)(ctx));
+        n.prog_name = start.name;
         n.parent_task = Some((parent, task));
         n.state = ProgState::Busy;
+        if let Some(t) = self.tracer.as_mut() {
+            let gid = self.nus[parent.0 as usize].rec(task).gid;
+            t.program_start(child, start.name, Some(gid), self.now);
+        }
         self.queue.push(self.now, Event::NuResume(child));
     }
 }

@@ -30,7 +30,7 @@
 //! Keys beyond Section 8.1:
 //!
 //! * `global`: `msg_latency` (extra cycles per remote-protocol message),
-//!   `cocharge` (own | longest), `log` (interval logs),
+//!   `cocharge` (own | longest),
 //!   `livelock_cycles` (idle cycles with continuing resends that stop the
 //!   run; default 10 x the largest `t_retry` plus the longest route
 //!   latency), `flow` (readyvalid | ticket), `hop_queue` (messages one
@@ -69,7 +69,7 @@ use crate::profile::{Dtype, PeId, ProfileRegistry};
 use crate::resource::{Kind, ResourceId};
 use crate::sim::Sim;
 use crate::time::Ratio;
-use crate::topology::{BusId, BusTopology};
+use crate::topology::{AttachId, BusId, BusTopology, Lane};
 
 /// A configuration that cannot be loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,7 +344,6 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct Global {
     neutrino_granule: u64,
-    #[allow(dead_code)]
     clock_ghz: Option<f64>,
     #[serde(default = "default_msg_bytes")]
     msg_bytes: u64,
@@ -355,8 +354,6 @@ struct Global {
     /// Messages a hop stage holds (a pipeline register; default 1).
     hop_queue: Option<usize>,
     cocharge: Option<String>,
-    #[serde(default)]
-    log: bool,
     livelock_cycles: Option<u64>,
     address: AddrSec,
 }
@@ -581,6 +578,65 @@ pub(crate) fn parse_rate(s: &str) -> Result<Ratio, ConfigError> {
 
 // ---- the built simulation ----
 
+/// What an attachment connects (for a tracer's manifest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Component {
+    Memory,
+    Neutrino,
+    Bridge,
+    Compute,
+}
+
+/// How an attachment takes part in transfers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Master,
+    Slave,
+    Both,
+}
+
+/// One attachment: the dotted path of what it connects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachInfo {
+    pub component: String,
+    pub kind: Component,
+    pub role: Role,
+}
+
+/// One bridge: a child node's bridge (`<node>.bridge`, its control side
+/// `<node>.bridge.ctl`) or a cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeInfo {
+    pub path: String,
+    pub cache: bool,
+}
+
+/// One memory of the configuration: a block, a cache or a sync range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemInfo {
+    pub path: String,
+    pub node: NeutrinoId,
+    /// "scratch", "dram", "cache" or "sync".
+    pub kind: &'static str,
+    /// Global address ranges.
+    pub ranges: Vec<Range>,
+    pub attachments: Vec<AttachId>,
+    pub port: Option<ResourceId>,
+    pub latency: u64,
+}
+
+/// The names and kinds of the fabric parts, by id: what a tracer needs
+/// beside the simulation's own tables.
+#[derive(Debug, Clone, Default)]
+pub struct Layout {
+    /// By `AttachId`.
+    pub attachments: Vec<AttachInfo>,
+    /// By bridge index (`Topology::bridges`).
+    pub bridges: Vec<BridgeInfo>,
+    /// The blocks, then the caches, then the sync ranges.
+    pub memories: Vec<MemInfo>,
+}
+
 /// A simulation built from a configuration, with name lookups by dotted
 /// name from the root.
 pub struct Built {
@@ -589,6 +645,10 @@ pub struct Built {
     /// True when some subtree has `numeric` fidelity; the caller then sets
     /// a Numeric backend.
     pub numeric: bool,
+    /// The clock of the global cycle in GHz (default 1).
+    pub clock_ghz: f64,
+    /// The fabric parts' names and kinds.
+    pub layout: Layout,
     nodes: HashMap<String, NeutrinoId>,
     pes: HashMap<String, PeId>,
     memories: HashMap<String, Range>,
@@ -716,12 +776,15 @@ fn resolve(name: &str, this: &str, parent: Option<&str>) -> Result<String, Confi
 /// A memory block whose buses are resolved at the end.
 struct PendingMem {
     block: MemBlock,
+    kind: &'static str,
     slaves: Vec<String>,
 }
 
 /// A cache: a bridge from its slave bus to its master bus through its port.
 struct PendingCache {
     name: String,
+    node: NeutrinoId,
+    ranges: Vec<Range>,
     port: ResourceId,
     slave: String,
     master: String,
@@ -739,6 +802,8 @@ struct Builder {
     buses: HashMap<String, BusId>,
     mems: Vec<PendingMem>,
     caches: Vec<PendingCache>,
+    /// Sync ranges for the layout, in node order.
+    syncs: Vec<MemInfo>,
     /// Scratch memories with their slave bus name and port, for the SMEM
     /// port of compute elements.
     scratch_ports: Vec<(String, String, ResourceId)>,
@@ -754,7 +819,7 @@ impl Builder {
         if total_bits > 64 {
             return err("address fields and offset exceed 64 bits");
         }
-        let mut sim = Sim::new(profiles, g.log);
+        let mut sim = Sim::new(profiles);
         sim.set_msg_bytes(g.msg_bytes);
         sim.set_msg_latency(g.msg_latency);
         match g.cocharge.as_deref() {
@@ -778,12 +843,15 @@ impl Builder {
         if let Some(c) = g.livelock_cycles {
             sim.set_livelock_cycles(c);
         }
+        let clock_ghz = g.clock_ghz.unwrap_or(1.0);
         Ok(Self {
             file,
             total_bits,
             built: Built {
                 sim,
                 numeric: false,
+                clock_ghz,
+                layout: Layout::default(),
                 nodes: HashMap::new(),
                 pes: HashMap::new(),
                 memories: HashMap::new(),
@@ -793,9 +861,43 @@ impl Builder {
             buses: HashMap::new(),
             mems: Vec::new(),
             caches: Vec::new(),
+            syncs: Vec::new(),
             scratch_ports: Vec::new(),
             table_sizes: Vec::new(),
         })
+    }
+
+    /// Records what the next attachment connects.
+    fn note_attach(&mut self, id: AttachId, component: &str, kind: Component, role: Role) {
+        let l = &mut self.built.layout.attachments;
+        debug_assert_eq!(id.0 as usize, l.len(), "attachments in creation order");
+        l.push(AttachInfo {
+            component: component.to_string(),
+            kind,
+            role,
+        });
+    }
+
+    /// Adds a bridge and records its two attachments and its path.
+    #[allow(clippy::too_many_arguments)]
+    fn bridge(
+        &mut self,
+        (a, a_name, a_role): (BusId, &str, Role),
+        (b, b_name, b_role): (BusId, &str, Role),
+        (ab, ba): (Lane, Lane),
+        latency: u64,
+        info: BridgeInfo,
+        kind: Component,
+    ) -> (AttachId, AttachId) {
+        let first = AttachId(self.built.sim.topology().attachment_count() as u32);
+        let second = AttachId(first.0 + 1);
+        self.built
+            .sim
+            .add_bridge(a, a_name, b, b_name, ab, ba, latency);
+        self.note_attach(first, &info.path, kind, a_role);
+        self.note_attach(second, &info.path, kind, b_role);
+        self.built.layout.bridges.push(info);
+        (first, second)
     }
 
     fn bus(&self, name: &str, what: &str) -> Result<BusId, ConfigError> {
@@ -842,23 +944,56 @@ impl Builder {
                 stack.push((c, Some((nu, path.clone())), f, numeric));
             }
         }
+        let mut caches = Vec::new();
         for c in std::mem::take(&mut self.caches) {
             let (a, b) = (self.bus(&c.slave, &c.name)?, self.bus(&c.master, &c.name)?);
             let lane = Some(c.port);
             let short = c.name.rsplit('.').next().unwrap_or(&c.name).to_string();
-            self.built
-                .sim
-                .add_bridge(a, &short, b, &short, lane, lane, c.latency);
+            let info = BridgeInfo {
+                path: c.name.clone(),
+                cache: true,
+            };
+            let (x, y) = self.bridge(
+                (a, &short, Role::Slave),
+                (b, &short, Role::Master),
+                (lane, lane),
+                c.latency,
+                info,
+                Component::Memory,
+            );
+            caches.push(MemInfo {
+                path: c.name,
+                node: c.node,
+                kind: "cache",
+                ranges: c.ranges,
+                attachments: vec![x, y],
+                port: Some(c.port),
+                latency: c.latency,
+            });
         }
         for m in std::mem::take(&mut self.mems) {
             let mut block = m.block;
             let short = block.name.rsplit('.').next().unwrap_or("").to_string();
             for slave in &m.slaves {
                 let bus = self.bus(slave, &block.name)?;
-                block.attach.push(self.built.sim.attach(bus, &short, true));
+                let id = self.built.sim.attach(bus, &short, true);
+                self.note_attach(id, &block.name, Component::Memory, Role::Slave);
+                block.attach.push(id);
             }
+            self.built.layout.memories.push(MemInfo {
+                path: block.name.clone(),
+                node: block.owner,
+                kind: m.kind,
+                ranges: vec![block.range],
+                attachments: block.attach.clone(),
+                port: Some(block.port),
+                latency: block.load_latency,
+            });
             self.built.sim.add_memory(block);
         }
+        self.built.layout.memories.extend(caches);
+        let syncs = std::mem::take(&mut self.syncs);
+        self.built.layout.memories.extend(syncs);
         self.built.sim.finish_fabric().map_err(ConfigError)?;
         check_tables(&self.table_sizes)?;
         Ok(self.built)
@@ -922,7 +1057,7 @@ impl Builder {
                 match m.kind.as_str() {
                     "scratch" | "dram" => owned.push(r),
                     "sync" => {
-                        if sync.replace(r).is_some() {
+                        if sync.replace((r, format!("{path}.{}", m.name))).is_some() {
                             return err(format!("{path}: more than one sync range"));
                         }
                         owned.push(r);
@@ -980,9 +1115,18 @@ impl Builder {
         };
         self.built.own.push(own);
         self.built.nodes.insert(path.clone(), nu);
-        if let Some(r) = sync {
+        if let Some((r, name)) = sync {
             self.built.sim.add_sync_only(r);
             self.built.sync_only.insert(nu, r);
+            self.syncs.push(MemInfo {
+                path: name,
+                node: nu,
+                kind: "sync",
+                ranges: vec![r],
+                attachments: Vec::new(),
+                port: None,
+                latency: 0,
+            });
         }
         // Buses.
         let mut own_buses = Vec::new();
@@ -1034,6 +1178,7 @@ impl Builder {
         for m in &masters {
             let bus = self.bus(m, &format!("{path}.neutrino"))?;
             let att = self.built.sim.attach(bus, "neutrino", true);
+            self.note_attach(att, &path, Component::Neutrino, Role::Both);
             if self.built.sim.topology().bus(bus).control {
                 if nu_ctl.replace(att).is_some() {
                     return err(format!("{path}.neutrino: masters two control buses"));
@@ -1047,11 +1192,23 @@ impl Builder {
         };
         self.built.sim.set_hub(nu, nu_ctl, nu_data);
         if let Some((data, control, (up, down), (up_ctl, down_ctl), latency)) = bridge {
-            let sim = &mut self.built.sim;
-            sim.add_bridge(hub_data, "bridge", data, &sec.name, up, down, latency);
-            sim.add_bridge(
-                hub_ctl, "bridge", control, &sec.name, up_ctl, down_ctl, latency,
-            );
+            for (child, parent, lanes, suffix) in [
+                (hub_data, data, (up, down), ""),
+                (hub_ctl, control, (up_ctl, down_ctl), ".ctl"),
+            ] {
+                let info = BridgeInfo {
+                    path: format!("{path}.bridge{suffix}"),
+                    cache: false,
+                };
+                self.bridge(
+                    (child, "bridge", Role::Both),
+                    (parent, &sec.name, Role::Both),
+                    lanes,
+                    latency,
+                    info,
+                    Component::Bridge,
+                );
+            }
         }
         self.memories(sec, &path, ppath, nu, own.base, numeric)?;
         self.compute(sec, &path, ppath, nu)?;
@@ -1104,6 +1261,11 @@ impl Builder {
                     }
                     self.built.memories.insert(name.clone(), range);
                     self.mems.push(PendingMem {
+                        kind: if m.kind == "scratch" {
+                            "scratch"
+                        } else {
+                            "dram"
+                        },
                         block: MemBlock {
                             name,
                             owner: nu,
@@ -1123,8 +1285,14 @@ impl Builder {
                     let Some(master) = &m.master else {
                         return err(format!("{name}: a cache needs master"));
                     };
+                    let mut ranges = Vec::new();
+                    for [a, b] in &m.addr {
+                        ranges.push(Range::new(a.bytes()?, b.bytes()?));
+                    }
                     self.caches.push(PendingCache {
                         name,
+                        node: nu,
+                        ranges,
                         port,
                         slave: slave.clone(),
                         master: resolve(master, path, ppath)?,
@@ -1176,7 +1344,9 @@ impl Builder {
             let mut atts = Vec::new();
             for m in &masters {
                 let bus = self.bus(m, &name)?;
-                atts.push(self.built.sim.attach(bus, &c.name, false));
+                let id = self.built.sim.attach(bus, &c.name, false);
+                self.note_attach(id, &name, Component::Compute, Role::Master);
+                atts.push(id);
             }
             let utilization = || opt_rate(&c.utilization).map(|u| u.unwrap_or(Ratio::ONE));
             let params = match c.kind.as_str() {

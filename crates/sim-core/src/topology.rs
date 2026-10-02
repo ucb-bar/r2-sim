@@ -94,15 +94,28 @@ pub struct Attachment {
 /// A bridge between buses `a` and `b`, attached to them as `att_a` and
 /// `att_b`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Bridge {
-    a: BusId,
-    b: BusId,
-    att_a: AttachId,
-    att_b: AttachId,
+pub struct Bridge {
+    pub a: BusId,
+    pub b: BusId,
+    pub att_a: AttachId,
+    pub att_b: AttachId,
     /// Lanes from `a` to `b`, and from `b` to `a`.
-    ab: Lane,
-    ba: Lane,
-    latency: Cycle,
+    pub ab: Lane,
+    pub ba: Lane,
+    pub latency: Cycle,
+}
+
+/// One link of a route, rated or unlimited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Link {
+    /// The ingress port of an `Xbar` attachment.
+    In(AttachId),
+    /// The egress port of an `Xbar` attachment.
+    Out(AttachId),
+    /// The shared lane of a `Shared` bus.
+    Bus(BusId),
+    /// A bridge lane: the bridge index, and true for `a` to `b`.
+    Bridge(u32, bool),
 }
 
 /// One hop of a control route: a resource and the latency after it.
@@ -157,6 +170,8 @@ pub struct Topology {
     /// Routes by (from, to) attachment, after `finish`; `None` where no
     /// route exists.
     routes: Vec<Option<Path>>,
+    /// Bus-level routes by (from, to) bus, after `finish`.
+    steps: Vec<Option<Vec<Step>>>,
     finished: bool,
 }
 
@@ -300,36 +315,29 @@ impl Topology {
                 self.routes.push(p);
             }
         }
+        self.steps = steps;
         self.finished = true;
         Ok(())
     }
 
-    /// The path from attachment `s` to attachment `d` over the bus-level
-    /// `route`.
-    fn route_of(&self, s: usize, d: usize, route: &[Step]) -> Path {
-        let mut p = Path {
-            bridges: route.len() as u32 - 1,
-            ..Path::default()
-        };
-        let mut add = |lane: Lane, latency: Cycle| {
-            p.resources.extend(lane);
-            p.push_hop(lane, latency);
-        };
-        let mut latency = 0;
+    /// Calls `f` for every link of the route from attachment `s` to `d`
+    /// over the bus-level `route`, in route order, with its lane and the
+    /// latency after it.
+    fn walk(&self, s: usize, d: usize, route: &[Step], mut f: impl FnMut(Link, Lane, Cycle)) {
         for (i, &(bus, via)) in route.iter().enumerate() {
             // Where the transfer enters and leaves this bus.
             let entry = match via {
                 None => s,
                 Some((br, fwd)) => {
                     let b = &self.bridges[br];
+                    f(
+                        Link::Bridge(br as u32, fwd),
+                        if fwd { b.ab } else { b.ba },
+                        b.latency,
+                    );
                     (if fwd { b.att_b } else { b.att_a }).0 as usize
                 }
             };
-            if let Some((br, fwd)) = via {
-                let b = &self.bridges[br];
-                add(if fwd { b.ab } else { b.ba }, b.latency);
-                latency += b.latency;
-            }
             let exit = match route.get(i + 1) {
                 None => d,
                 Some(&(_, Some((br, fwd)))) => {
@@ -341,14 +349,49 @@ impl Topology {
             let b = &self.buses[bus];
             match b.topology {
                 BusTopology::Xbar => {
-                    add(self.attachments[entry].ingress, 0);
-                    add(self.attachments[exit].egress, b.latency);
+                    f(
+                        Link::In(AttachId(entry as u32)),
+                        self.attachments[entry].ingress,
+                        0,
+                    );
+                    f(
+                        Link::Out(AttachId(exit as u32)),
+                        self.attachments[exit].egress,
+                        b.latency,
+                    );
                 }
-                BusTopology::Shared => add(b.lane, b.latency),
+                BusTopology::Shared => f(Link::Bus(BusId(bus as u32)), b.lane, b.latency),
             }
-            latency += b.latency;
         }
-        p.latency = latency;
+    }
+
+    /// Every link of the route from attachment `a` to `b` with its lane,
+    /// in route order (empty when there is no route).
+    pub fn links(&self, a: AttachId, b: AttachId) -> Vec<(Link, Lane)> {
+        assert!(self.finished, "fabric routes used before finish");
+        let (sb, db) = (self.attachment(a).bus.0, self.attachment(b).bus.0);
+        let nb = self.buses.len();
+        let mut out = Vec::new();
+        if let Some(route) = &self.steps[sb as usize * nb + db as usize] {
+            self.walk(a.0 as usize, b.0 as usize, route, |l, lane, _| {
+                out.push((l, lane))
+            });
+        }
+        out
+    }
+
+    /// The path from attachment `s` to attachment `d` over the bus-level
+    /// `route`.
+    fn route_of(&self, s: usize, d: usize, route: &[Step]) -> Path {
+        let mut p = Path {
+            bridges: route.len() as u32 - 1,
+            ..Path::default()
+        };
+        self.walk(s, d, route, |_, lane, latency| {
+            p.resources.extend(lane);
+            p.push_hop(lane, latency);
+            p.latency += latency;
+        });
         p
     }
 
@@ -365,17 +408,54 @@ impl Topology {
         if from.is_empty() || to.is_empty() {
             return Some(&EMPTY);
         }
-        let mut best: Option<&Path> = None;
+        self.best_pair(from, to)
+            .map(|(a, b)| self.route(a, b).expect("route"))
+    }
+
+    /// The (from, to) pair of [`Topology::best_path`]; `None` when either
+    /// set is empty or no pair has a route.
+    pub fn best_pair(&self, from: &[AttachId], to: &[AttachId]) -> Option<(AttachId, AttachId)> {
+        let mut best: Option<(AttachId, AttachId, u32)> = None;
         for &a in from {
             for &b in to {
                 if let Some(p) = self.route(a, b) {
-                    if best.is_none_or(|q| p.bridges < q.bridges) {
-                        best = Some(p);
+                    if best.is_none_or(|q| p.bridges < q.2) {
+                        best = Some((a, b, p.bridges));
                     }
                 }
             }
         }
-        best
+        best.map(|(a, b, _)| (a, b))
+    }
+
+    /// A copy for [`Topology::links`] only: without the attachment routes.
+    pub fn links_only(&self) -> Topology {
+        Topology {
+            nodes: self.nodes.clone(),
+            hub: self.hub.clone(),
+            data_hub: self.data_hub.clone(),
+            buses: self.buses.clone(),
+            attachments: self.attachments.clone(),
+            bridges: self.bridges.clone(),
+            routes: Vec::new(),
+            steps: self.steps.clone(),
+            finished: self.finished,
+        }
+    }
+
+    /// Number of buses.
+    pub fn bus_count(&self) -> usize {
+        self.buses.len()
+    }
+
+    /// Number of attachments.
+    pub fn attachment_count(&self) -> usize {
+        self.attachments.len()
+    }
+
+    /// The bridges, in insertion order.
+    pub fn bridges(&self) -> &[Bridge] {
+        &self.bridges
     }
 
     /// The largest latency of any route (0 before `finish`).

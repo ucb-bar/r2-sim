@@ -10,6 +10,7 @@
 //! * [`topology`]: the node tree, links and data paths.
 //! * [`sim`]: the timing plane and the run loop.
 //! * [`stats`]: run outputs.
+//! * [`tracer`]: observation points and the in-memory collector.
 
 pub mod config;
 pub(crate) mod event;
@@ -21,11 +22,13 @@ pub mod sim;
 pub mod stats;
 pub mod time;
 pub mod topology;
+pub mod tracer;
 mod writers;
 
 pub use config::{
-    build as build_config, build_file as build_config_file, build_str as build_config_str, Built,
-    ConfigError, MemBlock, NeutrinoConfig, NuCosts, PeConfig, PeParams, RaceCheck,
+    build as build_config, build_file as build_config_file, build_str as build_config_str,
+    AttachInfo, BridgeInfo, Built, Component, ConfigError, Layout, MemBlock, MemInfo,
+    NeutrinoConfig, NuCosts, PeConfig, PeParams, RaceCheck, Role,
 };
 pub use func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
 pub use profile::{
@@ -36,12 +39,17 @@ pub use program::{NeutrinoProgram, NuCtx, TaskHandle};
 pub use resource::{
     CoCharge, Demand, Dir, DirCycles, Grant, Kind, LogEntry, ResourceId, ResourceStats, Resources,
 };
-pub use sim::{Flow, Sim};
+pub use sim::{Flow, Sim, MESSAGE_KINDS};
 pub use stats::{
     Blocked, ChunkRec, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats,
     TableState, TaskTimeline, WarningRec,
 };
 pub use time::{Cycle, Ratio};
 pub use topology::{
-    AttachId, Attachment, Bus, BusId, BusTopology, Hop, Lane, Path, TopoNode, Topology,
+    AttachId, Attachment, Bridge, Bus, BusId, BusTopology, Hop, Lane, Link, Path, TopoNode,
+    Topology,
+};
+pub use tracer::{
+    Charge, ChunkGrant, Collector, CollectorConfig, RouteUse, TaskCall, TaskEntered, Tee, Tracer,
+    Who,
 };

@@ -7,7 +7,7 @@ fn reserve(r: &mut Resources, d: &[Demand], t: u64) -> Grant {
 #[test]
 fn fractional_carry_keeps_the_rate() {
     // Rate 2/3 unit per cycle: one unit takes 1.5 cycles.
-    let mut r = Resources::new(false);
+    let mut r = Resources::new();
     let f = r.add_flow("f", Kind::Bandwidth, Ratio::new(2, 3));
     let ends: Vec<u64> = (0..4)
         .map(|_| reserve(&mut r, &[Demand::work(f, 1)], 0).end)
@@ -23,7 +23,7 @@ fn fractional_carry_keeps_the_rate() {
 
 #[test]
 fn utilization_is_exclusive() {
-    let mut r = Resources::new(false);
+    let mut r = Resources::new();
     let f = r.add_flow("muon", Kind::VectorOps, Ratio::int(256));
     let mut d = Demand::work(f, 256 * 100);
     d.utilization = Ratio::new(1, 2);
@@ -32,7 +32,7 @@ fn utilization_is_exclusive() {
 
 #[test]
 fn gap_filling_is_causal() {
-    let mut r = Resources::new(false);
+    let mut r = Resources::new();
     let f = r.add_flow("f", Kind::Bandwidth, Ratio::ONE);
     assert_eq!(reserve(&mut r, &[Demand::work(f, 10)], 20).start, 20);
     // A 10-cycle chunk fits in the hole before 20.
@@ -47,7 +47,7 @@ fn gap_filling_is_causal() {
 
 #[test]
 fn co_charging_fixpoint_and_culprit() {
-    let mut r = Resources::new(true);
+    let mut r = Resources::new();
     r.set_cocharge(CoCharge::Longest);
     let a = r.add_flow("a", Kind::TensorOps, Ratio::ONE);
     let b = r.add_flow("b", Kind::Bandwidth, Ratio::ONE);
@@ -69,7 +69,7 @@ fn co_charging_fixpoint_and_culprit() {
 
 #[test]
 fn occupancy_is_fifo() {
-    let mut r = Resources::new(false);
+    let mut r = Resources::new();
     let s = r.add_occupancy("slots", Kind::Slots, 2);
     assert!(r.try_acquire(s, 2));
     assert!(!r.try_acquire(s, 1));
@@ -84,7 +84,7 @@ fn occupancy_is_fifo() {
 
 #[test]
 fn carry_only_on_resources_charged_their_own_duration() {
-    let mut r = Resources::new(false);
+    let mut r = Resources::new();
     r.set_cocharge(CoCharge::Longest);
     let a = r.add_flow("a", Kind::TensorOps, Ratio::ONE);
     let b = r.add_flow("b", Kind::Bandwidth, Ratio::new(2, 3));
@@ -104,7 +104,7 @@ fn own_rule_charges_each_resource_its_own_duration() {
     // A fast shared resource (HBM, 4/cycle) on the path of slow links
     // (1/cycle each): chunk D = 8, but HBM is charged 2, so a second flow on
     // another link uses HBM at once.
-    let mut r = Resources::new(false);
+    let mut r = Resources::new();
     let hbm = r.add_flow("hbm", Kind::Bandwidth, Ratio::int(4));
     let l1 = r.add_flow("l1", Kind::Bandwidth, Ratio::ONE);
     let l2 = r.add_flow("l2", Kind::Bandwidth, Ratio::ONE);
@@ -121,7 +121,7 @@ fn own_rule_charges_each_resource_its_own_duration() {
     // The second chunk queued on HBM for 2 cycles.
     assert_eq!(s[hbm.0 as usize].delay_cycles, 2);
     // The first rule holds HBM for the whole chunk.
-    let mut r = Resources::new(false);
+    let mut r = Resources::new();
     r.set_cocharge(CoCharge::Longest);
     let hbm = r.add_flow("hbm", Kind::Bandwidth, Ratio::int(4));
     let l1 = r.add_flow("l1", Kind::Bandwidth, Ratio::ONE);

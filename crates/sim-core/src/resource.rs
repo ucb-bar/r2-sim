@@ -124,6 +124,9 @@ pub struct Grant {
     pub end: Cycle,
     /// The resource with the longest own duration.
     pub culprit: ResourceId,
+    /// The resource whose own earliest start was latest, when the chunk
+    /// started after its requested earliest cycle.
+    pub queue_culprit: Option<ResourceId>,
 }
 
 /// Sub-cycle remainder in cycles, `num / den`, `num < den`.
@@ -150,7 +153,6 @@ pub struct FlowResource {
     busy_dir: DirCycles,
     culprit_total: u64,
     delay_total: u64,
-    log: Option<Vec<LogEntry>>,
 }
 
 /// One charged interval and its cycles by direction.
@@ -166,7 +168,7 @@ pub struct LogEntry {
 }
 
 impl FlowResource {
-    fn new(rate: Ratio, log: bool) -> Self {
+    fn new(rate: Ratio) -> Self {
         assert!(rate.num > 0, "flow resource with zero rate");
         Self {
             rate,
@@ -176,7 +178,6 @@ impl FlowResource {
             busy_dir: [0; 3],
             culprit_total: 0,
             delay_total: 0,
-            log: log.then(Vec::new),
         }
     }
 
@@ -236,9 +237,10 @@ impl FlowResource {
         t
     }
 
-    fn charge(&mut self, start: Cycle, d: u64, amounts: &DirCycles) {
+    /// Charges `[start, start + d)`; returns the cycles by direction.
+    fn charge(&mut self, start: Cycle, d: u64, amounts: &DirCycles) -> DirCycles {
         if d == 0 {
-            return;
+            return [0; 3];
         }
         let parts = split(d, amounts);
         for (b, p) in self.busy_dir.iter_mut().zip(parts) {
@@ -262,13 +264,7 @@ impl FlowResource {
         );
         self.busy.insert(s, e);
         self.busy_total += d;
-        if let Some(log) = &mut self.log {
-            log.push(LogEntry {
-                start,
-                end: start + d,
-                dir: parts,
-            });
-        }
+        parts
     }
 
     /// Drops intervals that end at or before `now`.
@@ -384,8 +380,11 @@ pub enum CoCharge {
 #[derive(Debug, Clone, Default)]
 pub struct Resources {
     res: Vec<Resource>,
-    log: bool,
     cocharge: CoCharge,
+    /// Record every charge in `charges` (a tracer is installed).
+    record: bool,
+    /// The charges of the last `reserve`, when recording.
+    pub(crate) charges: Vec<crate::tracer::Charge>,
     /// Scratch buffers of `reserve`, kept to avoid allocation.
     merged: Vec<Demand>,
     /// Per merged demand: its amount by direction.
@@ -394,23 +393,18 @@ pub struct Resources {
 }
 
 impl Resources {
-    /// Turns the per-interval log of every flow resource on or off (for
-    /// resources already added and later ones).
-    pub fn set_log(&mut self, on: bool) {
-        self.log = on;
-        for r in &mut self.res {
-            if let ResourceState::Flow(f) = &mut r.state {
-                f.log = on.then(Vec::new);
-            }
-        }
+    /// Records the charges of every `reserve` for a tracer.
+    pub(crate) fn set_record(&mut self, on: bool) {
+        self.record = on;
     }
 
-    /// `log` turns on the per-interval log of every flow resource.
-    pub fn new(log: bool) -> Self {
+    /// No resources yet.
+    pub fn new() -> Self {
         Self {
             res: Vec::new(),
-            log,
             cocharge: CoCharge::Own,
+            record: false,
+            charges: Vec::new(),
             merged: Vec::new(),
             merged_dir: Vec::new(),
             own: Vec::new(),
@@ -426,11 +420,7 @@ impl Resources {
     /// Panics for an occupancy kind.
     pub fn add_flow(&mut self, name: &str, kind: Kind, rate: Ratio) -> ResourceId {
         assert!(kind.is_flow(), "{kind:?} is not a flow kind");
-        self.push(
-            name,
-            kind,
-            ResourceState::Flow(FlowResource::new(rate, self.log)),
-        )
+        self.push(name, kind, ResourceState::Flow(FlowResource::new(rate)))
     }
 
     /// Adds an occupancy resource of `size` units and returns its id. Panics
@@ -479,6 +469,14 @@ impl Resources {
     /// True when there are no resources.
     pub fn is_empty(&self) -> bool {
         self.res.is_empty()
+    }
+
+    /// The rate of flow resource `id`; `None` for an occupancy resource.
+    pub fn flow_rate(&self, id: ResourceId) -> Option<Ratio> {
+        match &self.res[id.0 as usize].state {
+            ResourceState::Flow(f) => Some(f.rate()),
+            ResourceState::Occupancy(_) => None,
+        }
     }
 
     /// The flow state of resource `id`. Panics for an occupancy resource.
@@ -558,8 +556,24 @@ impl Resources {
         // carry: the extra charge already exceeds its sub-cycle remainder.
         for (i, &(r, d, carry, _)) in own.iter().enumerate() {
             let f = self.flow_mut(r);
-            f.charge(t, charged(d), &merged_dir[i]);
+            let parts = f.charge(t, charged(d), &merged_dir[i]);
             f.carry = if charged(d) == d { carry } else { Carry::ZERO };
+            // A charge of 0 cycles (a carry) is recorded too: its amount
+            // still moves.
+            if self.record {
+                for (k, dir) in [Dir::Read, Dir::Write, Dir::Work].into_iter().enumerate() {
+                    if merged_dir[i][k] > 0 {
+                        self.charges.push(crate::tracer::Charge {
+                            resource: r,
+                            dir,
+                            amount: merged_dir[i][k],
+                            start: t,
+                            span: charged(d),
+                            cycles: parts[k],
+                        });
+                    }
+                }
+            }
         }
         // Culprit: longest own duration; on a tie, the latest own start.
         let culprit = own
@@ -568,18 +582,20 @@ impl Resources {
             .expect("nonempty")
             .0;
         self.flow_mut(culprit).culprit_total += big_d;
-        if t > earliest {
+        let queue_culprit = (t > earliest).then(|| {
             let queued = own
                 .iter()
                 .max_by(|a, b| a.3.cmp(&b.3).then(b.0.cmp(&a.0)))
                 .expect("nonempty")
                 .0;
             self.flow_mut(queued).delay_total += t - earliest;
-        }
+            queued
+        });
         Some(Grant {
             start: t,
             end: t + big_d,
             culprit,
+            queue_culprit,
         })
     }
 
@@ -644,7 +660,7 @@ impl Resources {
                     busy_write: f.busy_dir[1],
                     busy_work: f.busy_dir[2],
                     peak: 0,
-                    log: f.log.clone(),
+                    log: None,
                     culprit_cycles: f.culprit_total,
                     delay_cycles: f.delay_total,
                 },

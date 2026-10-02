@@ -2,9 +2,11 @@
 //!
 //! Runs program P on configuration C in timing mode with the Trace backend.
 //! It prints a summary to stdout and, with `--stats OUT`, writes the run as
-//! JSON to OUT. `--trace-out DIR` writes the tracer files (`trace.rs`).
+//! JSON to OUT. `--trace-out DIR` writes the tracer files (`trace.rs`);
+//! `--trace-raw DIR` writes the raw trace dump for r2-vis (`traceraw.rs`).
 
 mod trace;
+mod traceraw;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -15,7 +17,7 @@ use sim_core::{build_config_file, ProfileRegistry, SimWarning, Stats};
 
 const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
 [--trace FILE | --synthetic SEED] [--stats OUT] [--timeline] [--quantize tile|none] \
-[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--no-diagnostics]";
+[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]";
 
 #[derive(Default)]
 struct Args {
@@ -29,6 +31,11 @@ struct Args {
     timeline: bool,
     phase_stats: bool,
     trace_out: Option<PathBuf>,
+    trace_raw: Option<PathBuf>,
+    trace_zstd: bool,
+    trace_config: Option<PathBuf>,
+    /// `--set trace.KEY=VALUE`: trace configuration overrides.
+    trace_sets: Vec<String>,
     sets: Vec<String>,
     bin: Option<u64>,
     window: Option<(u64, u64)>,
@@ -64,7 +71,18 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--timeline" => a.timeline = true,
             "--phase-stats" => a.phase_stats = true,
             "--trace-out" => a.trace_out = Some(val()?.into()),
-            "--set" => a.sets.push(val()?),
+            "--trace-raw" => a.trace_raw = Some(val()?.into()),
+            "--trace-zstd" => a.trace_zstd = true,
+            "--trace-config" => a.trace_config = Some(val()?.into()),
+            "--set" => {
+                // Tracing is not part of the SoC configuration.
+                let v = val()?;
+                if v.starts_with("trace.") {
+                    a.trace_sets.push(v);
+                } else {
+                    a.sets.push(v);
+                }
+            }
             "--bin" => a.bin = Some(val()?.parse().map_err(|e| format!("--bin: {e}"))?),
             "--node" => a.node = Some(val()?),
             "--window" => {
@@ -107,6 +125,11 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             _ => return Err(format!("unknown argument {k}\n{USAGE}")),
         }
+    }
+    if a.trace_raw.is_none()
+        && (a.trace_zstd || a.trace_config.is_some() || !a.trace_sets.is_empty())
+    {
+        return Err("--trace-zstd, --trace-config and --set trace.* need --trace-raw".into());
     }
     Ok(a)
 }
@@ -331,7 +354,7 @@ fn run(argv: &[String]) -> Result<(), String> {
     let tracing = a.trace_out.is_some();
     b.sim.set_timeline(a.timeline || tracing);
     b.sim.set_marks(a.phase_stats || tracing);
-    b.sim.resources_mut().set_log(tracing);
+    b.sim.set_log(tracing);
     if !a.diagnostics {
         b.sim.set_open_pending_report(false);
         b.sim.set_late_consumer_check(false);
@@ -360,13 +383,60 @@ fn run(argv: &[String]) -> Result<(), String> {
             _ => None,
         })
         .unwrap_or((0, false));
+    // The raw dump writes its manifest now, from the configuration.
+    let raw = match &a.trace_raw {
+        Some(dir) => {
+            let opts = traceraw::opts(
+                dir.clone(),
+                a.trace_config.as_deref(),
+                &a.trace_sets,
+                a.trace_zstd,
+            )
+            .map_err(|e| format!("--trace-raw: {e}"))?;
+            let run = traceraw::RunInfo {
+                config: cfg_path.display().to_string(),
+                program: program.clone(),
+                params_file: a.params.as_ref().map(|p| p.display().to_string()),
+                params: a.overrides.clone(),
+                overrides: a.sets.clone(),
+                granule,
+            };
+            let (t, out) = traceraw::RawTracer::create(&opts, &b, &run)
+                .map_err(|e| format!("--trace-raw: {e}"))?;
+            b.sim.set_tracer(Box::new(t));
+            Some((dir.clone(), out))
+        }
+        None => None,
+    };
     let mut sim = b.sim;
-    sim.spawn(launch.nu, launch.program);
+    sim.spawn_named(launch.nu, launch.name, launch.program);
     let t0 = Instant::now();
     let stats = sim.run();
     let wall = t0.elapsed().as_secs_f64();
     let prefill = launch.prefill.as_ref().map(|r| r.borrow().clone());
     let forward = launch.forward.as_ref().map(|r| r.borrow().clone());
+    if let Some((dir, out)) = &raw {
+        let phases = trace_phases(prefill.as_ref(), forward.as_ref(), &launch.report.borrow());
+        let rows: Vec<traceraw::PhaseRow> = phases
+            .iter()
+            .map(|p| traceraw::PhaseRow {
+                stage: &p.stage,
+                name: &p.name,
+                layer: p.layer,
+                start: p.start,
+                end: p.end,
+                estimate: p.estimate,
+                roofline: p.roofline,
+                bound_by: &p.bound_by,
+            })
+            .collect();
+        let out = out.borrow();
+        traceraw::write_summary(dir, &stats, wall, &out, &rows)
+            .map_err(|e| format!("--trace-raw: {e}"))?;
+        if let Some(e) = &out.error {
+            return Err(format!("--trace-raw: {e}"));
+        }
+    }
     if let (Some(dir), Some(names)) = (&a.trace_out, &names) {
         let phases = trace_phases(prefill.as_ref(), forward.as_ref(), &launch.report.borrow());
         let opts = trace::Opts {

@@ -66,7 +66,7 @@ impl Default for Knobs {
 }
 
 pub fn node(k: Knobs) -> Node {
-    let mut sim = Sim::new(ProfileRegistry::with_builtins(), true);
+    let mut sim = Sim::new(ProfileRegistry::with_builtins());
     let r = sim.resources_mut();
     let dram_port = r.add_flow("dram.port", Kind::Bandwidth, Ratio::int(64));
     let link = r.add_flow("link", Kind::Bandwidth, Ratio::int(32));

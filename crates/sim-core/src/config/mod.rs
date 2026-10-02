@@ -206,4 +206,7 @@ pub enum RaceCheck {
 
 mod yaml;
 
-pub use self::yaml::{build, build_file, build_str, Built, ConfigError};
+pub use self::yaml::{
+    build, build_file, build_str, AttachInfo, BridgeInfo, Built, Component, ConfigError, Layout,
+    MemInfo, Role,
+};
