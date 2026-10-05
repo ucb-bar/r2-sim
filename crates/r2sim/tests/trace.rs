@@ -84,6 +84,27 @@ fn trace_raw_writes_whole_records_that_match_the_stats() {
         read(plain.join("summary.json")),
     );
     assert_eq!(summary["end_time"], j["end_time"]);
+    // Each node gives its Neutrino's table sizes (tiny_sm.yaml for an SM):
+    let sm1 = manifest["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["path"] == "root.gpc0.sm1")
+        .unwrap();
+    // Set in the file; versions and inbound_invokes take their defaults.
+    for (k, v) in [
+        ("scoreboard", 64),
+        ("execution", 64),
+        ("pending", 16),
+        ("inbound_refs", 16),
+        ("outbound_deps", 16),
+        ("outbound_invokes", 16),
+    ] {
+        assert_eq!(sm1["neutrino"][k], v, "{k}");
+    }
+    for k in ["versions", "inbound_invokes"] {
+        assert!(sm1["neutrino"][k].as_u64().unwrap() > 0, "{k}");
+    }
     for (stem, size) in [
         ("tasks", 104),
         ("chunks", 32),

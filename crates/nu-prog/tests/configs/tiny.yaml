@@ -2,6 +2,8 @@
 # computation. Own spaces: offset_bits 24, fields gpc:2 sm:2.
 #   root 0x000_0000, gpc0 0x400_0000, sm0 0x500_0000, sm1 0x600_0000,
 #   sm2 0x700_0000.
+# The hand-computed tests on this file exclude descriptor assembly:
+# every Neutrino has c_base, c_dep and c_word 0 (c_invoke only).
 
 global:
   neutrino_granule: 512
@@ -21,7 +23,7 @@ device:
   compute:
     # Copy engine: writes into HBM are its pulls (Section 3.3).
     - {name: dma, type: dma, latency: 50, inflight: 2, outstanding: 1, master: [$this.sbus]}
-  neutrino: {}
+  neutrino: {c_base: 0, c_dep: 0, c_word: 0}
   children:
     - name: gpc0
       bridge: {data: $parent.sbus, control: $parent.cbus}
@@ -32,7 +34,7 @@ device:
         - {name: clcbus, bw_bytes: 8, control: true}
       memory:
         - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
-      neutrino: {}
+      neutrino: {c_base: 0, c_dep: 0, c_word: 0}
       children:
         - {name: sm0, config: tiny_sm.yaml}
         - {name: sm1, config: tiny_sm.yaml}

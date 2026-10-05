@@ -57,9 +57,11 @@ pub struct Params {
     /// Action expert parameters. `weight_dtype`, `cmem_reserve` and a
     /// non-empty `expert_prob` come from this struct.
     pub action: adamoe::Params,
-    /// "single": one driver on the home SM runs the three stages; "gpc":
-    /// the device program starts, per stage, one driver per gpc on the
-    /// gpc's Neutrino, each invoking the tasks of its gpc (Section 6.1).
+    /// "hierarchical" (the default): the device program starts, per
+    /// stage, one driver per gpc on the gpc's Neutrino, each invoking the
+    /// tasks of its gpc (Section 6.1); "single": one driver on the home SM
+    /// runs the three stages. "gpc" is a deprecated name of
+    /// "hierarchical".
     pub drivers: String,
     /// With per-gpc drivers: who invokes a write into a gpc's slice or
     /// cmem: "owner" (the gpc that owns it) or "writer" (the gpc of the
@@ -83,7 +85,7 @@ impl Default for Params {
             },
             vlm: prefill::Params::default(),
             action: adamoe::Params::default(),
-            drivers: "single".into(),
+            drivers: "hierarchical".into(),
             slice_writes: "owner".into(),
         }
     }
@@ -270,7 +272,7 @@ fn build(
 
 impl Driver {
     /// Builds the three stage drivers in one HBM map (one set per gpc with
-    /// `drivers = "gpc"`, each with its own version bookkeeping). Errors
+    /// `drivers = "hierarchical"`, each with its own version bookkeeping). Errors
     /// when the VLM writes the KV cache at a layout other than the one the
     /// action expert reads, or when the stages have different home SMs.
     pub fn new(m: Machine, p: Params) -> Result<Self, String> {
@@ -289,7 +291,10 @@ impl Driver {
                 });
                 (None, home, reserve, action_w)
             }
-            "gpc" => {
+            "hierarchical" | "gpc" => {
+                if p.drivers == "gpc" {
+                    eprintln!("forward: drivers = \"gpc\" is deprecated; use \"hierarchical\"");
+                }
                 let root_sync = m
                     .root_sync
                     .ok_or("per-gpc drivers need a sync space at the device")?;
@@ -328,7 +333,7 @@ impl Driver {
                     action_w,
                 )
             }
-            d => return Err(format!("unknown drivers {d:?} (single, gpc)")),
+            d => return Err(format!("unknown drivers {d:?} (hierarchical, single)")),
         };
         if stages.is_empty() {
             return Err("per-gpc drivers need gpcs".into());

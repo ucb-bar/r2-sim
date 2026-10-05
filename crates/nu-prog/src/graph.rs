@@ -323,6 +323,9 @@ impl Graph {
 
     /// Invokes the window in program order and clears it.
     pub(crate) async fn flush(&mut self, ctx: &NuCtx) {
+        // The driver planned every task of the window, its own and the
+        // other drivers' (planning is replicated).
+        ctx.plan(self.tasks.len() as u64).await;
         let releases = self.versions.borrow_mut().take_releases();
         for a in releases {
             if self.mine(&Range::from_len(a, 1)) {

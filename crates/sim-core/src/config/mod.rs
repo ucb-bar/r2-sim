@@ -11,8 +11,16 @@ use crate::time::{Cycle, Ratio};
 /// the others are charged on the Neutrino's scalar resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NuCosts {
-    /// Cost of `invoke`.
+    /// Cost of `invoke`: the issue of an assembled descriptor.
     pub invoke: Cycle,
+    /// Assembly of a descriptor before `invoke` (and `spawn_child`):
+    /// `c_desc = desc_base + desc_dep x deps + desc_word x wire words`
+    /// (8 B words of [`crate::Descriptor::wire_bytes`]).
+    pub desc_base: Cycle,
+    pub desc_dep: Cycle,
+    pub desc_word: Cycle,
+    /// Planning, per task that a program plans ([`crate::NuCtx::plan`]).
+    pub plan: Cycle,
     /// Cost of `wait`.
     pub wait: Cycle,
     /// Cost of `version`.
@@ -34,10 +42,24 @@ pub struct NuCosts {
     pub resolve: Cycle,
 }
 
+impl NuCosts {
+    /// `c_desc` of a descriptor with `deps` dependencies and `wire_bytes`
+    /// on the wire.
+    pub fn desc(&self, deps: usize, wire_bytes: u64) -> Cycle {
+        self.desc_base + self.desc_dep * deps as Cycle + self.desc_word * wire_bytes.div_ceil(8)
+    }
+}
+
 impl Default for NuCosts {
     fn default() -> Self {
         Self {
             invoke: 8,
+            // An RV64 estimate at IPC 1 for assembling a descriptor in
+            // scratch.
+            desc_base: 8,
+            desc_dep: 3,
+            desc_word: 1,
+            plan: 0,
             wait: 2,
             version: 1,
             vreset: 1,

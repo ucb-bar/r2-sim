@@ -42,7 +42,7 @@ fn per_gpc(slice_writes: &str) -> (sim_core::Stats, nu_prog::forward::Report) {
     let mut b = build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).unwrap();
     let mut p = Params {
         weight_dtype: "mxfp4".into(),
-        drivers: "gpc".into(),
+        drivers: "hierarchical".into(),
         slice_writes: slice_writes.into(),
         ..Params::default()
     };

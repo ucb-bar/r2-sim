@@ -128,6 +128,8 @@ pub struct NuCtx {
     mb: Rc<RefCell<Mailbox>>,
     clock: Rc<Cell<Cycle>>,
     children: Rc<Vec<NeutrinoId>>,
+    /// The Neutrino's `c_plan`.
+    plan_cost: Cycle,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -146,12 +148,14 @@ impl NuCtx {
         mb: Rc<RefCell<Mailbox>>,
         clock: Rc<Cell<Cycle>>,
         children: Vec<NeutrinoId>,
+        plan_cost: Cycle,
     ) -> Self {
         Self {
             id,
             mb,
             clock,
             children: Rc::new(children),
+            plan_cost,
         }
     }
 
@@ -272,6 +276,15 @@ impl NuCtx {
     /// Charges `n` scalar cycles.
     pub async fn cycles(&self, n: u64) {
         self.call(Request::Cycles(n)).await;
+    }
+
+    /// Charges the planning of `tasks` tasks: `c_plan` scalar cycles each,
+    /// in one block. Nothing happens when that is 0.
+    pub async fn plan(&self, tasks: u64) {
+        let n = self.plan_cost * tasks;
+        if n > 0 {
+            self.cycles(n).await;
+        }
     }
 
     /// Records the resource totals under `name` when marks are on

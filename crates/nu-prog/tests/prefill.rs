@@ -65,6 +65,44 @@ fn run_p(p: Params) -> (Stats, Report, KvLayout) {
     (s, r, kv)
 }
 
+/// `run_p` on tiny.yaml with the configuration overrides `sets`.
+fn run_with(sets: &[&str], p: Params) -> (Stats, Report) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/configs/tiny.yaml");
+    let b = build_config_file(&path, sets, ProfileRegistry::with_builtins()).unwrap();
+    let m = Machine::from_built(&b, 512).unwrap();
+    let d = Driver::new(m, p).unwrap();
+    let report = d.report.clone();
+    let nu = d.home_nu();
+    let mut sim = b.sim;
+    sim.set_functional(Box::new(Trace::new(Default::default())));
+    sim.spawn(nu, move |ctx| d.run(ctx));
+    let s = sim.run();
+    let r = report.borrow().clone();
+    (s, r)
+}
+
+#[test]
+fn planning_costs_c_plan_per_planned_task_on_the_driver() {
+    // c_plan 5 on every SM; only the driver plans. Each window's flush
+    // charges 5 x (its tasks) on the driver's scalar in one block, so the
+    // driver's busy cycles grow by exactly 5 x planned.
+    let (s0, r0) = run_with(&[], params());
+    let (s5, r5) = run_with(&["root.gpc0.sm*.neutrino.c_plan=5"], params());
+    clean(&s0);
+    clean(&s5);
+    assert!(r0.planned > 0);
+    assert_eq!(r0.planned, r5.planned);
+    let busy = |s: &Stats| -> u64 {
+        s.resources
+            .iter()
+            .filter(|r| r.name.ends_with(".scalar"))
+            .map(|r| r.busy_cycles)
+            .sum()
+    };
+    assert_eq!(busy(&s5) - busy(&s0), 5 * r5.planned);
+    assert!(s5.end_time > s0.end_time);
+}
+
 fn clean(s: &Stats) {
     assert_eq!(s.fatal, None);
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());

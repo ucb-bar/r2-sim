@@ -11,6 +11,8 @@ vlm_last_layer = "no_ffn"   # the last VLM layer's FFN feeds nothing; skip it
 act_mem = "auto"            # prefill activations: cmem when present, else HBM
 single_accumulator = true   # prefill GEMMs: one accumulator per SM (5b item 4:
                             # faster on all four configurations)
+drivers = "hierarchical"    # one driver per gpc, started by the device program
+                            # per stage; "single": one driver on the home SM
 
 [action]
 steps = 10

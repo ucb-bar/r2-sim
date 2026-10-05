@@ -42,7 +42,8 @@
 //! * `neutrino`: every key of [`NeutrinoConfig`] (`scoreboard`, `execution`, `pending`,
 //!   `versions` (default 256), `inbound_refs`, `inbound_invokes`, `outbound_deps`, `outbound_invokes`,
 //!   `issue_headroom` (default: the node's number of compute elements), `t_retry`,
-//!   `c_invoke`, `c_wait`, `c_version`, `c_vreset`, `c_complete`,
+//!   `c_invoke`, `c_base`, `c_dep`, `c_word` (descriptor assembly),
+//!   `c_plan` (per planned task), `c_wait`, `c_version`, `c_vreset`, `c_complete`,
 //!   `c_load`, `c_store`, `c_spawn`, `c_resolve`, `scalar_rate`,
 //!   `complete_rate`), and `master`.
 //! * compute: `utilization` (tensor and vector), `inflight` and
@@ -467,6 +468,10 @@ struct NuSec {
     issue_headroom: Option<usize>,
     t_retry: Option<u64>,
     c_invoke: Option<u64>,
+    c_base: Option<u64>,
+    c_dep: Option<u64>,
+    c_word: Option<u64>,
+    c_plan: Option<u64>,
     c_wait: Option<u64>,
     c_version: Option<u64>,
     c_vreset: Option<u64>,
@@ -1493,6 +1498,10 @@ fn nu_config(
         },
         costs: super::NuCosts {
             invoke: s.c_invoke.unwrap_or(c.invoke),
+            desc_base: s.c_base.unwrap_or(c.desc_base),
+            desc_dep: s.c_dep.unwrap_or(c.desc_dep),
+            desc_word: s.c_word.unwrap_or(c.desc_word),
+            plan: s.c_plan.unwrap_or(c.plan),
             wait: s.c_wait.unwrap_or(c.wait),
             version: s.c_version.unwrap_or(c.version),
             vreset: s.c_vreset.unwrap_or(c.vreset),

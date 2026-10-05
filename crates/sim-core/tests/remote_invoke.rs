@@ -107,6 +107,56 @@ fn forwarded_invoke_with_a_dep_back_on_the_invoker() {
 }
 
 #[test]
+fn descriptor_assembly_precedes_each_invoke() {
+    // forwarded_invoke_with_a_dep_back_on_the_invoker with the default
+    // descriptor costs on sm0 (c_base 8, c_dep 3, c_word 1), charged on
+    // sm0's scalar before each c_invoke 8:
+    // * P0 (no deps; 2 + 2 + 16 + 52 = 72 B = 9 words): c_desc 8 + 9 = 17,
+    //   [0, 17), then c_invoke [17, 25); P0 runs [25, 217), completes 221.
+    // * M (one dep; 80 B = 10 words): c_desc 8 + 3 + 10 = 21, [25, 46),
+    //   then c_invoke [46, 54): queued and sent at 54. Its path as before
+    //   (32 cycles): M enters sm1's scoreboard at 86; its Await to sm0
+    //   arrives 112, before P0 completes (Registered).
+    // * Resolve(A) leaves sm0 at 221 and arrives 247: M runs [247, 439),
+    //   completes 443; Resolve(M) for sm0's wait arrives 469.
+    let b = two_sm(&[
+        "root.gpc0.sm0.neutrino.c_base=8",
+        "root.gpc0.sm0.neutrino.c_dep=3",
+        "root.gpc0.sm0.neutrino.c_word=1",
+    ]);
+    let sm0 = b.nu("root.gpc0.sm0");
+    let a = Range::from_len(b.memory("root.gpc0.sm0.smem").base, MAT);
+    let c = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
+    let p0 = matmul(&b, "root.gpc0.sm0.atlas", a, vec![]);
+    let m = matmul(&b, "root.gpc0.sm1.atlas", c, vec![v1(a)]).with_inferred_version(1);
+    assert_eq!((p0.wire_bytes(), m.wire_bytes()), (72, 80));
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.invoke(p0).await;
+        assert_eq!(ctx.now(), 25);
+        let h = ctx.invoke(m).await;
+        assert_eq!(ctx.now(), 54, "the invoke returns once queued");
+        ctx.wait(h.addr, 1).await;
+        assert_eq!(ctx.now(), 469);
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let (tp, tm) = (&s.tasks[0], &s.tasks[1]);
+    assert_eq!((tp.invoke, tp.complete), (25, Some(221)));
+    assert_eq!(tm.invoke, 86);
+    assert_eq!(tm.ready, Some(247));
+    assert_eq!((tm.chunks[0].start, tm.chunks[0].end), (247, 439));
+    assert_eq!(s.end_time, 469);
+    // sm0's scalar: 17 + 8 + 21 + 8 + c_wait 2.
+    let scalar = s
+        .resources
+        .iter()
+        .find(|r| r.name == "root.gpc0.sm0.scalar")
+        .unwrap();
+    assert_eq!(scalar.busy_cycles, 56);
+}
+
+#[test]
 fn a_full_scoreboard_holds_forwarded_invokes_in_the_inbound_table() {
     let b = built_with(&["scoreboard=1"]);
     let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));

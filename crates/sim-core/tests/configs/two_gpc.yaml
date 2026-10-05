@@ -4,6 +4,8 @@
 # Control at the data rate (as two_sm.yaml): a 1-beat message takes 1
 # cycle on a gpc bridge (64 B/cycle) or a crossbar port, 2 on an SM bridge
 # (32 B/cycle).
+# The hand-computed tests on this file exclude descriptor assembly:
+# every Neutrino has c_base, c_dep and c_word 0 (c_invoke only).
 
 global:
   neutrino_granule: 512
@@ -20,7 +22,7 @@ device:
     - {name: cbus, control: true}
   memory:
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
-  neutrino: {}
+  neutrino: {c_base: 0, c_dep: 0, c_word: 0}
   children:
     - {name: gpc0, config: two_gpc_gpc.yaml}
     - {name: gpc1, config: two_gpc_gpc.yaml}

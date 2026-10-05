@@ -1122,6 +1122,7 @@ impl Sim {
             n.mb.clone(),
             self.clock.clone(),
             self.topo.node(child).children.clone(),
+            n.cfg.costs.plan,
         );
         // A program start resets the Neutrino's version table (Section 3.2).
         n.tables.vreset_all();

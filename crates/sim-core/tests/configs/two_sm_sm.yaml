@@ -1,4 +1,6 @@
 # An SM of two_sm.yaml.
+# The hand-computed tests on this file exclude descriptor assembly:
+# every Neutrino has c_base, c_dep and c_word 0 (c_invoke only).
 bridge: {data: $parent.clsbus, control: $parent.clcbus, bw_bytes: 32, latency: 10}
 fabric:
   - {name: smsbus}
@@ -10,4 +12,4 @@ memory:
 compute:
   - {name: atlas, type: tensor, rate: {bf16: 4096}, master: [$this.lbus]}
   - {name: dma, type: dma, latency: 100, inflight: 2, master: [$this.lbus, $this.smsbus]}
-neutrino: {inbound_refs: 4, t_retry: 50}
+neutrino: {inbound_refs: 4, t_retry: 50, c_base: 0, c_dep: 0, c_word: 0}

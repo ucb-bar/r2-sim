@@ -41,6 +41,9 @@ BASE = [
     "--synthetic", "7",
     "--phase-stats",
     "--param", "weight_dtype=mxfp4",
+    # The hierarchical program (one driver per gpc), the default of
+    # configs/forward.toml; "drivers=single" for the single driver.
+    "--param", "drivers=hierarchical",
 ]
 BASE_CONFIG = "configs/2p.yaml"
 BASE_ACC = ["--acc-buffer", "1048576"]

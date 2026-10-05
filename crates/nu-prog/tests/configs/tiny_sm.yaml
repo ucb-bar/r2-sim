@@ -1,5 +1,7 @@
 # An SM of tiny.yaml. The bridge's control side runs at 1/8 of its data
 # rate (4 B/cycle).
+# The hand-computed tests on this file exclude descriptor assembly:
+# every Neutrino has c_base, c_dep and c_word 0 (c_invoke only).
 bridge: {data: $parent.clsbus, control: $parent.clcbus, bw_bytes: 32, control_bw_bytes: 4, latency: 10}
 fabric:
   - {name: smsbus}
@@ -13,4 +15,4 @@ compute:
      master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 64}, overhead: 10, master: [$this.lbus, $this.smsbus]}
   - {name: dma, type: dma, latency: 50, inflight: 2, outstanding: 1, master: [$this.lbus, $this.smsbus]}
-neutrino: {scoreboard: 64, execution: 64, pending: 16, inbound_refs: 16, outbound_deps: 16, outbound_invokes: 16}
+neutrino: {scoreboard: 64, execution: 64, pending: 16, inbound_refs: 16, outbound_deps: 16, outbound_invokes: 16, c_base: 0, c_dep: 0, c_word: 0}

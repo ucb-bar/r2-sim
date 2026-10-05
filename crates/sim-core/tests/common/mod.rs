@@ -9,7 +9,8 @@
 //! | scalar | 1 instr/cycle |
 //! | completion port | 1 /cycle |
 //!
-//! Costs: c_invoke 8, c_wait 2, c_version 1, c_vreset 1, c_complete 4.
+//! Costs: c_invoke 8, c_wait 2, c_version 1, c_vreset 1, c_complete 4;
+//! no descriptor assembly (c_base, c_dep, c_word 0).
 //!
 //! DMA and matmul outputs are versioned data ranges; each test range is
 //! written once unless a test says otherwise, so its consumers name
@@ -84,8 +85,12 @@ pub fn node(k: Knobs) -> Node {
                 issue_headroom: 0,
                 granule: 512,
             },
+            // The hand computations exclude descriptor assembly.
             costs: NuCosts {
                 resolve: k.resolve,
+                desc_base: 0,
+                desc_dep: 0,
+                desc_word: 0,
                 ..NuCosts::default()
             },
             scalar_rate: Ratio::ONE,

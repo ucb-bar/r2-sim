@@ -726,6 +726,11 @@ impl Sim {
         self.pes.len()
     }
 
+    /// The configuration of Neutrino `nu`.
+    pub fn neutrino_config(&self, nu: NeutrinoId) -> &NeutrinoConfig {
+        &self.nus[nu.0 as usize].cfg
+    }
+
     /// The scalar resource and the completion port of Neutrino `nu`.
     pub fn neutrino_resources(&self, nu: NeutrinoId) -> (ResourceId, ResourceId) {
         let n = &self.nus[nu.0 as usize];
@@ -780,6 +785,7 @@ impl Sim {
             n.mb.clone(),
             self.clock.clone(),
             self.topo.node(nu).children.clone(),
+            n.cfg.costs.plan,
         );
         // A program start resets the Neutrino's version table (Section 3.2).
         n.tables.vreset_all();
@@ -1016,10 +1022,19 @@ impl Sim {
         }
     }
 
-    /// Charges the request's cost on the Neutrino's scalar resource.
+    /// Charges the request's cost on the Neutrino's scalar resource: for
+    /// an invoke or a spawn, the descriptor's assembly (`c_desc`) and then
+    /// its issue.
     fn start_request(&mut self, nu: NeutrinoId, req: Request) {
         let n = &self.nus[nu.0 as usize];
         let c = &n.cfg.costs;
+        let desc = match &req {
+            Request::Invoke(d) => c.desc(d.deps.len(), d.wire_bytes()),
+            // The spawn descriptor of `Descriptor::wire_bytes`: 20 B of
+            // header and `dst`, 8 per dependency, 4 for the child.
+            Request::Spawn { deps, .. } => c.desc(deps.len(), 24 + 8 * deps.len() as u64),
+            _ => 0,
+        };
         let cost = match &req {
             Request::Invoke(_) => c.invoke,
             Request::Wait(_) => c.wait,
@@ -1031,6 +1046,9 @@ impl Sim {
             Request::Spawn { .. } => c.spawn,
             Request::Mark(_) => 0,
         };
+        if desc > 0 {
+            self.charge_scalar(nu, desc);
+        }
         let end = self.charge_scalar(nu, cost);
         let n = &mut self.nus[nu.0 as usize];
         n.op = Some(req);

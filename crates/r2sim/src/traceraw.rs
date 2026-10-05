@@ -1422,7 +1422,21 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let node_rows: Vec<Value> = (0..topo.len())
         .map(|i| {
             let n = topo.node(NeutrinoId(i as u32));
-            json!({"id": i, "path": nodes[i], "parent": n.parent.map(|p| p.0)})
+            let c = sim.neutrino_config(NeutrinoId(i as u32));
+            let t = &c.tables;
+            json!({
+                "id": i, "path": nodes[i], "parent": n.parent.map(|p| p.0),
+                "neutrino": {
+                    "scoreboard": t.scoreboard_capacity,
+                    "pending": t.pending_capacity,
+                    "execution": t.execution_capacity,
+                    "versions": t.version_capacity,
+                    "inbound_refs": t.inbound_ref_capacity,
+                    "inbound_invokes": c.inbound_invokes,
+                    "outbound_deps": c.outbound_deps,
+                    "outbound_invokes": c.outbound_invokes,
+                },
+            })
         })
         .collect();
 
