@@ -97,6 +97,7 @@ fn main() {
                     links: vec![link],
                     latency: 50,
                     masters: Vec::new(),
+                    burst: None,
                 },
             },
         );

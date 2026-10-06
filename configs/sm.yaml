@@ -13,7 +13,12 @@
 # * Muon: 256 lane-op/cycle (a 16 x 16 SIMT core), overhead 50 cycles per
 #   task for launch and the reduction tail.
 # * DMA: latency 100 cycles, 4 chunks outstanding (enough to cover the
-#   latency at a 64 KiB chunk), 4 transfers in flight.
+#   latency at a 64 KiB chunk), 4 transfers in flight. The chunk is the
+#   program's tile (64 KiB): `burst_bytes` is not set (measured 2026-10-05,
+#   docs/results.md Section 3: smaller bursts make the forward pass slower
+#   in this model). Rule when it is set: (outstanding - 1) x burst_bytes
+#   >= latency x rate of the slowest hop (the loader warns otherwise; the
+#   worst SM path is 220 cycles x 128 B/cycle = 28160 B).
 # * Neutrino: the table sizes of architecture Section 3.3
 #   (2026-09-24): scoreboard 128, pending table 256, execution table 256,
 #   inbound ref table 128, inbound invoke table 64, outbound dep table 128,

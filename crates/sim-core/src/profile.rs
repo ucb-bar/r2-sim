@@ -367,10 +367,14 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         links,
         latency,
         masters,
+        burst,
     } = &node.pe.params
     else {
         panic!("dma opcode on PE {}", node.pe.name);
     };
+    // The engine's burst, when set, is the chunk size: a fabric
+    // transaction, whatever the program's tile.
+    let tile_bytes = burst.unwrap_or(tile_bytes);
     assert!(tile_bytes > 0, "dma with tile_bytes 0");
     let (sm, dm) = (node.memory(src), node.memory(dst));
     let (src_port, dst_port) = (sm.port, dm.port);

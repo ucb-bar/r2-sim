@@ -24,7 +24,8 @@ memory:
 compute:
   # Copy engine: every write into the slice is a task of the gpc on it, a
   # pull from the writing SM (Section 3.3); 8 transfers in flight, 4 chunks
-  # each.
+  # each. No burst_bytes (see sm.yaml); its worst path needs
+  # (outstanding - 1) x burst_bytes >= 100 x 512 = 51200 B.
   - {name: dma, type: dma, latency: 100, inflight: 8, outstanding: 4, master: [$this.clsbus]}
 # Version table 1024: one entry per HBM output block in flight (up to 896
 # per window with the current write granularity, one DMA per 128-column

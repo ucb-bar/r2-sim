@@ -128,6 +128,7 @@ pub fn node(k: Knobs) -> Node {
                 links: vec![link],
                 latency: k.dma_latency,
                 masters: Vec::new(),
+                burst: None,
             },
         },
     );

@@ -138,6 +138,9 @@ pub enum PeParams {
         masters: Vec<crate::topology::AttachId>,
         /// Latency of every chunk (Section 5.7).
         latency: Cycle,
+        /// Chunk size of every transfer (a transaction of the fabric);
+        /// `None`: the descriptor's `tile_bytes`.
+        burst: Option<u64>,
     },
     /// A tensor unit.
     Atlas {

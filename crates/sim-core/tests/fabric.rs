@@ -486,3 +486,113 @@ fn demands_record_reads_and_writes() {
         );
     }
 }
+
+/// One SM under the device: HBM (1024 B/cycle) at the device, the SM's
+/// bridge at 128 B/cycle with no latency, SMEM at 1024 B/cycle, and a DMA
+/// engine with the compute keys `dma` (`burst_bytes`, `outstanding`,
+/// `latency`). No descriptor assembly.
+fn burst_node(dma: &str) -> Built {
+    build_config(
+        &format!(
+            "global:
+  neutrino_granule: 512
+  address: {{fields: [{{name: sm, bits: 2}}], offset_bits: 24}}
+device:
+  name: root
+  fabric: [{{name: sbus}}, {{name: cbus, control: true}}]
+  memory:
+    - {{name: hbm, type: dram, addr: [[0x0, 0x100000]], bw_bytes: 1024, slave: $this.sbus}}
+    - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
+  neutrino: {{c_base: 0, c_dep: 0, c_word: 0}}
+  children:
+    - name: sm0
+      bridge: {{data: $parent.sbus, control: $parent.cbus, bw_bytes: 128, latency: 0}}
+      fabric: [{{name: smsbus}}, {{name: smcbus, control: true}}, {{name: lbus}}]
+      memory:
+        - {{name: smem, type: scratch, addr: [[0x0, 0x10000]], bw_bytes: 1024, slave: [$this.lbus, $this.smsbus]}}
+        - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
+      compute:
+        - {{name: dma, type: dma, inflight: 2, {dma}, master: [$this.lbus, $this.smsbus]}}
+      neutrino: {{c_invoke: 0, c_base: 0, c_dep: 0, c_word: 0}}
+"
+        ),
+        ProfileRegistry::with_builtins(),
+    )
+    .unwrap()
+}
+
+/// Two 4 KiB DMAs from HBM into sm0's SMEM, both invoked at 0 (c_invoke 0
+/// on sm0); the end of each transfer's last chunk.
+fn two_transfers(dma: &str) -> (u64, u64) {
+    let b = burst_node(dma);
+    let sm0 = b.nu("root.sm0");
+    let (hbm, smem) = (b.memory("root.hbm"), b.memory("root.sm0.smem"));
+    let d = |i: u64| Descriptor {
+        opcode: b.sim.profiles().lookup("dma").unwrap(),
+        pe: Some(b.pe("root.sm0.dma")),
+        dst: Range::from_len(smem.base + i * 4096, 4096),
+        versioned: false,
+        inferred_version: None,
+        deps: vec![],
+        label: Some(i),
+        args: Args::Dma {
+            src: Addr(hbm.base + i * 4096),
+            dst: Addr(smem.base + i * 4096),
+            bytes: 4096,
+            tile_bytes: 4096,
+        },
+    };
+    let (d0, d1) = (d(0), d(1));
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h0 = ctx.invoke(d0).await;
+        let h1 = ctx.invoke(d1).await;
+        ctx.wait_unversioned(h0.addr).await;
+        ctx.wait_unversioned(h1.addr).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let last = |l: u64| {
+        let t = s.tasks.iter().find(|t| t.label == Some(l)).unwrap();
+        t.chunks.last().unwrap().end
+    };
+    (last(0), last(1))
+}
+
+#[test]
+fn small_bursts_interleave_two_transfers_on_a_shared_bridge() {
+    // The bridge is the slow hop: 4 KiB takes 32 cycles on it. As one 4 KiB
+    // chunk each, the two transfers hold the bridge back to back: [0, 32)
+    // and [32, 64).
+    assert_eq!(two_transfers("outstanding: 1"), (32, 64));
+    // In 512 B bursts (4 cycles each on the bridge) with one chunk in flight
+    // per transfer, the transfers alternate bursts: the first ends at 60,
+    // one burst before the second; the bridge stays busy to 64.
+    assert_eq!(two_transfers("burst_bytes: 512, outstanding: 1"), (60, 64));
+    // With two chunks in flight each, a transfer reserves two bursts in a
+    // row: they alternate in pairs and end two bursts apart. The
+    // interleaving grain is outstanding x burst.
+    assert_eq!(two_transfers("burst_bytes: 512, outstanding: 2"), (56, 64));
+}
+
+#[test]
+fn a_burst_that_does_not_cover_the_latency_is_a_warning() {
+    // Engine latency 100. The worst pair is a copy within SMEM (1024
+    // B/cycle, no bridge): (outstanding - 1) x 512 must reach 100 x 1024 =
+    // 102400 B, so 201 chunks in flight and not 200.
+    let warn = |out: u32| {
+        burst_node(&format!(
+            "latency: 100, burst_bytes: 512, outstanding: {out}"
+        ))
+        .warnings
+    };
+    let w = warn(200);
+    assert_eq!(w.len(), 1);
+    assert!(w[0].starts_with("root.sm0.dma:"), "{}", w[0]);
+    assert!(w[0].contains("100 x 1024 = 102400 B"), "{}", w[0]);
+    assert!(warn(201).is_empty());
+    // Without burst_bytes the chunk is the program's tile: no check.
+    assert!(burst_node("latency: 100, outstanding: 1")
+        .warnings
+        .is_empty());
+}

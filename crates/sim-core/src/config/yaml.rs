@@ -47,7 +47,10 @@
 //!   `c_load`, `c_store`, `c_spawn`, `c_resolve`, `scalar_rate`,
 //!   `complete_rate`), and `master`.
 //! * compute: `utilization` (tensor and vector), `inflight` and
-//!   `outstanding` on every type (default 1).
+//!   `outstanding` on every type (default 1), `burst_bytes` (dma: the
+//!   chunk size of every transfer; default the descriptor's tile; a
+//!   warning in [`Built::warnings`] when `(outstanding - 1) x burst_bytes`
+//!   does not cover latency x rate of the engine's paths).
 //!
 //! Addressing: an address is [field 1] .. [field n] [offset]. A child's
 //! field value is its index among its parent's children plus one; value 0
@@ -496,6 +499,9 @@ struct CompSec {
     quantize: Option<String>,
     operand_reuse: Option<String>,
     acc_buffer: Option<Num>,
+    /// DMA: the chunk size of every transfer (default: the descriptor's
+    /// tile).
+    burst_bytes: Option<Num>,
     overhead: Option<u64>,
     utilization: Option<Num>,
     latency: Option<u64>,
@@ -654,6 +660,8 @@ pub struct Built {
     pub clock_ghz: f64,
     /// The fabric parts' names and kinds.
     pub layout: Layout,
+    /// Configuration warnings (the configuration is valid).
+    pub warnings: Vec<String>,
     nodes: HashMap<String, NeutrinoId>,
     pes: HashMap<String, PeId>,
     memories: HashMap<String, Range>,
@@ -857,6 +865,7 @@ impl Builder {
                 numeric: false,
                 clock_ghz,
                 layout: Layout::default(),
+                warnings: Vec::new(),
                 nodes: HashMap::new(),
                 pes: HashMap::new(),
                 memories: HashMap::new(),
@@ -1001,6 +1010,7 @@ impl Builder {
         self.built.layout.memories.extend(syncs);
         self.built.sim.finish_fabric().map_err(ConfigError)?;
         check_tables(&self.table_sizes)?;
+        self.built.warnings.extend(check_bursts(&self.built.sim));
         Ok(self.built)
     }
 
@@ -1354,6 +1364,9 @@ impl Builder {
                 atts.push(id);
             }
             let utilization = || opt_rate(&c.utilization).map(|u| u.unwrap_or(Ratio::ONE));
+            if c.burst_bytes.is_some() && c.kind != "dma" {
+                return err(format!("{name}: burst_bytes is a dma key"));
+            }
             let params = match c.kind.as_str() {
                 "tensor" => {
                     let mut rates = Vec::new();
@@ -1426,6 +1439,13 @@ impl Builder {
                     links: Vec::new(),
                     latency: c.latency.unwrap_or(0),
                     masters: atts,
+                    burst: match &c.burst_bytes {
+                        None => None,
+                        Some(b) => match b.bytes()? {
+                            0 => return err(format!("{name}: burst_bytes 0")),
+                            b => Some(b),
+                        },
+                    },
                 },
                 k => return err(format!("{name}: unknown compute type {k:?}")),
             };
@@ -1442,6 +1462,71 @@ impl Builder {
         }
         Ok(())
     }
+}
+
+/// The burst check: a DMA engine with `burst_bytes` keeps a path busy
+/// only when its chunks in flight cover the path's latency. With k chunks
+/// outstanding a transfer moves k bursts per (L + burst / R) cycles, so
+/// it reaches the slowest rate R of the path when
+/// `(outstanding - 1) x burst_bytes >= L x R`, L the engine latency plus
+/// the two route latencies. Checked over every pair of memory blocks the
+/// engine can move between; one warning per engine, for its worst pair.
+fn check_bursts(sim: &Sim) -> Vec<String> {
+    let topo = sim.topology();
+    let res = sim.resources();
+    let rate = |r: &ResourceId| {
+        res.flow_rate(*r)
+            .map_or(f64::INFINITY, |q| q.num as f64 / q.den as f64)
+    };
+    let mut out = Vec::new();
+    for p in 0..sim.pe_count() {
+        let cfg = sim.pe_config(PeId(p as u32));
+        let PeParams::Dma {
+            latency,
+            masters,
+            burst: Some(burst),
+            ..
+        } = &cfg.params
+        else {
+            continue;
+        };
+        let have = (cfg.max_outstanding as u64).saturating_sub(1) * burst;
+        // (need, latency, rate, src, dst) of the worst pair.
+        let mut worst: Option<(f64, u64, f64, &str, &str)> = None;
+        for src in sim.memories() {
+            for dst in sim.memories() {
+                let (Some(inp), Some(outp)) = (
+                    topo.best_path(&src.attach, masters),
+                    topo.best_path(masters, &dst.attach),
+                ) else {
+                    continue;
+                };
+                let l = latency + inp.latency + outp.latency;
+                let r = inp
+                    .resources
+                    .iter()
+                    .chain(&outp.resources)
+                    .chain([&src.port, &dst.port])
+                    .map(rate)
+                    .fold(f64::INFINITY, f64::min);
+                let need = l as f64 * r;
+                if worst.is_none_or(|w| need > w.0) {
+                    worst = Some((need, l, r, &src.name, &dst.name));
+                }
+            }
+        }
+        if let Some((need, l, r, s, d)) = worst {
+            if (have as f64) < need {
+                out.push(format!(
+                    "{}: (outstanding - 1) x burst_bytes = ({} - 1) x {burst} = {have} B is less \
+                     than latency x rate = {l} x {r} = {need:.0} B ({s} to {d}): the engine \
+                     cannot keep the path busy",
+                    cfg.name, cfg.max_outstanding
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The table check of Section 3.3 (ready/valid): every owner takes at

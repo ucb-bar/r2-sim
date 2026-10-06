@@ -301,6 +301,9 @@ fn run(argv: &[String]) -> Result<(), String> {
     };
     let mut b = build_config_file(&cfg_path, &a.sets, ProfileRegistry::with_builtins())
         .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
+    for w in &b.warnings {
+        eprintln!("r2sim: warning: {}: {w}", cfg_path.display());
+    }
     let granule = 512;
     let records = match (&a.trace, a.synthetic) {
         (Some(p), None) => func::load_trace(p).map_err(|e| e.0)?,
