@@ -410,6 +410,8 @@ struct BusSec {
     /// A control bus (protocol messages).
     #[serde(default)]
     control: bool,
+    /// Beat of the bus's ports or shared lane (default 64).
+    beat_bytes: Option<Num>,
 }
 
 #[derive(Deserialize)]
@@ -423,6 +425,8 @@ struct BridgeSec {
     control_bw_bytes: Option<Num>,
     #[serde(default)]
     latency: u64,
+    /// Beat of the four bridge lanes (default 64).
+    beat_bytes: Option<Num>,
 }
 
 /// A bus reference or a list of them.
@@ -455,6 +459,8 @@ struct MemSec {
     latency: u64,
     slave: Option<Buses>,
     master: Option<String>,
+    /// Beat of the port (default 64).
+    beat_bytes: Option<Num>,
 }
 
 #[derive(Deserialize, Default)]
@@ -486,6 +492,8 @@ struct NuSec {
     scalar_rate: Option<Num>,
     complete_rate: Option<Num>,
     master: Option<Buses>,
+    /// Data width as a master: loads, stores, messages (default 64).
+    beat_bytes: Option<Num>,
 }
 
 #[derive(Deserialize)]
@@ -502,6 +510,9 @@ struct CompSec {
     /// DMA: the chunk size of every transfer (default: the descriptor's
     /// tile).
     burst_bytes: Option<Num>,
+    /// Data width as a master (default 64): a DMA engine moves at most
+    /// one beat per cycle.
+    beat_bytes: Option<Num>,
     overhead: Option<u64>,
     utilization: Option<Num>,
     latency: Option<u64>,
@@ -1011,6 +1022,7 @@ impl Builder {
         self.built.sim.finish_fabric().map_err(ConfigError)?;
         check_tables(&self.table_sizes)?;
         self.built.warnings.extend(check_bursts(&self.built.sim));
+        self.built.warnings.extend(check_beats(&self.built.sim));
         Ok(self.built)
     }
 
@@ -1102,6 +1114,10 @@ impl Builder {
                 let down = r.lane(&format!("{path}.bridge.down"), rate);
                 let up_ctl = r.lane(&format!("{path}.bridge.up.ctl"), ctl_rate);
                 let down_ctl = r.lane(&format!("{path}.bridge.down.ctl"), ctl_rate);
+                let beat = beat_of(&br.beat_bytes, &path)?;
+                for l in [up, down, up_ctl, down_ctl].into_iter().flatten() {
+                    r.resources_mut().set_beat(l, beat);
+                }
                 Some((data, control, (up, down), (up_ctl, down_ctl), br.latency))
             }
         };
@@ -1160,6 +1176,8 @@ impl Builder {
                 b.latency,
                 b.control,
             );
+            let beat = beat_of(&b.beat_bytes, &name)?;
+            self.built.sim.set_bus_beat(id, beat);
             if self.buses.insert(name.clone(), id).is_some() {
                 return err(format!("{name}: two buses of this name"));
             }
@@ -1252,6 +1270,8 @@ impl Builder {
                 Kind::Bandwidth,
                 bw.rate()?,
             );
+            let beat = beat_of(&m.beat_bytes, &name)?;
+            self.built.sim.resources_mut().set_beat(port, beat);
             let Some(slave) = &m.slave else {
                 return err(format!("{name}: needs slave"));
             };
@@ -1439,6 +1459,7 @@ impl Builder {
                     links: Vec::new(),
                     latency: c.latency.unwrap_or(0),
                     masters: atts,
+                    beat: beat_of(&c.beat_bytes, &name)?,
                     burst: match &c.burst_bytes {
                         None => None,
                         Some(b) => match b.bytes()? {
@@ -1462,6 +1483,63 @@ impl Builder {
         }
         Ok(())
     }
+}
+
+/// The default beat of a bus, bridge, memory port, compute element or
+/// Neutrino (Section 5.4, data-path rule 3).
+const DEFAULT_BEAT: u64 = 64;
+
+/// `beat_bytes` of `what`, or the default.
+fn beat_of(b: &Option<Num>, what: &str) -> Result<u64, ConfigError> {
+    match b {
+        None => Ok(DEFAULT_BEAT),
+        Some(n) => match n.bytes()? {
+            0 => err(format!("{what}: beat_bytes 0")),
+            v => Ok(v),
+        },
+    }
+}
+
+/// The beat check: a master (a DMA engine, a Neutrino) whose beat exceeds
+/// every bus it masters cannot use its width (an unlimited bus never
+/// limits it).
+fn check_beats(sim: &Sim) -> Vec<String> {
+    let topo = sim.topology();
+    let exceeds = |beat: u64, atts: &[crate::topology::AttachId]| -> Option<f64> {
+        let best = atts
+            .iter()
+            .map(|a| {
+                sim.bus_rate(topo.attachment(*a).bus)
+                    .map_or(f64::INFINITY, |r| r.to_f64())
+            })
+            .fold(0.0, f64::max);
+        (!atts.is_empty() && (beat as f64) > best).then_some(best)
+    };
+    let mut out = Vec::new();
+    for p in 0..sim.pe_count() {
+        let cfg = sim.pe_config(PeId(p as u32));
+        if let PeParams::Dma { beat, masters, .. } = &cfg.params {
+            if let Some(best) = exceeds(*beat, masters) {
+                out.push(format!(
+                    "{}: beat_bytes {beat} exceeds every bus it masters (at most {best} B/cycle)",
+                    cfg.name
+                ));
+            }
+        }
+    }
+    for i in 0..topo.len() {
+        let nu = NeutrinoId(i as u32);
+        let beat = sim.neutrino_config(nu).beat_bytes;
+        let mut atts = topo.data_hub(nu).to_vec();
+        atts.extend(topo.hub(nu));
+        if let Some(best) = exceeds(beat, &atts) {
+            out.push(format!(
+                "{}.neutrino: beat_bytes {beat} exceeds every bus it masters (at most {best} B/cycle)",
+                topo.path_name(nu)
+            ));
+        }
+    }
+    out
 }
 
 /// The burst check: a DMA engine with `burst_bytes` keeps a path busy
@@ -1602,5 +1680,6 @@ fn nu_config(
         outbound_invokes: s.outbound_invokes.unwrap_or(d.outbound_invokes),
         inbound_invokes: s.inbound_invokes.unwrap_or(d.inbound_invokes),
         t_retry: s.t_retry.unwrap_or(d.t_retry),
+        beat_bytes: beat_of(&s.beat_bytes, name)?,
     })
 }

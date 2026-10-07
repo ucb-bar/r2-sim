@@ -37,7 +37,8 @@ pub use profile::{
 };
 pub use program::{NeutrinoProgram, NuCtx, TaskHandle};
 pub use resource::{
-    CoCharge, Demand, Dir, DirCycles, Grant, Kind, LogEntry, ResourceId, ResourceStats, Resources,
+    CoCharge, Demand, Dir, DirCycles, Grant, Kind, LogEntry, PathHop, ResourceId, ResourceStats,
+    Resources,
 };
 pub use sim::{Flow, Sim, MESSAGE_KINDS};
 pub use stats::{

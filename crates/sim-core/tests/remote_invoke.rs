@@ -251,11 +251,14 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let t = &s.tasks[0];
-    // The Invoke (52 B, 1 beat) arrives at sm1 at 34 and issues; latency
-    // 100 + 20; 256 cycles on the links: [154,410), complete 414; Resolve
-    // arrives at sm0 at 440.
+    // The Invoke (52 B, 1 beat) arrives at sm1 at 34 and issues; engine
+    // latency 100: the hops in route order from 134, at the engine's 64 B
+    // beat narrowed by each hop: sm0's SMEM port [134, 262); sm0's bridge up
+    // (32 B/cycle) [134, 390), latency 10; the crossbar ports and sm1's
+    // bridge down narrowed to 32, [144, 400), latency 10; sm1's SMEM port
+    // [154, 410). Complete 414; Resolve arrives at sm0 at 440.
     assert_eq!(t.invoke, 34);
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (154, 410));
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (134, 410));
     assert_eq!(t.complete, Some(414));
     assert_eq!(s.end_time, 440);
 }
@@ -352,14 +355,16 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
     // ports, sm1's down bridge 2 + 10) and waits on a pending entry. P
     // (72 B, 2 beats) is invoked at [208, 216) and enters sm1 at 248,
     // adopting the entry; it runs [248, 440) and completes at 444. Resolve
-    // reaches the device at 479: C is ready. C's DMA (latency 100 + 30,
-    // 8 KiB at 32 B/cycle on sm1's bridge) runs [609, 865) and completes
-    // at 869; Resolve reaches sm0's wait at 904.
+    // reaches the device at 479: C is ready. C's DMA: engine latency 100,
+    // its first hop (sm1's SMEM port) at 579; 8 KiB at 32 B/cycle on sm1's
+    // bridge up from 579, then the crossbar ports and the cluster bridge
+    // narrowed to 32 from 589 and the HBM port from 609, to 865; complete
+    // 869; Resolve reaches sm0's wait at 904.
     assert_eq!((tc.invoke, tp.invoke), (43, 248));
     assert_eq!((tp.complete, tc.ready), (Some(444), Some(479)));
     assert_eq!(
         (tc.chunks[0].start, tc.chunks[0].end, tc.complete),
-        (609, 865, Some(869))
+        (579, 865, Some(869))
     );
     assert_eq!(s.end_time, 904);
 }

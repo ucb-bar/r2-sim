@@ -35,6 +35,19 @@ impl Ratio {
     pub fn to_f64(self) -> f64 {
         self.num as f64 / self.den as f64
     }
+
+    /// The smaller of `self` and `other`.
+    pub fn min(self, other: Ratio) -> Ratio {
+        let (a, b) = (
+            self.num as u128 * other.den as u128,
+            other.num as u128 * self.den as u128,
+        );
+        if a <= b {
+            self
+        } else {
+            other
+        }
+    }
 }
 
 impl Default for Ratio {

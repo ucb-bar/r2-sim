@@ -148,6 +148,11 @@ struct PhaseStats {
 }
 
 fn phase_stats(stats: &Stats) -> Vec<PhaseStats> {
+    let lanes: Vec<f64> = stats
+        .resources
+        .iter()
+        .map(|r| r.lanes.max(1) as f64)
+        .collect();
     let names: Vec<&str> = stats.resources.iter().map(|r| r.name.as_str()).collect();
     let top = |v: Vec<(usize, f64)>| -> Vec<(String, f64)> {
         let mut v: Vec<(usize, f64)> = v.into_iter().filter(|x| x.1 > 0.0).collect();
@@ -177,13 +182,19 @@ fn phase_stats(stats: &Stats) -> Vec<PhaseStats> {
                     .map(|(i, x)| (i, x[k] as f64 / den))
                     .collect())
             };
+            // Busy lane-cycles over all lanes of the interval.
+            let busiest = top(d
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (i, x[0] as f64 / (len * lanes[i])))
+                .collect());
             PhaseStats {
                 name: b.name.clone(),
                 start: a.time,
                 end: b.time,
                 culprits: share(1, sum(1)),
                 delays: share(2, sum(2)),
-                busiest: share(0, len),
+                busiest,
             }
         })
         .collect()
@@ -204,6 +215,8 @@ struct Spread {
 struct ResourceOut {
     name: String,
     kind: String,
+    /// Lanes (Section 5.4); `busy_cycles` counts lane-cycles.
+    lanes: u32,
     busy_cycles: u64,
     /// `busy_cycles` by direction (they sum to it).
     busy_read: u64,
@@ -579,11 +592,12 @@ fn resource_outs(stats: &Stats) -> Vec<ResourceOut> {
         .map(|r| ResourceOut {
             name: r.name.clone(),
             kind: format!("{:?}", r.kind),
+            lanes: r.lanes,
             busy_cycles: r.busy_cycles,
             busy_read: r.busy_read,
             busy_write: r.busy_write,
             busy_work: r.busy_work,
-            utilization: r.busy_cycles as f64 / end as f64,
+            utilization: r.busy_cycles as f64 / (end as f64 * r.lanes.max(1) as f64),
             culprit_cycles: r.culprit_cycles,
             culprit_share: r.culprit_cycles as f64 / total_culprit.max(1) as f64,
             delay_cycles: r.delay_cycles,

@@ -402,7 +402,8 @@ fn demands_record_reads_and_writes() {
     // HBM port and the route up to the engine are reads (HBM port, gpc0's
     // bridge down, sm0's bridge down), the SMEM port is a write. sm1 runs a
     // 64^3 bf16 matmul: A and B (16 KiB) are reads and C (8 KiB) a write
-    // on its SMEM port, 192 cycles at 128 B/cycle: 128 read, 64 write; the
+    // on its SMEM port, 192 cycles at 128 B/cycle: 128 read, 64 write (in
+    // lane-cycles, times its 2 lanes); the
     // array's cycles are work. Every split sums to the busy total.
     let b = two_sm(&[]).unwrap();
     let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
@@ -474,7 +475,9 @@ fn demands_record_reads_and_writes() {
     }
     let (sr, sw, _) = r("root.gpc0.sm0.smem.port");
     assert!(sr == 0 && sw > 0, "destination SMEM port: write");
-    assert_eq!(r("root.gpc0.sm1.smem.port"), (128, 64, 0));
+    // The matmul holds both lanes of the 128 B/cycle port (64 B beats):
+    // 128 read and 64 write cycles are 256 and 128 lane-cycles.
+    assert_eq!(r("root.gpc0.sm1.smem.port"), (256, 128, 0));
     let (ar, aw, ak) = r("root.gpc0.sm1.atlas.array");
     assert!(ar == 0 && aw == 0 && ak > 0, "array: work");
     for x in &s.resources {
@@ -561,18 +564,30 @@ fn two_transfers(dma: &str) -> (u64, u64) {
 
 #[test]
 fn small_bursts_interleave_two_transfers_on_a_shared_bridge() {
-    // The bridge is the slow hop: 4 KiB takes 32 cycles on it. As one 4 KiB
-    // chunk each, the two transfers hold the bridge back to back: [0, 32)
-    // and [32, 64).
-    assert_eq!(two_transfers("outstanding: 1"), (32, 64));
+    // The bridge is the slow hop: 128 B/cycle in two 64 B lanes; HBM and
+    // SMEM (1024 B/cycle) are not. With a 128 B engine beat a transfer
+    // holds both bridge lanes, and 4 KiB takes 32 cycles on it. As one 4
+    // KiB chunk each, the two transfers hold the bridge back to back: [0,
+    // 32) and [32, 64).
+    assert_eq!(two_transfers("beat_bytes: 128, outstanding: 1"), (32, 64));
     // In 512 B bursts (4 cycles each on the bridge) with one chunk in flight
     // per transfer, the transfers alternate bursts: the first ends at 60,
     // one burst before the second; the bridge stays busy to 64.
-    assert_eq!(two_transfers("burst_bytes: 512, outstanding: 1"), (60, 64));
+    assert_eq!(
+        two_transfers("beat_bytes: 128, burst_bytes: 512, outstanding: 1"),
+        (60, 64)
+    );
     // With two chunks in flight each, a transfer reserves two bursts in a
     // row: they alternate in pairs and end two bursts apart. The
     // interleaving grain is outstanding x burst.
-    assert_eq!(two_transfers("burst_bytes: 512, outstanding: 2"), (56, 64));
+    assert_eq!(
+        two_transfers("beat_bytes: 128, burst_bytes: 512, outstanding: 2"),
+        (56, 64)
+    );
+    // With the default 64 B engine beat a transfer moves 64 B/cycle on one
+    // of the two bridge lanes: the transfers run side by side, 4096 / 64 =
+    // 64 cycles each.
+    assert_eq!(two_transfers("outstanding: 1"), (64, 64));
 }
 
 #[test]
@@ -595,4 +610,39 @@ fn a_burst_that_does_not_cover_the_latency_is_a_warning() {
     assert!(burst_node("latency: 100, outstanding: 1")
         .warnings
         .is_empty());
+}
+
+#[test]
+fn a_master_beat_wider_than_its_buses_is_a_warning() {
+    // The device's DMA engine masters sbus (256 B/cycle): a 512 B beat
+    // exceeds it, a 256 B beat does not. The Neutrino also masters the
+    // unlimited control bus, so its beat never exceeds every bus.
+    let warnings = |beat: u64| {
+        build_config(
+            &format!(
+                "global:
+  neutrino_granule: 512
+  address: {{fields: [{{name: sm, bits: 2}}], offset_bits: 24}}
+device:
+  name: root
+  fabric: [{{name: sbus, bw_bytes: 256}}, {{name: cbus, control: true}}]
+  memory:
+    - {{name: hbm, type: dram, addr: [[0x0, 0x100000]], bw_bytes: 512, slave: $this.sbus}}
+    - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
+  compute:
+    - {{name: dma, type: dma, beat_bytes: {beat}, master: [$this.sbus]}}
+  neutrino: {{beat_bytes: 4096}}
+"
+            ),
+            ProfileRegistry::with_builtins(),
+        )
+        .unwrap()
+        .warnings
+    };
+    let w = warnings(512);
+    assert_eq!(
+        w,
+        vec!["root.dma: beat_bytes 512 exceeds every bus it masters (at most 256 B/cycle)"]
+    );
+    assert!(warnings(256).is_empty());
 }

@@ -1,15 +1,16 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.0). The checks are the
+The format is r2-vis's `trace-raw.md` (version 1.1). The checks are the
 ones of its Section 8, plus the file layout:
 
 * the manifest's record layouts have the record sizes of the format, every
   binary file holds whole records, and the counts match `summary.json`;
 * in a complete dump (`filters.partial` false), every gid in chunks,
   deps, charges and programs.spawn has a task record;
-* on a resource with a rate, two charges overlap only when they are the
-  direction records of one charge (same start and span); per resource the
-  cycles sum to `busy_cycles` of the `--stats` JSON (with `--stats`);
+* on a resource with a rate, the lanes held at any cycle (a record holds
+  cycles / span lanes over [start, start + span)) are at most its `lanes`
+  (one for a 1.0 dump); per resource the cycles (lane-cycles) sum to
+  `busy_cycles` of the `--stats` JSON (with `--stats`);
 * every resource id in the records is in the manifest, every link of the
   topology tables has a resource, and records on unlimited links have
   span = cycles >= 1;
@@ -140,18 +141,30 @@ def check_charges(r: Report, manifest: dict, recs: dict, stats: dict | None) -> 
     u = c[~on_rated]
     r.check(bool(((u["span"] >= 1) & (u["span"] == u["cycles"])).all()),
             f"{len(u)} unlimited-link records have span = cycles >= 1")
-    # Overlap on rated resources: unique (resource, start, span) intervals
-    # of nonzero span, sorted, must not overlap.
+    # Capacity on rated resources: sweep the records of nonzero span in
+    # time order per resource (an end before a start at the same cycle);
+    # the lanes held never exceed the resource's lanes.
+    lanes = np.array([x.get("lanes") or 1 for x in res], dtype=np.float64)
     k = c[on_rated & (c["span"] > 0)]
-    key = np.unique(np.stack([k["resource"].astype(np.uint64), k["start"],
-                              k["span"].astype(np.uint64)], axis=1), axis=0)
-    same = key[1:, 0] == key[:-1, 0]
-    overlap = same & (key[1:, 1] < key[:-1, 1] + key[:-1, 2])
-    n = int(np.count_nonzero(overlap))
-    r.check(n == 0, f"rated resources: {n} overlapping charges")
+    held = k["cycles"].astype(np.float64) / k["span"].astype(np.float64)
+    rid = k["resource"].astype(np.int64)
+    t = np.concatenate([k["start"], k["start"] + k["span"].astype(np.uint64)])
+    dl = np.concatenate([held, -held])
+    rr = np.concatenate([rid, rid])
+    order = np.lexsort((dl, t, rr))
+    t, dl, rr = t[order], dl[order], rr[order]
+    level = np.cumsum(dl)
+    # Restart the running sum at each resource.
+    first = np.r_[True, rr[1:] != rr[:-1]]
+    base = np.maximum.accumulate(np.where(first, np.arange(len(rr)), 0))
+    offset = np.r_[0.0, level][base]
+    level = level - offset
+    over = level > lanes[rr] + 1e-6
+    n = int(np.count_nonzero(over))
+    r.check(n == 0, f"rated resources: {n} cycles over capacity")
     if n:
-        i = int(np.flatnonzero(overlap)[0])
-        print(f"      first: resource {key[i, 0]} {key[i, 1:]} and {key[i + 1, 1:]}")
+        i = int(np.flatnonzero(over)[0])
+        print(f"      first: resource {rr[i]} at {t[i]}: {level[i]:.2f} of {lanes[rr[i]]:.0f} lanes")
     if stats is not None:
         busy = {x["name"]: x["busy_cycles"] for x in stats["resources"]}
         sums = np.bincount(c["resource"], weights=c["cycles"].astype(np.float64),

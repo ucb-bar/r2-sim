@@ -130,12 +130,20 @@ pub struct Grant {
     pub queue_culprit: Option<ResourceId>,
 }
 
-/// A flow resource: a rate and a calendar.
+/// A flow resource: a rate split into lanes, and a calendar of the lanes
+/// in use over time (Section 5.4, data-path rule 3).
 #[derive(Debug, Clone)]
 pub struct FlowResource {
     rate: Ratio,
-    /// Busy intervals, start -> end; disjoint, merged when adjacent.
-    busy: BTreeMap<Cycle, Cycle>,
+    /// Lanes: `ceil(rate / beat_bytes)`; 1 without a beat.
+    lanes: u32,
+    /// The rate of one lane: `rate / lanes`.
+    lane_rate: Ratio,
+    /// The beat in bytes, when the resource has lanes.
+    beat: Option<u64>,
+    /// Lanes in use from each key until the next one; 0 after the last.
+    used: BTreeMap<Cycle, u32>,
+    /// Lane-cycles charged.
     busy_total: u64,
     /// `busy_total` by direction.
     busy_dir: DirCycles,
@@ -160,7 +168,10 @@ impl FlowResource {
         assert!(rate.num > 0, "flow resource with zero rate");
         Self {
             rate,
-            busy: BTreeMap::new(),
+            lanes: 1,
+            lane_rate: rate,
+            beat: None,
+            used: BTreeMap::new(),
             busy_total: 0,
             busy_dir: [0; 3],
             culprit_total: 0,
@@ -171,6 +182,25 @@ impl FlowResource {
     /// Units per cycle.
     pub fn rate(&self) -> Ratio {
         self.rate
+    }
+
+    /// Lanes.
+    pub fn lanes(&self) -> u32 {
+        self.lanes
+    }
+
+    /// The beat in bytes; `None` for a resource without lanes.
+    pub fn beat(&self) -> Option<u64> {
+        self.beat
+    }
+
+    /// Splits the rate into `ceil(rate / beat)` lanes of `rate / lanes`.
+    fn set_beat(&mut self, beat: u64) {
+        assert!(beat > 0, "beat of 0 bytes");
+        let lanes = (self.rate.num as u128).div_ceil(self.rate.den as u128 * beat as u128);
+        self.lanes = lanes.max(1) as u32;
+        self.lane_rate = Ratio::new(self.rate.num, self.rate.den * self.lanes as u64);
+        self.beat = Some(beat);
     }
 
     /// Whole cycles for `amount` at `util`: `ceil(amount / (rate * util))`,
@@ -192,60 +222,104 @@ impl FlowResource {
         e_num.div_ceil(e_den).max(1) as u64
     }
 
-    /// The earliest `t' >= t` with `[t', t' + d)` free.
-    pub(crate) fn earliest(&self, mut t: Cycle, d: u64) -> Cycle {
+    /// Lanes that a flow at `r` units per cycle holds: `ceil(r / lane
+    /// rate)`, at least one and at most all.
+    fn lanes_for(&self, r: Ratio) -> u32 {
+        let k = (r.num as u128 * self.lane_rate.den as u128)
+            .div_ceil(r.den as u128 * self.lane_rate.num as u128);
+        k.clamp(1, self.lanes as u128) as u32
+    }
+
+    /// Lanes in use at `t`.
+    fn used_at(&self, t: Cycle) -> u32 {
+        self.used.range(..=t).next_back().map_or(0, |(_, &v)| v)
+    }
+
+    /// The earliest `t' >= t` with `k` lanes free over `[t', t' + d)`.
+    pub(crate) fn earliest(&self, t: Cycle, d: u64, k: u32) -> Cycle {
+        use std::ops::Bound::{Excluded, Unbounded};
         if d == 0 {
             return t;
         }
-        if let Some((_, &end)) = self.busy.range(..=t).next_back() {
-            t = t.max(end);
-        }
-        for (&s, &e) in self.busy.range(t..) {
-            if s - t >= d {
-                return t;
+        let free = self.lanes - k.min(self.lanes);
+        let mut cand = t;
+        'search: loop {
+            if self.used_at(cand) > free {
+                // The lanes in use change only at keys; the last is 0.
+                match self.used.range((Excluded(cand), Unbounded)).next() {
+                    Some((&next, _)) => cand = next,
+                    None => return cand,
+                }
+                continue;
             }
-            t = t.max(e);
+            for (&at, &v) in self.used.range((Excluded(cand), Excluded(cand + d))) {
+                if v > free {
+                    cand = at;
+                    continue 'search;
+                }
+            }
+            return cand;
         }
-        t
     }
 
-    /// Charges `[start, start + d)`; returns the cycles by direction.
-    fn charge(&mut self, start: Cycle, d: u64, amounts: &DirCycles) -> DirCycles {
+    /// Adds `delta` lanes in use over `[t, t + d)`.
+    fn add(&mut self, t: Cycle, d: u64, delta: i64) {
         if d == 0 {
-            return [0; 3];
+            return;
         }
-        let parts = split(d, amounts);
+        let e = t + d;
+        let (vt, ve) = (self.used_at(t), self.used_at(e));
+        self.used.entry(t).or_insert(vt);
+        self.used.entry(e).or_insert(ve);
+        for (_, v) in self.used.range_mut(t..e) {
+            let n = *v as i64 + delta;
+            debug_assert!(n >= 0 && n <= self.lanes as i64, "lanes over capacity");
+            *v = n as u32;
+        }
+        // Coalesce at the two ends.
+        let before =
+            |m: &BTreeMap<Cycle, u32>, x: Cycle| m.range(..x).next_back().map_or(0, |(_, &v)| v);
+        if before(&self.used, t) == self.used[&t] {
+            self.used.remove(&t);
+        }
+        if before(&self.used, e) == self.used[&e] {
+            self.used.remove(&e);
+        }
+    }
+
+    /// Holds `k` lanes over `[t, t + d)` (the calendar only).
+    fn occupy(&mut self, t: Cycle, d: u64, k: u32) {
+        self.add(t, d, k as i64);
+    }
+
+    /// Frees `k` lanes over `[t, t + d)` held by [`FlowResource::occupy`].
+    fn release(&mut self, t: Cycle, d: u64, k: u32) {
+        self.add(t, d, -(k as i64));
+    }
+
+    /// Counts `k` lanes over `d` cycles in the statistics; returns the
+    /// lane-cycles by direction.
+    fn account(&mut self, d: u64, k: u32, amounts: &DirCycles) -> DirCycles {
+        let lc = d * k as u64;
+        let parts = split(lc, amounts);
         for (b, p) in self.busy_dir.iter_mut().zip(parts) {
             *b += p;
         }
-        let mut s = start;
-        let mut e = start + d;
-        if let Some((&ps, &pe)) = self.busy.range(..=s).next_back() {
-            debug_assert!(pe <= s, "charge over a busy interval");
-            if pe == s {
-                self.busy.remove(&ps);
-                s = ps;
-            }
-        }
-        if let Some(ne) = self.busy.remove(&e) {
-            e = ne;
-        }
-        debug_assert!(
-            self.busy.range(s..e).next().is_none(),
-            "charge over a busy interval"
-        );
-        self.busy.insert(s, e);
-        self.busy_total += d;
+        self.busy_total += lc;
         parts
     }
 
-    /// Drops intervals that end at or before `now`.
+    /// Drops the calendar before `now`.
     fn prune(&mut self, now: Cycle) {
-        while let Some((&s, &e)) = self.busy.first_key_value() {
-            if e > now {
+        let v = self.used_at(now);
+        while let Some((&k, _)) = self.used.first_key_value() {
+            if k >= now {
                 break;
             }
-            self.busy.remove(&s);
+            self.used.pop_first();
+        }
+        if v > 0 {
+            self.used.entry(now).or_insert(v);
         }
     }
 }
@@ -302,7 +376,10 @@ pub struct ResourceStats {
     pub name: String,
     /// The resource's kind.
     pub kind: Kind,
-    /// Flow: charged cycles. Occupancy: 0.
+    /// Flow: lanes (1 for a resource without a beat). Occupancy: 0.
+    pub lanes: u32,
+    /// Flow: charged lane-cycles (cycles for a one-lane resource).
+    /// Occupancy: 0.
     pub busy_cycles: u64,
     /// The part of `busy_cycles` charged for reads.
     pub busy_read: u64,
@@ -351,6 +428,30 @@ pub struct Resources {
     /// Per merged demand: its amount by direction.
     merged_dir: Vec<DirCycles>,
     own: Vec<(ResourceId, u64, Cycle)>,
+    /// Scratch buffer of `reserve_path`.
+    plan: Vec<Placed>,
+}
+
+/// One hop of a transfer chunk, in route order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathHop {
+    /// The flow resource.
+    pub resource: ResourceId,
+    /// Bytes.
+    pub amount: u64,
+    pub dir: Dir,
+    /// Cycles from this hop's start to the next hop's earliest start.
+    pub latency: Cycle,
+}
+
+/// A hop's window while a transfer is placed.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    start: Cycle,
+    dur: u64,
+    lanes: u32,
+    /// Start delay on this hop in the forward pass.
+    delay: Cycle,
 }
 
 impl Resources {
@@ -369,6 +470,7 @@ impl Resources {
             merged: Vec::new(),
             merged_dir: Vec::new(),
             own: Vec::new(),
+            plan: Vec::new(),
         }
     }
 
@@ -432,6 +534,12 @@ impl Resources {
         self.res.is_empty()
     }
 
+    /// Splits flow resource `id` into lanes of `beat` bytes (Section 5.4,
+    /// data-path rule 3).
+    pub fn set_beat(&mut self, id: ResourceId, beat: u64) {
+        self.flow_mut(id).set_beat(beat);
+    }
+
     /// The rate of flow resource `id`; `None` for an occupancy resource.
     pub fn flow_rate(&self, id: ResourceId) -> Option<Ratio> {
         match &self.res[id.0 as usize].state {
@@ -493,7 +601,7 @@ impl Resources {
         own.extend(merged.iter().map(|d| {
             let f = self.flow(d.resource);
             let dur = f.duration(d.amount, d.utilization);
-            (d.resource, dur, f.earliest(earliest, dur))
+            (d.resource, dur, f.earliest(earliest, dur, f.lanes))
         }));
         // Step 2.
         let mut t = own.iter().map(|o| o.2).max().expect("nonempty");
@@ -505,7 +613,10 @@ impl Resources {
         loop {
             let next = own
                 .iter()
-                .map(|o| self.flow(o.0).earliest(t, charged(o.1)))
+                .map(|o| {
+                    let f = self.flow(o.0);
+                    f.earliest(t, charged(o.1), f.lanes)
+                })
                 .max()
                 .expect("nonempty");
             if next == t {
@@ -513,23 +624,13 @@ impl Resources {
             }
             t = next;
         }
-        // Step 4.
+        // Step 4: a compute chunk holds every lane.
         for (i, &(r, d, _)) in own.iter().enumerate() {
-            let parts = self.flow_mut(r).charge(t, charged(d), &merged_dir[i]);
-            if self.record {
-                for (k, dir) in [Dir::Read, Dir::Write, Dir::Work].into_iter().enumerate() {
-                    if merged_dir[i][k] > 0 {
-                        self.charges.push(crate::tracer::Charge {
-                            resource: r,
-                            dir,
-                            amount: merged_dir[i][k],
-                            start: t,
-                            span: charged(d),
-                            cycles: parts[k],
-                        });
-                    }
-                }
-            }
+            let f = self.flow_mut(r);
+            let k = f.lanes;
+            f.occupy(t, charged(d), k);
+            let parts = f.account(charged(d), k, &merged_dir[i]);
+            self.record_charge(r, &merged_dir[i], t, charged(d), &parts);
         }
         // Culprit: longest own duration; on a tie, the latest own start.
         let culprit = own
@@ -550,6 +651,127 @@ impl Resources {
         Some(Grant {
             start: t,
             end: t + big_d,
+            culprit,
+            queue_culprit,
+        })
+    }
+
+    /// Records one charge per direction with a nonzero amount, when
+    /// recording; `cycles` are lane-cycles.
+    fn record_charge(
+        &mut self,
+        r: ResourceId,
+        amounts: &DirCycles,
+        start: Cycle,
+        span: Cycle,
+        parts: &DirCycles,
+    ) {
+        if !self.record {
+            return;
+        }
+        for (k, dir) in [Dir::Read, Dir::Write, Dir::Work].into_iter().enumerate() {
+            if amounts[k] > 0 {
+                self.charges.push(crate::tracer::Charge {
+                    resource: r,
+                    dir,
+                    amount: amounts[k],
+                    start,
+                    span,
+                    cycles: parts[k],
+                });
+            }
+        }
+    }
+
+    /// Reserves a transfer chunk along `hops` in route order (Section 5.4,
+    /// data-path rule): hop 0 at the earliest window at or after
+    /// `earliest`, hop i+1 at or after hop i's start plus its latency. Hop
+    /// i's rate is the narrowest of `rate` (the master's) and the rates of
+    /// hops 0 to i; it holds `ceil(r / lane rate)` lanes for `ceil(bytes /
+    /// r)` cycles. A backward pass moves a hop later when the next one
+    /// starts more than one skid (its latency plus one cycle) after it
+    /// ends, unless that would put it after the next hop's start less its
+    /// latency (data order wins). The chunk ends at the last window's
+    /// end plus the last hop's latency. Returns `None` for no hops.
+    pub fn reserve_path(
+        &mut self,
+        hops: &[PathHop],
+        rate: Ratio,
+        earliest: Cycle,
+    ) -> Option<Grant> {
+        if hops.is_empty() {
+            return None;
+        }
+        let mut plan = std::mem::take(&mut self.plan);
+        plan.clear();
+        let mut r = rate;
+        let mut want = earliest;
+        for h in hops {
+            let f = self.flow(h.resource);
+            r = r.min(f.rate);
+            let k = f.lanes_for(r);
+            let d = (h.amount as u128 * r.den as u128)
+                .div_ceil(r.num as u128)
+                .max(1) as u64;
+            let s = f.earliest(want, d, k);
+            self.flow_mut(h.resource).occupy(s, d, k);
+            plan.push(Placed {
+                start: s,
+                dur: d,
+                lanes: k,
+                delay: s - want,
+            });
+            want = s + h.latency;
+        }
+        // Backward pass: no storage between hops beyond one skid.
+        for i in (0..hops.len() - 1).rev() {
+            let (cur, next) = (plan[i], plan[i + 1]);
+            let lat = hops[i].latency;
+            if next.start <= cur.start + cur.dur + lat + 1 {
+                continue;
+            }
+            let target = next.start - lat - 1 - cur.dur;
+            let res = hops[i].resource;
+            self.flow_mut(res).release(cur.start, cur.dur, cur.lanes);
+            let s = self.flow(res).earliest(target, cur.dur, cur.lanes);
+            let s = if s + lat <= next.start { s } else { cur.start };
+            self.flow_mut(res).occupy(s, cur.dur, cur.lanes);
+            plan[i].start = s;
+        }
+        // Statistics, records, culprits.
+        for (h, p) in hops.iter().zip(plan.iter()) {
+            let mut amounts = [0; 3];
+            amounts[h.dir.index()] = h.amount;
+            let parts = self.flow_mut(h.resource).account(p.dur, p.lanes, &amounts);
+            self.record_charge(h.resource, &amounts, p.start, p.dur, &parts);
+        }
+        // The data arrives the last hop's latency after its window.
+        let start = plan[0].start;
+        let end = plan.iter().map(|p| p.start + p.dur).max().expect("hops")
+            + hops.last().expect("hops").latency;
+        // The first hop with the longest window: the narrowest one (the hops
+        // after it are narrowed to its rate).
+        let (ci, cp) = plan
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, p)| (p.dur, std::cmp::Reverse(*i)))
+            .expect("hops");
+        let culprit = hops[ci].resource;
+        self.flow_mut(culprit).culprit_total += cp.dur;
+        let (qi, qp) = plan
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, p)| (p.delay, *i))
+            .expect("hops");
+        let queue_culprit = (qp.delay > 0).then(|| {
+            let q = hops[qi].resource;
+            self.flow_mut(q).delay_total += qp.delay;
+            q
+        });
+        self.plan = plan;
+        Some(Grant {
+            start,
+            end,
             culprit,
             queue_culprit,
         })
@@ -611,6 +833,7 @@ impl Resources {
                 ResourceState::Flow(f) => ResourceStats {
                     name: r.name.clone(),
                     kind: r.kind,
+                    lanes: f.lanes,
                     busy_cycles: f.busy_total,
                     busy_read: f.busy_dir[0],
                     busy_write: f.busy_dir[1],
@@ -623,6 +846,7 @@ impl Resources {
                 ResourceState::Occupancy(o) => ResourceStats {
                     name: r.name.clone(),
                     kind: r.kind,
+                    lanes: 0,
                     busy_cycles: 0,
                     busy_read: 0,
                     busy_write: 0,

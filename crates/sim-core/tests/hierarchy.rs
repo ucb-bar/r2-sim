@@ -378,10 +378,13 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let t = &s.tasks[0];
-    // Issue 8; latency engine 100 + path 20; 8 KiB: 256 cycles on each
-    // bridge, 128 on each crossbar port, 64 on each memory port: D = 256.
-    // Co-charge "longest": every resource is charged D.
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (128, 384));
+    // Issue 8, engine latency 100: the hops in route order from 108, at
+    // the engine's 64 B beat narrowed by each hop (Section 5.4): sm1's
+    // SMEM port (128 B/cycle) at 64, one of its two lanes, [108, 236); sm1's
+    // bridge up (32 B/cycle) [108, 364), latency 10; the crossbar ports
+    // (64 B/cycle) narrowed to 32, [118, 374); sm0's bridge down [118,
+    // 374), latency 10; sm0's SMEM port narrowed to 32, [128, 384).
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (108, 384));
     assert_eq!(t.complete, Some(388));
     for name in [
         "root.gpc0.sm1.bridge.up",
@@ -395,10 +398,11 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
             "{name}"
         );
     }
-    // Two bridges tie at 256; the tie goes to the lower resource id.
+    // The first hop with the longest window: sm1's bridge up, the
+    // narrowest (the hops after it are narrowed to its rate).
     assert_eq!(
         t.chunks[0].culprit,
-        Some(res(&s, "root.gpc0.sm0.bridge.down"))
+        Some(res(&s, "root.gpc0.sm1.bridge.up"))
     );
 }
 

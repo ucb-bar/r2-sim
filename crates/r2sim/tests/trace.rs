@@ -246,7 +246,9 @@ fn trace_out_writes_consistent_files() {
         *sum.entry(f[0].to_string()).or_default() += f[4].parse::<f64>().unwrap() * 1000.0;
     }
     for r in j["resources"].as_array().unwrap() {
-        let busy = r["busy_cycles"].as_u64().unwrap() as f64;
+        // Busy lane-cycles over the resource's lanes.
+        let busy =
+            r["busy_cycles"].as_u64().unwrap() as f64 / r["lanes"].as_u64().unwrap().max(1) as f64;
         let got = sum.get(r["name"].as_str().unwrap()).copied().unwrap_or(0.0);
         assert!(
             (got - busy).abs() <= 1.0 + busy * 1e-3,

@@ -8,7 +8,7 @@
 use nu_model::{Addr, Dep, NeutrinoId, Range};
 
 use crate::config::{MemBlock, PeConfig, PeParams};
-use crate::resource::{Demand, Dir, ResourceId};
+use crate::resource::{Demand, Dir, PathHop, ResourceId};
 use crate::time::{Cycle, Ratio};
 use crate::topology::{AttachId, Topology};
 use crate::tracer::RouteUse;
@@ -224,12 +224,19 @@ pub struct Occupancy {
     pub amount: u64,
 }
 
-/// One timing-only subdivision of a task.
+/// One timing-only subdivision of a task: a compute chunk (`demand`,
+/// co-charged from one start) or a transfer chunk (`path`, reserved hop by
+/// hop in route order; Section 5.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
-    /// Co-charged over one interval (Section 5.4).
+    /// Compute: co-charged over one interval.
     pub demand: Vec<Demand>,
-    /// Cycles after the request before the demand may start (Section 5.7).
+    /// Transfer: the hops in route order; empty for a compute chunk.
+    pub path: Vec<PathHop>,
+    /// Transfer: the master's beat rate, the start of the narrowing chain.
+    pub rate: Ratio,
+    /// Cycles after the request before the demand (or the first hop) may
+    /// start (Section 5.7).
     pub latency: Cycle,
     /// The fabric routes the chunk's bytes take, for a tracer (the
     /// unlimited links of a route have no demand).
@@ -348,11 +355,13 @@ impl ProfileRegistry {
     }
 }
 
-/// DMA: one chunk per `tile_bytes`; bandwidth on the source port, the
-/// engine's extra links, the fabric route from the source block to the
-/// engine and from the engine to the destination block (each over the
-/// engine's master bus with the fewest bridges), and the destination port.
-/// Chunk latency is the engine latency plus the two route latencies.
+/// DMA: one transfer chunk per `tile_bytes` (or per burst); its hops in
+/// route order are the source port, the fabric route from the source
+/// block to the engine, the engine's extra links, the route from the
+/// engine to the destination block (each over the engine's master bus
+/// with the fewest bridges), and the destination port. The chunk latency
+/// is the engine latency; each hop carries the route latency to the next
+/// hop. The engine's beat rate starts the narrowing chain.
 pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Dma {
         src,
@@ -368,6 +377,7 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         latency,
         masters,
         burst,
+        beat,
     } = &node.pe.params
     else {
         panic!("dma opcode on PE {}", node.pe.name);
@@ -397,14 +407,22 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     while left > 0 {
         let n = left.min(tile_bytes);
         left -= n;
-        // Reads: the source port, the engine's links and the route to the
-        // engine. Writes: the route from the engine and the destination
-        // port.
-        let mut demand = vec![Demand::read(src_port, n)];
-        demand.extend(links.iter().map(|l| Demand::read(*l, n)));
-        demand.extend(inp.resources.iter().map(|r| Demand::read(*r, n)));
-        demand.extend(out.resources.iter().map(|r| Demand::write(*r, n)));
-        demand.push(Demand::write(dst_port, n));
+        // Reads: the source port, the route to the engine and the engine's
+        // links. Writes: the route from the engine and the destination
+        // port. A latency before a route's first rated hop is added to the
+        // hop before it.
+        let hop = |resource, dir, latency| PathHop {
+            resource,
+            amount: n,
+            dir,
+            latency,
+        };
+        let mut path = vec![hop(src_port, Dir::Read, inp.lead)];
+        path.extend(inp.hops.iter().map(|h| hop(h.lane, Dir::Read, h.latency)));
+        path.extend(links.iter().map(|l| hop(*l, Dir::Read, 0)));
+        path.last_mut().expect("source port").latency += out.lead;
+        path.extend(out.hops.iter().map(|h| hop(h.lane, Dir::Write, h.latency)));
+        path.push(hop(dst_port, Dir::Write, 0));
         let use_of = |p: Option<(AttachId, AttachId)>, dir| {
             p.map(|(from, to)| RouteUse {
                 from,
@@ -414,8 +432,10 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             })
         };
         chunks.push(Chunk {
-            demand,
-            latency: *latency + inp.latency + out.latency,
+            demand: Vec::new(),
+            path,
+            rate: Ratio::int(*beat),
+            latency: *latency,
             routes: [use_of(in_pair, Dir::Read), use_of(out_pair, Dir::Write)],
         });
     }
@@ -518,6 +538,8 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                     Demand::read(smem_port, read),
                     Demand::write(smem_port, c_out + flush),
                 ],
+                path: Vec::new(),
+                rate: Ratio::ONE,
                 latency: 0,
                 routes: [None; 2],
             });
@@ -590,6 +612,8 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     Profile {
         chunks: vec![Chunk {
             demand,
+            path: Vec::new(),
+            rate: Ratio::ONE,
             latency: overhead + latency,
             routes,
         }],

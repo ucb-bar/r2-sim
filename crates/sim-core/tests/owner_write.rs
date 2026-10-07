@@ -67,10 +67,14 @@ fn a_write_into_hbm_is_a_pull_by_the_device() {
     // and issues the task on its copy engine at 43.
     let t = &s.tasks[0];
     assert_eq!((t.invoke, t.ready, t.issue), (43, Some(43), Some(43)));
-    // Engine latency 100 + route latency 30 (sm0 bridge 10, gpc0
-    // bridge 20): start 173; 64 KiB on the 32 B/cycle sm0 bridge: 2048
-    // cycles, end 2221; c_complete 4 at the device: 2225.
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (173, 2221));
+    // Engine latency 100: the hops in route order from 143 at the
+    // engine's 64 B beat, narrowed by each hop (Section 5.4): sm0's SMEM
+    // port (one of its two lanes) [143, 1167); sm0's bridge up (32 B/cycle)
+    // [143, 2191), latency 10; the crossbar ports and gpc0's bridge up
+    // narrowed to 32, [153, 2201), latency 20; the HBM port [173, 2221).
+    // The chunk runs from its first hop's start to its last hop's end;
+    // c_complete 4 at the device: 2225.
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (143, 2221));
     assert_eq!(t.complete, Some(2225));
     // sm0's wait: Await sent 10 in the dependency channel (independent of
     // the invoke channel), registered at 45; Resolve sent 2225, arrives

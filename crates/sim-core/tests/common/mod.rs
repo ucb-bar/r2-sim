@@ -129,6 +129,8 @@ pub fn node(k: Knobs) -> Node {
                 latency: k.dma_latency,
                 masters: Vec::new(),
                 burst: None,
+                // Wide enough not to narrow the paths.
+                beat: 1024,
             },
         },
     );

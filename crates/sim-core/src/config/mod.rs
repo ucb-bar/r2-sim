@@ -98,6 +98,10 @@ pub struct NeutrinoConfig {
     pub inbound_invokes: usize,
     /// Cycles before a rejected Await is resent.
     pub t_retry: Cycle,
+    /// Data width in bytes of the Neutrino as a master (loads, stores,
+    /// protocol messages): the start of a transfer's narrowing chain
+    /// (Section 5.4).
+    pub beat_bytes: u64,
 }
 
 impl Default for NeutrinoConfig {
@@ -120,6 +124,7 @@ impl Default for NeutrinoConfig {
             outbound_invokes: 16,
             inbound_invokes: 64,
             t_retry: 50,
+            beat_bytes: 64,
         }
     }
 }
@@ -141,6 +146,9 @@ pub enum PeParams {
         /// Chunk size of every transfer (a transaction of the fabric);
         /// `None`: the descriptor's `tile_bytes`.
         burst: Option<u64>,
+        /// Data width in bytes: the engine moves at most one beat per
+        /// cycle, the start of a transfer's narrowing chain (Section 5.4).
+        beat: u64,
     },
     /// A tensor unit.
     Atlas {

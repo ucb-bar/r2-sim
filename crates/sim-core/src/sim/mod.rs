@@ -31,11 +31,11 @@ use crate::profile::{
     Args, Descriptor, NodeConfig, Occupancy, OpcodeId, PeId, Profile, ProfileRegistry,
 };
 use crate::program::{Mailbox, NeutrinoProgram, NuCtx, Request, Response, StartFn, TaskHandle};
-use crate::resource::{Demand, Kind, ResourceId, Resources};
+use crate::resource::{Demand, Dir, Kind, PathHop, ResourceId, Resources};
 use crate::stats::{
     Blocked, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats, WarningRec,
 };
-use crate::time::Cycle;
+use crate::time::{Cycle, Ratio};
 use crate::topology::{AttachId, Attachment, Bus, BusId, BusTopology, Lane, Topology};
 use crate::tracer::{
     ChunkGrant, Collector, CollectorConfig, RouteUse, TaskCall, TaskEntered, Tee, Tracer, Who,
@@ -296,6 +296,8 @@ pub struct Sim {
     msg_latency: u64,
     /// Port rate of each bus; `None`: unlimited.
     bus_rates: Vec<Option<crate::time::Ratio>>,
+    /// Beat of each bus's resources; `None`: one lane.
+    bus_beats: Vec<Option<u64>>,
     /// Cycle of the last task issue or completion.
     last_progress: Cycle,
     /// Idle cycles with continuing replays that stop the run as a retry
@@ -347,6 +349,7 @@ impl Sim {
             msg_bytes: 64,
             msg_latency: 0,
             bus_rates: Vec::new(),
+            bus_beats: Vec::new(),
             last_progress: 0,
             livelock_cycles: None,
             livelock: Cycle::MAX,
@@ -524,6 +527,7 @@ impl Sim {
             BusTopology::Xbar => None,
         };
         self.bus_rates.push(rate);
+        self.bus_beats.push(None);
         self.topo.add_bus(Bus {
             name: name.to_string(),
             topology,
@@ -531,6 +535,21 @@ impl Sim {
             latency,
             control,
         })
+    }
+
+    /// The rate of `bus` (its ports' or its shared lane's); `None`:
+    /// unlimited.
+    pub fn bus_rate(&self, bus: BusId) -> Option<Ratio> {
+        self.bus_rates[bus.0 as usize]
+    }
+
+    /// Splits the resources of `bus` into lanes of `beat` bytes: its shared
+    /// lane, and the ports of the attachments made from now on.
+    pub fn set_bus_beat(&mut self, bus: BusId, beat: u64) {
+        self.bus_beats[bus.0 as usize] = Some(beat);
+        if let Some(r) = self.topo.bus(bus).lane {
+            self.res.set_beat(r, beat);
+        }
     }
 
     /// A bandwidth resource named `name` at `rate`; none when unlimited.
@@ -553,6 +572,11 @@ impl Sim {
             ),
             BusTopology::Shared => (None, None),
         };
+        if let Some(beat) = self.bus_beats[bus.0 as usize] {
+            for r in [ingress, egress].into_iter().flatten() {
+                self.res.set_beat(r, beat);
+            }
+        }
         self.topo.add_attachment(Attachment {
             bus,
             name: full,
@@ -1082,7 +1106,36 @@ impl Sim {
         if self.zero_time {
             return Reserved::at(self.now);
         }
-        let g = match self.res.reserve(demand, earliest) {
+        let g = self.res.reserve(demand, earliest);
+        self.granted(g, earliest, who)
+    }
+
+    /// Reserves a transfer chunk along `path` in route order (Section 5.4,
+    /// data-path rule) for `who`, starting at or after `earliest`, at most
+    /// at the master's `rate`.
+    fn reserve_path(
+        &mut self,
+        path: &[PathHop],
+        rate: Ratio,
+        earliest: Cycle,
+        who: Who,
+    ) -> Reserved {
+        if self.zero_time {
+            return Reserved::at(self.now);
+        }
+        let g = self.res.reserve_path(path, rate, earliest);
+        self.granted(g, earliest, who)
+    }
+
+    /// The reservation of `g` (none: an empty one at `earliest`); the
+    /// tracer gets its charges.
+    fn granted(
+        &mut self,
+        g: Option<crate::resource::Grant>,
+        earliest: Cycle,
+        who: Who,
+    ) -> Reserved {
+        let g = match g {
             Some(g) => Reserved {
                 start: g.start,
                 end: g.end,
@@ -1220,42 +1273,53 @@ impl Sim {
         let Some(mem) = self.memories.iter().find(|m| m.range.covers(&range)) else {
             return self.fatal(nu, None, FatalError::Unowned(range));
         };
-        // Local or remote: the fabric path to the block's node, twice in
-        // latency for a load (request and data), once for a store.
-        let (port, block_latency) = (mem.port, mem.load_latency);
-        let Some(path) = self
-            .topo
-            .best_path(self.topo.data_hub(nu), &mem.attach)
-            .cloned()
-        else {
-            let msg = format!("no data route from {:?} to {}", nu, mem.name);
+        // A transfer in data order (Section 5.4, data-path rule). A load:
+        // the request takes the route to the block and the block latency,
+        // then the data comes back from the port over the return route. A
+        // store: the data takes the route to the block, then the port;
+        // the block latency follows the port.
+        let (port, block_latency, attach) = (mem.port, mem.load_latency, mem.attach.clone());
+        let load = matches!(req, Request::Load { .. });
+        let hub = self.topo.data_hub(nu).to_vec();
+        let (to_block, from_block) = (
+            self.topo.best_path(&hub, &attach).cloned(),
+            self.topo.best_path(&attach, &hub).cloned(),
+        );
+        let (Some(to_block), Some(from_block)) = (to_block, from_block) else {
+            let msg = format!("no data route between {:?} and {}", nu, mem.name);
             return self.fatal(nu, None, FatalError::Invalid(msg));
         };
-        let trips = if matches!(req, Request::Load { .. }) {
-            2
-        } else {
-            1
+        let dir = if load { Dir::Read } else { Dir::Write };
+        let hop = |resource, latency| PathHop {
+            resource,
+            amount: len,
+            dir,
+            latency,
         };
-        let latency = block_latency + trips * path.latency;
-        // A load reads, a store writes.
-        let dir = if trips == 2 {
-            crate::resource::Dir::Read
+        let (path, lead, tail): (Vec<PathHop>, Cycle, Cycle) = if load {
+            let mut p = vec![hop(port, from_block.lead)];
+            p.extend(from_block.hops.iter().map(|h| hop(h.lane, h.latency)));
+            (p, to_block.latency + block_latency, 0)
         } else {
-            crate::resource::Dir::Write
+            let mut p: Vec<PathHop> = to_block
+                .hops
+                .iter()
+                .map(|h| hop(h.lane, h.latency))
+                .collect();
+            p.push(hop(port, 0));
+            (p, to_block.lead, block_latency)
         };
-        let mut demand: Vec<Demand> = path
-            .resources
-            .iter()
-            .map(|r| Demand::new(*r, len, dir))
-            .collect();
-        demand.push(Demand::new(port, len, dir));
-        let earliest = self.now + if self.zero_time { 0 } else { latency };
+        let earliest = self.now + if self.zero_time { 0 } else { lead };
+        let rate = Ratio::int(self.nus[nu.0 as usize].cfg.beat_bytes);
         let pair = self
             .tracer
             .is_some()
             .then(|| self.topo.best_pair(self.topo.data_hub(nu), &mem.attach))
             .flatten();
-        let g = self.reserve(&demand, earliest, Who::Program(nu));
+        let mut g = self.reserve_path(&path, rate, earliest, Who::Program(nu));
+        if !self.zero_time {
+            g.end += tail;
+        }
         if let Some((from, to)) = pair {
             let r = RouteUse {
                 from,
@@ -1812,9 +1876,14 @@ impl Sim {
         let gid = r.gid;
         // The profile lives in the PE; a moved-out demand avoids a borrow of
         // `self.pes` across the reservation.
-        let routes = chunk.routes;
+        let (routes, rate) = (chunk.routes, chunk.rate);
         let demand = std::mem::take(&mut r.profile.chunks[i].demand);
-        let g = self.reserve(&demand, earliest, Who::Task(gid));
+        let path = std::mem::take(&mut r.profile.chunks[i].path);
+        let g = if path.is_empty() {
+            self.reserve(&demand, earliest, Who::Task(gid))
+        } else {
+            self.reserve_path(&path, rate, earliest, Who::Task(gid))
+        };
         if let Some(tr) = self.tracer.as_mut() {
             tr.chunk_grant(&ChunkGrant {
                 gid,

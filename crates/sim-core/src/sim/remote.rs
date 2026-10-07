@@ -45,7 +45,6 @@ use crate::event::{Event, Stage};
 use crate::profile::{Descriptor, OpcodeId};
 use crate::program::{NuCtx, Response, StartFn};
 use crate::program::{Request, TaskHandle};
-use crate::resource::Demand;
 use crate::stats::{FatalError, Stall};
 use crate::time::Cycle;
 use crate::tracer::{TaskCall, Who};
@@ -227,6 +226,10 @@ pub(crate) struct Msg {
     lead: Cycle,
     /// The next hop to take.
     next: usize,
+    /// The sender's beat rate. A message is held whole in each hop stage
+    /// (store and forward), so a hop is not narrowed by the hops before
+    /// it: it moves at the smaller of this rate and its own.
+    rate: crate::time::Ratio,
     /// Part of an `Await` retry (does not count as progress).
     retry: bool,
     /// Ticket flow: a replay that carries the ticket.
@@ -369,6 +372,7 @@ impl Sim {
             hops,
             lead,
             next: 0,
+            rate: crate::time::Ratio::int(self.nus[from.0 as usize].cfg.beat_bytes),
             retry,
             ticketed: false,
             seq: 0,
@@ -446,9 +450,14 @@ impl Sim {
                     bytes,
                 };
                 // A message is a write toward its receiver.
-                let end = self
-                    .reserve(&[Demand::write(hop.lane, bytes)], earliest, who)
-                    .end;
+                let rate = self.msgs[id as usize].as_ref().expect("message").rate;
+                let hop_path = [crate::resource::PathHop {
+                    resource: hop.lane,
+                    amount: bytes,
+                    dir: crate::resource::Dir::Write,
+                    latency: 0,
+                }];
+                let end = self.reserve_path(&hop_path, rate, earliest, who).end;
                 self.msgs[id as usize].as_mut().expect("message").next += 1;
                 self.queue.push(end, Event::StageFree { stage: s });
                 self.queue

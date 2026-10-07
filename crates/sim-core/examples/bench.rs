@@ -98,6 +98,8 @@ fn main() {
                     latency: 50,
                     masters: Vec::new(),
                     burst: None,
+                    // Wide enough not to narrow the paths.
+                    beat: 1024,
                 },
             },
         );

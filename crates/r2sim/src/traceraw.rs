@@ -1584,6 +1584,10 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             json!({
                 "id": i, "name": r.name, "kind": format!("{:?}", r.kind),
                 "rate": res.flow_rate(id).map_or(Value::Null, ratio),
+                // Lanes: a flow resource has them (1 without a beat); an
+                // occupancy resource has none.
+                "lanes": res.flow_rate(id).map(|_| res.flow(id).lanes()),
+                "beat_bytes": res.flow_rate(id).and_then(|_| res.flow(id).beat()),
                 "owner": owner_of(&r.name, &nodes),
                 "role": role[i].clone().unwrap_or(json!({"type": "other"})),
             })
@@ -1618,6 +1622,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         };
         res_rows.push(json!({
             "id": id, "name": name, "kind": "Bandwidth", "rate": null,
+            "lanes": null, "beat_bytes": null,
             "owner": owner_of(&name, &nodes), "role": role,
         }));
     }
@@ -1632,7 +1637,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
     json!({
         "format": "r2raw",
-        "version": [1, 0],
+        "version": [1, 1],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

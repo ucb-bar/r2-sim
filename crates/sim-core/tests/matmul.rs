@@ -32,16 +32,19 @@ fn matmul_end_to_end() {
     // Hand computation. Scalar: invoke A [0,8), invoke B [8,16),
     // invoke C [16,24), wait [24,26).
     let (ta, tb, tc) = (&s.tasks[0], &s.tasks[1], &s.tasks[2]);
-    // DMA A: issue 8, latency 100, 8 KiB on dram (128), link (256), smem
-    // (64): D = 256, culprit link.
+    // DMA A: issue 8, latency 100; hops in route order from 108: dram port
+    // (64 B/cycle) [108, 236), link (32) [108, 364), smem port narrowed to
+    // the link's 32 [108, 364); culprit link (the first longest window).
     assert_eq!((ta.invoke, ta.issue), (8, Some(8)));
     assert_eq!((ta.chunks[0].start, ta.chunks[0].end), (108, 364));
     assert_eq!(ta.chunks[0].culprit, Some(n.link));
     // c_complete [364, 368).
     assert_eq!(ta.complete, Some(368));
-    // DMA B: issue 16, earliest 116, link busy until 364.
+    // DMA B: issue 16, earliest 116: dram port busy until 236, [236, 364);
+    // the link is busy until 364, [364, 620), and the smem port [364, 620).
+    // The chunk starts at its first hop.
     assert_eq!(tb.issue, Some(16));
-    assert_eq!((tb.chunks[0].start, tb.chunks[0].end), (364, 620));
+    assert_eq!((tb.chunks[0].start, tb.chunks[0].end), (236, 620));
     assert_eq!(tb.complete, Some(624));
     // Matmul: ready at B's completion. 64^3 MAC / 4096 = 64 cycles on the
     // array. On smem: operands (64*64 + 64*64) * 2 B plus the C writeback

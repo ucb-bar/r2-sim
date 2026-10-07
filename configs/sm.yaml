@@ -40,6 +40,8 @@ compute:
   - {name: atlas, type: tensor, rate: {bf16: 16384, fp8: 16384, mxfp4: 16384},
      quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 256}, overhead: 50, master: [$this.lbus, $this.smsbus]}
-  - {name: dma, type: dma, latency: 100, inflight: 4, outstanding: 4, master: [$this.lbus, $this.smsbus]}
+  # DMA beat 256 B: sized to the SMEM port it serves (its buses are
+  # unlimited), so one transfer can fill the port.
+  - {name: dma, type: dma, latency: 100, inflight: 4, outstanding: 4, beat_bytes: 256, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
            c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}
