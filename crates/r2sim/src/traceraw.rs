@@ -1,6 +1,6 @@
 //! The raw trace dump for the r2-vis converter (`--trace-raw DIR`).
 //!
-//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.0.
+//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.3.
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -21,6 +21,10 @@
 //! * a dependency on a pending entry (no producer yet) waits for the next
 //!   invoke that writes its key.
 //!
+//! Table entries (`entries.bin`) are kept open until they leave their
+//! table; an outbound invoke entry waits for its task's invoke at the
+//! owner, which gives its gid.
+//!
 //! Unlimited links (lanes without a resource) get ids after the real
 //! resources and records synthesized from the granted interval of the
 //! chunk, load, store or message hop that uses them (at least 1 cycle).
@@ -34,9 +38,11 @@ use std::rc::Rc;
 
 use nu_model::{Dep, NeutrinoId};
 use serde_json::{json, Value};
+use sim_core::tracer as tr;
 use sim_core::{
     AttachId, Built, BusTopology, Charge, ChunkGrant, Component, Cycle, Dir, Link, PeParams,
-    ResourceId, Role, RouteUse, Sim, Stats, TaskEntered, Topology, Tracer, Who, MESSAGE_KINDS,
+    ResourceId, Role, RouteUse, Sim, Stats, Table, TableEntry, TaskEntered, Topology, Tracer, Who,
+    MESSAGE_KINDS,
 };
 
 const BUF: usize = 1 << 20;
@@ -109,18 +115,32 @@ const MARKS: &[(&str, &str)] = &[
     ("nu", "u16"),
     ("pad", "u16"),
 ];
+const ENTRIES: &[(&str, &str)] = &[
+    ("start", "u64"),
+    ("end", "u64"),
+    ("base", "u64"),
+    ("len", "u64"),
+    ("gid", "u32"),
+    ("version", "u32"),
+    ("nu", "u16"),
+    ("peer", "u16"),
+    ("table", "u8"),
+    ("flags", "u8"),
+    ("pad", "u16"),
+];
 
 /// A record layout: (field, type) in file order.
 type Layout = &'static [(&'static str, &'static str)];
 
 /// The record types: file stem, layout and record size.
-pub const RECORDS: [(&str, Layout, usize); 6] = [
+pub const RECORDS: [(&str, Layout, usize); 7] = [
     ("tasks", TASKS, 104),
     ("chunks", CHUNKS, 32),
     ("deps", DEPS, 24),
     ("charges", CHARGES, 32),
     ("programs", PROGRAMS, 32),
     ("marks", MARKS, 16),
+    ("entries", ENTRIES, 48),
 ];
 const T_TASKS: usize = 0;
 const T_CHUNKS: usize = 1;
@@ -128,6 +148,7 @@ const T_DEPS: usize = 2;
 const T_CHARGES: usize = 3;
 const T_PROGRAMS: usize = 4;
 const T_MARKS: usize = 5;
+const T_ENTRIES: usize = 6;
 
 /// One record being encoded: little-endian fields in layout order.
 struct Rec<const N: usize> {
@@ -298,8 +319,8 @@ impl Sink {
 
 /// The record types of [`Filter::records`]: the files, and `messages`
 /// (the protocol message records of `charges.bin`).
-pub const RECORD_TYPES: [&str; 7] = [
-    "tasks", "chunks", "deps", "charges", "messages", "programs", "marks",
+pub const RECORD_TYPES: [&str; 8] = [
+    "tasks", "chunks", "deps", "charges", "messages", "programs", "marks", "entries",
 ];
 
 /// Which records the dump keeps (architecture Section 7.3, trace-raw.md
@@ -419,7 +440,7 @@ pub struct RunInfo {
 #[derive(Debug, Default)]
 pub struct Outcome {
     /// Records written per record type (order of [`RECORDS`]).
-    pub counts: [u64; 6],
+    pub counts: [u64; 7],
     /// The first write error.
     pub error: Option<String>,
 }
@@ -468,13 +489,28 @@ struct OpenDep {
 const REMOTE: u8 = 1;
 const VERSIONED: u8 = 2;
 
+/// An open table entry (written when it leaves or at the end).
+#[derive(Debug, Clone, Copy)]
+struct OpenEntry {
+    start: Cycle,
+    base: u64,
+    len: u64,
+    version: Option<u64>,
+    gid: Option<u64>,
+    peer: Option<NeutrinoId>,
+    flags: u8,
+}
+
+/// A table entry's key: (Neutrino, table, id).
+type EntryKey = (u32, u8, u64);
+
 /// The raw trace writer.
 pub struct RawTracer {
-    files: [Option<Sink>; 6],
+    files: [Option<Sink>; 7],
     strings: BufWriter<File>,
     string_ids: HashMap<String, u32>,
     out: Rc<RefCell<Outcome>>,
-    counts: [u64; 6],
+    counts: [u64; 7],
     error: Option<std::io::Error>,
     /// Real resources; unlimited links have ids from here on.
     unlimited: HashMap<Link, u16>,
@@ -506,6 +542,12 @@ pub struct RawTracer {
     last_remote: Vec<u32>,
     /// Running programs by Neutrino: (name, spawn, start).
     programs: IdMap<u32, Program>,
+    /// Open table entries.
+    entries: IdMap<EntryKey, OpenEntry>,
+    /// Outbound invoke entries that left before their task's invoke at
+    /// the owner (which gives their gid), with their end.
+    unnamed: IdMap<(u32, u64), (OpenEntry, Cycle)>,
+    entries_on: bool,
     /// Filters: kept Neutrinos (subtree), kept resources (by owner, the
     /// unlimited links included), the window and the charge kinds.
     keep_nu: Vec<bool>,
@@ -621,7 +663,7 @@ impl RawTracer {
             .collect();
         let text = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
         std::fs::write(o.dir.join("manifest.json"), text).map_err(ctx)?;
-        let mut files: [Option<Sink>; 6] = Default::default();
+        let mut files: [Option<Sink>; 7] = Default::default();
         let (charges, messages) = (f.keeps("charges"), f.keeps("messages"));
         for (i, (stem, _, _)) in RECORDS.iter().enumerate() {
             let on = f.keeps(stem) || (i == T_CHARGES && messages);
@@ -640,7 +682,7 @@ impl RawTracer {
             strings,
             string_ids: HashMap::new(),
             out: out.clone(),
-            counts: [0; 6],
+            counts: [0; 7],
             error: None,
             unlimited,
             topo: topo.links_only(),
@@ -660,6 +702,9 @@ impl RawTracer {
             remote: IdMap::default(),
             last_remote: Vec::new(),
             programs: IdMap::default(),
+            entries: IdMap::default(),
+            unnamed: IdMap::default(),
+            entries_on: f.keeps("entries"),
             keep_nu,
             keep_res,
             lo: f.window.map_or(0, |w| w.0),
@@ -808,6 +853,36 @@ impl RawTracer {
             .u64(start)
             .u64(o64(end));
         self.emit(T_PROGRAMS, r.done());
+    }
+
+    fn write_entry(&mut self, (nu, table, _): EntryKey, e: &OpenEntry, end: Option<Cycle>) {
+        if !(self.keep_nu[nu as usize] && self.in_window(e.start, end.unwrap_or(Cycle::MAX))) {
+            return;
+        }
+        let mut r = Rec::<48>::new();
+        r.u64(e.start)
+            .u64(o64(end))
+            .u64(e.base)
+            .u64(e.len)
+            .u32(o32(e.gid.map(|g| g as u32)))
+            .u32(o32(e.version.map(|v| v as u32)))
+            .u16(nu as u16)
+            .u16(o16(e.peer.map(|p| p.0 as u16)))
+            .u8(table)
+            .u8(e.flags)
+            .u16(0);
+        self.emit(T_ENTRIES, r.done());
+    }
+
+    /// Entry `k` left at `end`: written, or kept until its gid is known
+    /// (an outbound invoke whose task has not entered its owner yet).
+    fn close_entry(&mut self, k: EntryKey, e: OpenEntry, end: Cycle) {
+        let invoke = k.1 == Table::OutboundInvokes as u8 && e.flags & tr::INVOKE_VRESET == 0;
+        if invoke && e.gid.is_none() {
+            self.unnamed.insert((k.0, k.2), (e, end));
+        } else {
+            self.write_entry(k, &e, Some(end));
+        }
     }
 
     // ---- links ----
@@ -1010,6 +1085,15 @@ impl Tracer for RawTracer {
             parked: NONE,
         };
         self.tasks.insert(e.gid, open);
+        if self.entries_on && e.call.seq != 0 {
+            let k = (e.call.src.0, Table::OutboundInvokes as u8, e.call.seq);
+            if let Some(o) = self.entries.get_mut(&k) {
+                o.gid = Some(e.gid);
+            } else if let Some((mut o, end)) = self.unnamed.remove(&(k.0, k.2)) {
+                o.gid = Some(e.gid);
+                self.write_entry(k, &o, Some(end));
+            }
+        }
         // This task as a producer.
         let vkey = e.version.map(|v| (d.dst.base, v));
         match vkey {
@@ -1230,6 +1314,68 @@ impl Tracer for RawTracer {
         }
     }
 
+    fn entry_open(&mut self, e: &TableEntry, time: Cycle) {
+        if !self.entries_on {
+            return;
+        }
+        let k = (e.nu.0, e.table as u8, e.id);
+        match self.entries.get_mut(&k) {
+            Some(o) => {
+                if e.version.is_some() {
+                    o.version = e.version;
+                }
+                if o.len == 0 {
+                    o.len = e.len;
+                }
+                o.flags |= e.flags;
+            }
+            None => {
+                let o = OpenEntry {
+                    start: time,
+                    base: e.base,
+                    len: e.len,
+                    version: e.version,
+                    gid: e.gid,
+                    peer: e.peer,
+                    flags: e.flags,
+                };
+                self.entries.insert(k, o);
+            }
+        }
+    }
+
+    fn entry_close(&mut self, e: &TableEntry, time: Cycle) {
+        if !self.entries_on {
+            return;
+        }
+        let k = (e.nu.0, e.table as u8, e.id);
+        let Some(mut o) = self.entries.remove(&k) else {
+            return;
+        };
+        o.version = e.version.or(o.version);
+        o.gid = e.gid.or(o.gid);
+        o.peer = e.peer.or(o.peer);
+        o.flags |= e.flags;
+        self.close_entry(k, o, time);
+    }
+
+    fn entries_clear(&mut self, nu: NeutrinoId, table: Table, time: Cycle) {
+        if !self.entries_on {
+            return;
+        }
+        let mut gone: Vec<(EntryKey, OpenEntry)> = self
+            .entries
+            .iter()
+            .filter(|(k, _)| k.0 == nu.0 && k.1 == table as u8)
+            .map(|(k, o)| (*k, *o))
+            .collect();
+        gone.sort_by_key(|g| g.0);
+        for (k, o) in gone {
+            self.entries.remove(&k);
+            self.close_entry(k, o, time);
+        }
+    }
+
     fn program_start(&mut self, nu: NeutrinoId, name: &'static str, spawn: Option<u64>, t: Cycle) {
         let id = self.string(name);
         self.programs.insert(nu.0, (id, spawn, t));
@@ -1297,6 +1443,18 @@ impl Tracer for RawTracer {
             if self.keep_nu[nu as usize] && self.in_window(p.2, Cycle::MAX) {
                 self.write_program(nu, p, None);
             }
+        }
+        // Entries still in their tables, and outbound invokes whose task
+        // never entered its owner.
+        let mut open: Vec<(EntryKey, OpenEntry)> = self.entries.drain().collect();
+        open.sort_by_key(|e| (e.1.start, e.0));
+        for (k, o) in open {
+            self.write_entry(k, &o, None);
+        }
+        let mut unnamed: Vec<_> = self.unnamed.drain().collect();
+        unnamed.sort_by_key(|u| u.0);
+        for ((nu, seq), (o, end)) in unnamed {
+            self.write_entry((nu, Table::OutboundInvokes as u8, seq), &o, Some(end));
         }
         let mut err = self.error.take();
         if let Err(e) = self.strings.flush() {
@@ -1640,7 +1798,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
     json!({
         "format": "r2raw",
-        "version": [1, 2],
+        "version": [1, 3],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

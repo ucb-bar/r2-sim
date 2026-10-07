@@ -1459,6 +1459,7 @@ impl Builder {
                         rates,
                         smem_port,
                         utilization: utilization()?,
+                        masters: atts.clone(),
                     }
                 }
                 "vector" => {

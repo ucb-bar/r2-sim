@@ -1,6 +1,6 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.2). The checks are the
+The format is r2-vis's `trace-raw.md` (version 1.3). The checks are the
 ones of its Section 8, plus the file layout:
 
 * the manifest's record layouts have the record sizes of the format, every
@@ -11,6 +11,12 @@ ones of its Section 8, plus the file layout:
   cycles / span lanes over [start, start + span)) are at most its `lanes`
   (one for a 1.0 dump); per resource the cycles (lane-cycles) sum to
   `busy_cycles` of the `--stats` JSON (with `--stats`);
+* entries (version 1.3): end >= start; per Neutrino and table the open
+  entries at any cycle are at most the table's capacity in the manifest;
+  in a complete dump every gid has a task record, a pending entry that
+  left has the gid of its adopting task, an inbound invoke entry ends at
+  its task's invoke and an outbound one (not a VersionReset) starts at
+  its task's `queued`;
 * every resource id in the records is in the manifest, every link of the
   topology tables has a resource, and records on unlimited links have
   span = cycles >= 1;
@@ -34,7 +40,14 @@ from pathlib import Path
 
 import numpy as np
 
-SIZES = {"tasks": 104, "chunks": 32, "deps": 24, "charges": 32, "programs": 32, "marks": 16}
+SIZES = {"tasks": 104, "chunks": 32, "deps": 24, "charges": 32, "programs": 32, "marks": 16,
+         "entries": 48}
+# The record types added after version 1.0: (stem, version).
+SINCE = {"entries": [1, 3]}
+TABLES = ["pending", "versions", "inbound_refs", "inbound_invokes", "outbound_deps",
+          "outbound_invokes"]
+NULL64 = 0xFFFFFFFFFFFFFFFF
+VRESET = 1
 TYPES = {"u8": "<u1", "u16": "<u2", "u32": "<u4", "u64": "<u8"}
 NULL32 = 0xFFFFFFFF
 
@@ -98,6 +111,8 @@ class Report:
 def check_layouts(r: Report, manifest: dict, recs: dict, summary: dict | None) -> None:
     for stem, size in SIZES.items():
         layout = manifest["records"].get(stem)
+        if layout is None and manifest["version"] < SINCE.get(stem, [1, 0]):
+            continue
         got = sum(np.dtype(TYPES[t]).itemsize for _, t in layout) if layout else None
         r.check(got == size, f"{stem} layout is {got} B (format: {size} B)")
     if summary is not None:
@@ -175,6 +190,60 @@ def check_charges(r: Report, manifest: dict, recs: dict, stats: dict | None) -> 
         r.check(not bad, f"per-resource cycles equal busy_cycles ({len(bad)} differ)")
         for b in bad[:5]:
             print(f"      {b[0]}: charges {b[1]}, stats {b[2]}")
+
+
+def check_entries(r: Report, manifest: dict, recs: dict) -> None:
+    e = recs.get("entries")
+    if e is None:
+        print("skip  entries (not recorded)")
+        return
+    closed = e["end"] != NULL64
+    r.check(bool((e["end"][closed] >= e["start"][closed]).all()),
+            f"{len(e)} entries: end >= start")
+    # Occupancy per (Neutrino, table): an end before a start at one cycle.
+    cap = np.array([[n["neutrino"][t] if n.get("neutrino") else 0 for t in TABLES]
+                    for n in manifest["nodes"]], dtype=np.int64)
+    key = e["nu"].astype(np.int64) * len(TABLES) + e["table"].astype(np.int64)
+    t = np.concatenate([e["start"], e["end"][closed]])
+    d = np.concatenate([np.ones(len(e), np.int64), -np.ones(int(closed.sum()), np.int64)])
+    k = np.concatenate([key, key[closed]])
+    order = np.lexsort((d, t, k))
+    t, d, k = t[order], d[order], k[order]
+    level = np.cumsum(d)
+    first = np.r_[True, k[1:] != k[:-1]]
+    base = np.maximum.accumulate(np.where(first, np.arange(len(k)), 0))
+    level = level - np.r_[0, level][base]
+    over = level > cap.reshape(-1)[k]
+    for i, name in enumerate(TABLES):
+        sel = k % len(TABLES) == i
+        n = int(np.count_nonzero(over & sel))
+        peak = int(level[sel].max()) if sel.any() else 0
+        r.check(n == 0, f"entries {name}: {int(np.count_nonzero(e['table'] == i))} records, "
+                f"peak {peak}, {n} cycles over capacity")
+        if n:
+            j = int(np.flatnonzero(over & sel)[0])
+            print(f"      first: node {k[j] // len(TABLES)} at {t[j]}: {level[j]}")
+    if manifest["filters"]["partial"]:
+        print("skip  entries against tasks (partial dump)")
+        return
+    tasks = recs["tasks"]
+    order = np.argsort(tasks["gid"])
+    gids = tasks["gid"][order]
+    named = e["gid"] != NULL32
+    pos = np.minimum(np.searchsorted(gids, e["gid"]), len(gids) - 1)
+    found = gids[pos] == e["gid"]
+    r.check(bool(found[named].all()),
+            f"entries.gid: {int(np.count_nonzero(named & ~found))} gids without a task record")
+    task = tasks[order][pos]
+    p = (e["table"] == 0) & closed
+    r.check(bool(named[p].all()), f"pending: {int(np.count_nonzero(p & ~named))} "
+            "entries that left without an adopting task")
+    i = (e["table"] == 3) & closed & named & found
+    r.check(bool((e["end"][i] == task["invoke"][i]).all()),
+            f"inbound_invokes: {int(np.count_nonzero(i))} end at their task's invoke")
+    o = (e["table"] == 5) & (e["flags"] & VRESET == 0) & named & found
+    r.check(bool((e["start"][o] == task["queued"][o]).all()),
+            f"outbound_invokes: {int(np.count_nonzero(o))} start at their task's queued")
 
 
 def check_links(r: Report, manifest: dict) -> None:
@@ -258,6 +327,9 @@ def kept(manifest: dict, full: dict) -> dict[str, np.ndarray]:
         m = full["marks"]
         nu_ok = np.where(m["nu"] == 0xFFFF, True, keep_nu[np.minimum(m["nu"], len(paths) - 1)])
         out["marks"] = m[nu_ok & overlaps(m["time"], m["time"], lo, hi)]
+    if want("entries") and "entries" in full:
+        e = full["entries"]
+        out["entries"] = e[keep_nu[e["nu"]] & overlaps(e["start"], e["end"], lo, hi)]
     return out
 
 
@@ -290,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     check_layouts(r, manifest, recs, summary)
     check_gids(r, manifest, recs)
     check_charges(r, manifest, recs, stats)
+    check_entries(r, manifest, recs)
     check_links(r, manifest)
     if a.reference:
         check_reference(r, a.dump, manifest, recs, a.reference)

@@ -30,7 +30,88 @@ pub struct TaskCall {
     /// A forwarded invoke: the cycle the Invoke message left the outbound
     /// invoke table onto the channel.
     pub sent: Option<Cycle>,
+    /// A forwarded invoke: its outbound invoke entry at `src` (the
+    /// [`TableEntry::id`] of its [`Table::OutboundInvokes`] entry); 0 for
+    /// a local invoke.
+    pub seq: u64,
 }
+
+/// A Neutrino table whose entries a tracer can follow. The scoreboard and
+/// the execution table follow from the task hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Table {
+    /// Keys named before their producer's invoke.
+    Pending = 0,
+    /// The version table: one entry per versioned base address.
+    Versions = 1,
+    /// Owner side: remote `Await`s registered on keys not yet done.
+    InboundRefs = 2,
+    /// Owner side: forwarded invokes waiting to enter the scoreboard.
+    InboundInvokes = 3,
+    /// Requester side: open remote dependency requests.
+    OutboundDeps = 4,
+    /// Requester side: forwarded invokes and `VersionReset`s not yet out
+    /// of the outbound invoke table.
+    OutboundInvokes = 5,
+}
+
+/// One entry of a [`Table`] (trace-raw.md Section 4.7 gives the meaning of
+/// every field per table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableEntry {
+    /// The Neutrino whose table holds the entry.
+    pub nu: NeutrinoId,
+    pub table: Table,
+    /// Unique among the open entries of (`nu`, `table`).
+    pub id: u64,
+    /// The key's address or the range base.
+    pub base: u64,
+    /// The range length; 0 for a key.
+    pub len: u64,
+    pub version: Option<u64>,
+    pub gid: Option<u64>,
+    /// The other Neutrino.
+    pub peer: Option<NeutrinoId>,
+    pub flags: u8,
+}
+
+impl TableEntry {
+    /// Entry `id` of `table` of `nu` with no field set.
+    pub fn new(nu: NeutrinoId, table: Table, id: u64) -> Self {
+        Self {
+            nu,
+            table,
+            id,
+            base: 0,
+            len: 0,
+            version: None,
+            gid: None,
+            peer: None,
+            flags: 0,
+        }
+    }
+
+    /// With the address and version of `key`.
+    pub fn key(self, key: Dep) -> Self {
+        Self {
+            base: key.addr(),
+            version: key.version(),
+            ..self
+        }
+    }
+}
+
+/// [`Table::Pending`] flags: the lookup that created the entry.
+pub const PENDING_WAIT: u8 = 1;
+pub const PENDING_AWAIT: u8 = 2;
+/// [`Table::Versions`] flag: `nu.version` created the entry.
+pub const VERSION_SET: u8 = 1;
+/// [`Table::OutboundDeps`] flags.
+pub const DEP_REGISTERED: u8 = 1;
+pub const DEP_REJECTED: u8 = 2;
+/// [`Table::OutboundInvokes`] flags.
+pub const INVOKE_VRESET: u8 = 1;
+pub const INVOKE_REPLAYED: u8 = 2;
 
 /// A task that entered its owner's tables.
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +228,17 @@ pub trait Tracer {
     /// The remote request `req` of `nu` was satisfied (AwaitAck done or
     /// Resolve).
     fn dep_remote_done(&mut self, nu: NeutrinoId, req: u32, time: Cycle) {}
+    /// Entry `e` entered its table at `time`. For an entry that is already
+    /// open this is an update: a `version` replaces the entry's, a `len`
+    /// fills a zero one, and `flags` are added.
+    fn entry_open(&mut self, e: &TableEntry, time: Cycle) {}
+    /// Entry `e` left its table at `time` (which can be later than now: an
+    /// outbound invoke frees at the end of its transmission). A set
+    /// `version`, `gid` or `peer` replaces the open entry's; `flags` are
+    /// added. An `id` that is not open is ignored.
+    fn entry_close(&mut self, e: &TableEntry, time: Cycle) {}
+    /// Every entry of `table` of `nu` left at `time`.
+    fn entries_clear(&mut self, nu: NeutrinoId, table: Table, time: Cycle) {}
     /// A program started on `nu`; `spawn` is the parent's spawn task.
     fn program_start(
         &mut self,
@@ -222,6 +314,17 @@ impl Tracer for Tee {
         self.0
             .iter_mut()
             .for_each(|t| t.dep_remote_done(nu, req, time));
+    }
+    fn entry_open(&mut self, e: &TableEntry, time: Cycle) {
+        self.0.iter_mut().for_each(|t| t.entry_open(e, time));
+    }
+    fn entry_close(&mut self, e: &TableEntry, time: Cycle) {
+        self.0.iter_mut().for_each(|t| t.entry_close(e, time));
+    }
+    fn entries_clear(&mut self, nu: NeutrinoId, table: Table, time: Cycle) {
+        self.0
+            .iter_mut()
+            .for_each(|t| t.entries_clear(nu, table, time));
     }
     fn program_start(
         &mut self,

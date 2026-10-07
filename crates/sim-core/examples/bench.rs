@@ -110,6 +110,7 @@ fn main() {
                 max_inflight: 1,
                 max_outstanding: 1,
                 params: PeParams::Atlas {
+                    masters: Vec::new(),
                     rates: Vec::new(),
                     row_panel: false,
                     acc_buffer: 0,

@@ -38,7 +38,8 @@ use crate::stats::{
 use crate::time::{Cycle, Ratio};
 use crate::topology::{AttachId, Attachment, Bus, BusId, BusTopology, Lane, Topology};
 use crate::tracer::{
-    ChunkGrant, Collector, CollectorConfig, RouteUse, TaskCall, TaskEntered, Tee, Tracer, Who,
+    ChunkGrant, Collector, CollectorConfig, RouteUse, Table, TableEntry, TaskCall, TaskEntered,
+    Tee, Tracer, Who,
 };
 use crate::writers::LastWriters;
 use remote::Msg;
@@ -818,6 +819,7 @@ impl Sim {
         n.prog_name = name;
         n.state = ProgState::Busy;
         let now = self.now;
+        trace!(self, t => t.entries_clear(nu, Table::Versions, now));
         trace!(self, t => t.program_start(nu, name, None, now));
         self.queue.push(self.now, Event::NuResume(nu));
     }
@@ -1182,6 +1184,7 @@ impl Sim {
                 }
                 match self.nus[nu.0 as usize].tables.wait(key) {
                     Ok((status, fx)) => {
+                        self.trace_pending(nu, &fx, crate::tracer::PENDING_WAIT, None);
                         self.effects(nu, None, fx);
                         match status {
                             WaitStatus::Done => self.respond(nu, Response::Done),
@@ -1198,12 +1201,23 @@ impl Sim {
                     return self.fatal(nu, None, e);
                 }
                 match self.nus[nu.0 as usize].tables.set_version(addr, v) {
-                    Ok(()) => self.respond(nu, Response::Done),
+                    Ok(()) => {
+                        let now = self.now;
+                        trace!(self, t => t.entry_open(&TableEntry {
+                            base: addr,
+                            version: Some(v),
+                            flags: crate::tracer::VERSION_SET,
+                            ..TableEntry::new(nu, Table::Versions, addr)
+                        }, now));
+                        self.respond(nu, Response::Done)
+                    }
                     Err(e) => self.fatal(nu, None, FatalError::Dep(e)),
                 }
             }
             Request::VersionReset => {
                 self.nus[nu.0 as usize].tables.vreset_all();
+                let now = self.now;
+                trace!(self, t => t.entries_clear(nu, Table::Versions, now));
                 self.respond(nu, Response::Done);
             }
             Request::VReset(addr) => {
@@ -1218,6 +1232,8 @@ impl Sim {
                     Some(_) => {}
                 }
                 self.nus[nu.0 as usize].tables.vreset(addr);
+                let now = self.now;
+                trace!(self, t => t.entry_close(&TableEntry::new(nu, Table::Versions, addr), now));
                 // A version table entry freed: forwarded invokes that wait
                 // for one can enter.
                 self.unstall(nu);
@@ -1467,6 +1483,7 @@ impl Sim {
                 call: self.nus[nu.0 as usize].op_call,
                 queued: None,
                 sent: None,
+                seq: 0,
             },
             Entry::Inbound(call) => call,
         };
@@ -1566,6 +1583,9 @@ impl Sim {
             remote_deps,
         }));
         let dst = desc.dst;
+        if self.tracer.is_some() {
+            self.trace_invoke_entries(nu, gid, dst, inv.version, &inv.effects);
+        }
         let n = &mut self.nus[nu.0 as usize];
         let slot = inv.task.0 as usize;
         if n.tasks.len() <= slot {
@@ -1595,6 +1615,65 @@ impl Sim {
             version: inv.version,
             ready: inv.ready,
         })
+    }
+
+    /// The tracer's view of an invoke's table changes: the pending entries
+    /// it created and adopted, and its version table entry.
+    fn trace_invoke_entries(
+        &mut self,
+        nu: NeutrinoId,
+        gid: u64,
+        dst: Range,
+        version: Option<u64>,
+        fx: &Effects,
+    ) {
+        self.trace_pending(nu, fx, 0, None);
+        let now = self.now;
+        let Some(t) = self.tracer.as_mut() else {
+            return;
+        };
+        for p in &fx.adopted {
+            let e = TableEntry {
+                gid: Some(gid),
+                ..TableEntry::new(nu, Table::Pending, p.0 as u64)
+            };
+            t.entry_close(&e, now);
+        }
+        if let Some(v) = version {
+            t.entry_open(
+                &TableEntry {
+                    base: dst.base,
+                    len: dst.len(),
+                    version: Some(v),
+                    gid: Some(gid),
+                    ..TableEntry::new(nu, Table::Versions, dst.base)
+                },
+                now,
+            );
+        }
+    }
+
+    /// The tracer's view of the pending entries a lookup created: `flags`
+    /// names the lookup, `peer` a remote requester.
+    pub(super) fn trace_pending(
+        &mut self,
+        nu: NeutrinoId,
+        fx: &Effects,
+        flags: u8,
+        peer: Option<NeutrinoId>,
+    ) {
+        let now = self.now;
+        let Some(t) = self.tracer.as_mut() else {
+            return;
+        };
+        for &(p, key) in &fx.pending_created {
+            let e = TableEntry {
+                peer,
+                flags,
+                ..TableEntry::new(nu, Table::Pending, p.0 as u64).key(key)
+            };
+            t.entry_open(&e, now);
+        }
     }
 
     /// A full scoreboard stalls the request. Everything else stops the run,
@@ -1677,6 +1756,9 @@ impl Sim {
             }
         }
         for w in fx.resolves {
+            let now = self.now;
+            let id = remote::ref_id(w.requester, w.request);
+            trace!(self, t => t.entry_close(&TableEntry::new(nu, Table::InboundRefs, id), now));
             self.send(nu, w.requester, remote::MsgKind::Resolve { req: w.request });
         }
         let resolve = self.nus[nu.0 as usize].cfg.costs.resolve;

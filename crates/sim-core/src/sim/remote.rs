@@ -47,7 +47,17 @@ use crate::program::{NuCtx, Response, StartFn};
 use crate::program::{Request, TaskHandle};
 use crate::stats::{FatalError, Stall};
 use crate::time::Cycle;
-use crate::tracer::{TaskCall, Who};
+use crate::tracer::{self as tr, Table, TableEntry, TaskCall, Who};
+
+/// The id of the inbound ref of request `request` of `requester`.
+pub(super) fn ref_id(requester: NeutrinoId, request: RequestId) -> u64 {
+    (requester.0 as u64) << 32 | request.0 as u64
+}
+
+/// The id of the inbound invoke entry of outbound entry `seq` of `src`.
+fn inbound_id(src: NeutrinoId, seq: u64) -> u64 {
+    (src.0 as u64) << 40 | seq
+}
 
 /// Most beats of one message.
 pub(crate) const MAX_BEATS: u64 = 4;
@@ -171,8 +181,9 @@ pub(crate) struct Tickets {
     /// Requesters whose bit is set, with their requests not yet accepted
     /// (the one answered `RetryAck` and the rejected ones).
     held: std::collections::BTreeMap<u32, u32>,
-    /// Requesters with a grant (or its resend) in flight.
-    granted: std::collections::BTreeSet<u32>,
+    /// Requesters with a grant (or its resend) in flight, and when their
+    /// entry was reserved.
+    granted: std::collections::BTreeMap<u32, Cycle>,
     /// The requester granted last (round-robin).
     last: u32,
     /// The most bits set at once.
@@ -234,8 +245,11 @@ pub(crate) struct Msg {
     retry: bool,
     /// Ticket flow: a replay that carries the ticket.
     ticketed: bool,
-    /// Ticket flow: the request's sequence number at its requester.
+    /// A request of the invoke channel: its outbound invoke entry at its
+    /// requester (a sequence number).
     seq: u64,
+    /// An invoke: when the owner reserved its inbound invoke entry.
+    reserved: Option<Cycle>,
 }
 
 /// One stage of a channel.
@@ -376,6 +390,7 @@ impl Sim {
             retry,
             ticketed: false,
             seq: 0,
+            reserved: None,
         };
         let id = match self.msg_free.pop() {
             Some(i) => {
@@ -458,6 +473,7 @@ impl Sim {
                     latency: 0,
                 }];
                 let end = self.reserve_path(&hop_path, rate, earliest, who).end;
+                self.close_outbound(s, id, end);
                 self.msgs[id as usize].as_mut().expect("message").next += 1;
                 self.queue.push(end, Event::StageFree { stage: s });
                 self.queue
@@ -480,7 +496,10 @@ impl Sim {
                         return self.block_inbound(s, to);
                     }
                     self.nus[to.0 as usize].inbound_reserved += 1;
+                    let now = self.now;
+                    self.msgs[id as usize].as_mut().expect("message").reserved = Some(now);
                 }
+                self.close_outbound(s, id, self.now);
                 self.leave(s);
                 self.sent_from_source(s, id);
                 let q = self.stages.get_mut(&s).expect("stage");
@@ -601,7 +620,7 @@ impl Sim {
     }
 
     pub(super) fn msg_arrive(&mut self, id: u32) {
-        let msg = self.msgs[id as usize].take().expect("message in flight");
+        let mut msg = self.msgs[id as usize].take().expect("message in flight");
         self.msg_free.push(id);
         let (from, to) = (msg.from, msg.to);
         if self.flow == Flow::Ticket && msg.class == INVOKE {
@@ -610,7 +629,7 @@ impl Sim {
                 MsgKind::Invoke { .. } | MsgKind::VersionReset { .. }
             );
             if accept {
-                match self.ticket_answer(from, to, &msg) {
+                match self.ticket_answer(from, to, &mut msg) {
                     MsgKind::InvokeAck => self.send(to, from, MsgKind::InvokeAck),
                     answer => {
                         self.send(to, from, answer);
@@ -623,6 +642,9 @@ impl Sim {
             MsgKind::Await { msg: m } => {
                 let ack = match handle_await(&mut self.nus[to.0 as usize].tables, &m) {
                     Ok((ack, fx)) => {
+                        if self.tracer.is_some() {
+                            self.trace_await(&m, ack, &fx);
+                        }
                         self.effects(to, None, fx);
                         if ack == AwaitAck::Reject {
                             self.stats.rejects += 1;
@@ -639,11 +661,16 @@ impl Sim {
             }
             MsgKind::AwaitAck { req, ack } => match self.nus[to.0 as usize].reqs.on_ack(req, ack) {
                 AckAction::Satisfied(purpose) => {
-                    self.trace_dep_done(to, req.0, purpose);
+                    self.trace_dep_done(to, req.0, purpose, 0);
                     self.dep_satisfied(to, purpose)
                 }
                 AckAction::Wait => {}
                 AckAction::Retry { msg, .. } => {
+                    let now = self.now;
+                    trace!(self, t => t.entry_open(&TableEntry {
+                        flags: tr::DEP_REJECTED,
+                        ..TableEntry::new(to, Table::OutboundDeps, req.0 as u64)
+                    }, now));
                     let t = self.nus[to.0 as usize].cfg.t_retry;
                     self.queue.push(
                         self.now + t,
@@ -657,13 +684,23 @@ impl Sim {
             },
             MsgKind::Resolve { req } => {
                 let purpose = self.nus[to.0 as usize].reqs.on_resolve(req);
-                self.trace_dep_done(to, req.0, purpose);
+                self.trace_dep_done(to, req.0, purpose, tr::DEP_REGISTERED);
                 self.dep_satisfied(to, purpose);
             }
             MsgKind::Start { task, start } => self.start_child(from, to, task, start),
             MsgKind::Invoke { desc, call } => {
                 if self.flow == Flow::ReadyValid {
                     self.nus[to.0 as usize].inbound_reserved -= 1;
+                }
+                if self.tracer.is_some() {
+                    let e = TableEntry {
+                        base: desc.dst.base,
+                        len: desc.dst.len(),
+                        peer: Some(from),
+                        ..TableEntry::new(to, Table::InboundInvokes, inbound_id(from, call.seq))
+                    };
+                    let start = msg.reserved.unwrap_or(self.now);
+                    trace!(self, t => t.entry_open(&e, start));
                 }
                 let n = &mut self.nus[to.0 as usize];
                 n.inbound.push_back((Entry::Inbound(call), desc));
@@ -672,6 +709,11 @@ impl Sim {
             }
             MsgKind::VersionReset { addr } => {
                 self.nus[to.0 as usize].tables.vreset(addr);
+                let now = self.now;
+                trace!(self, t => t.entry_close(&TableEntry {
+                    peer: Some(from),
+                    ..TableEntry::new(to, Table::Versions, addr)
+                }, now));
                 // A freed entry lets a forwarded invoke that waits for one
                 // enter.
                 self.unstall(to);
@@ -692,10 +734,10 @@ impl Sim {
     /// `req`'s bit is set any other request is rejected; an invoke that
     /// finds the inbound invoke table full sets the bit (`RetryAck`).
     /// Otherwise the request is accepted (`InvokeAck`).
-    fn ticket_answer(&mut self, req: NeutrinoId, owner: NeutrinoId, msg: &Msg) -> MsgKind {
+    fn ticket_answer(&mut self, req: NeutrinoId, owner: NeutrinoId, msg: &mut Msg) -> MsgKind {
         let n = &mut self.nus[owner.0 as usize];
         if msg.ticketed {
-            n.tickets.granted.remove(&req.0);
+            msg.reserved = n.tickets.granted.remove(&req.0);
             n.inbound_reserved -= 1;
             let left = n.tickets.held.get_mut(&req.0).expect("bit of a replay");
             *left -= 1;
@@ -732,12 +774,12 @@ impl Sim {
                 .held
                 .keys()
                 .copied()
-                .filter(|r| !t.granted.contains(r))
+                .filter(|r| !t.granted.contains_key(r))
                 .min_by_key(|&r| (r <= t.last, r));
             let Some(r) = next else {
                 return;
             };
-            n.tickets.granted.insert(r);
+            n.tickets.granted.insert(r, self.now);
             n.tickets.last = r;
             n.inbound_reserved += 1;
             self.send(owner, NeutrinoId(r), MsgKind::PCrdGrant);
@@ -775,6 +817,7 @@ impl Sim {
     fn ack_arrive(&mut self, nu: NeutrinoId, owner: NeutrinoId) {
         let n = &mut self.nus[nu.0 as usize];
         let h = n.held.get_mut(&owner.0).and_then(|q| q.pop_front());
+        let seq = h.as_ref().map(|h| h.seq);
         match h {
             Some(h) if h.state == HeldState::Sent => {}
             h => {
@@ -784,6 +827,10 @@ impl Sim {
         }
         n.held_len -= 1;
         self.ticket_stats.acks[nu.0 as usize] += 1;
+        if let Some(seq) = seq {
+            let now = self.now;
+            trace!(self, t => t.entry_close(&TableEntry::new(nu, Table::OutboundInvokes, seq), now));
+        }
         self.unstall(nu);
     }
 
@@ -813,7 +860,18 @@ impl Sim {
                 t.replay.push_back(h.seq);
             }
         }
+
         t.rejects_due = t.replay.len() as u32 - 1;
+        if let Some(tracer) = self.tracer.as_mut() {
+            for &seq in &t.replay {
+                let e = TableEntry {
+                    flags: tr::INVOKE_REPLAYED,
+                    ..TableEntry::new(nu, Table::OutboundInvokes, seq)
+                };
+                tracer.entry_open(&e, now);
+            }
+        }
+        let n = &mut self.nus[nu.0 as usize];
         n.ticket.insert(owner.0, t);
         n.ticket_peak = n.ticket_peak.max(n.ticket.len());
     }
@@ -882,7 +940,7 @@ impl Sim {
 
     /// Ticket flow, requester side: holds a request to `owner` until it is
     /// acknowledged, and sends it into the invoke source queue.
-    fn send_held(&mut self, nu: NeutrinoId, owner: NeutrinoId, kind: MsgKind) {
+    fn send_held(&mut self, nu: NeutrinoId, owner: NeutrinoId, kind: MsgKind, seq: u64) {
         let held = match &kind {
             MsgKind::Invoke { desc, call } => HeldKind::Invoke(Box::new(desc.clone()), *call),
             MsgKind::VersionReset { addr } => HeldKind::VersionReset(*addr),
@@ -892,8 +950,6 @@ impl Sim {
             return;
         };
         let n = &mut self.nus[nu.0 as usize];
-        n.next_seq += 1;
-        let seq = n.next_seq;
         n.held.entry(owner.0).or_default().push_back(Held {
             seq,
             kind: held,
@@ -918,12 +974,38 @@ impl Sim {
         }
     }
 
-    /// Sends request `kind` from `nu` to `owner` in the invoke channel.
-    fn send_request(&mut self, nu: NeutrinoId, owner: NeutrinoId, kind: MsgKind) {
+    /// Sends request `kind` from `nu` to `owner` in the invoke channel; it
+    /// takes outbound invoke entry `seq` (the next sequence number).
+    fn send_request(&mut self, nu: NeutrinoId, owner: NeutrinoId, mut kind: MsgKind) {
+        let n = &mut self.nus[nu.0 as usize];
+        n.next_seq += 1;
+        let seq = n.next_seq;
+        let mut e = TableEntry {
+            peer: Some(owner),
+            ..TableEntry::new(nu, Table::OutboundInvokes, seq)
+        };
+        match &mut kind {
+            MsgKind::Invoke { desc, call } => {
+                call.seq = seq;
+                (e.base, e.len) = (desc.dst.base, desc.dst.len());
+            }
+            MsgKind::VersionReset { addr } => {
+                (e.base, e.flags) = (*addr, tr::INVOKE_VRESET);
+            }
+            _ => unreachable!("only requests take an outbound invoke entry"),
+        }
+        let now = self.now;
+        trace!(self, t => t.entry_open(&e, now));
         if self.flow == Flow::Ticket {
-            self.send_held(nu, owner, kind);
+            self.send_held(nu, owner, kind, seq);
         } else {
-            self.send(nu, owner, kind);
+            let Some((id, class)) = self.make_msg(nu, owner, kind, false) else {
+                return;
+            };
+            self.msgs[id as usize].as_mut().expect("message").seq = seq;
+            let src = Stage::Source(nu.0, class);
+            self.enqueue(src, id);
+            self.advance(src);
             let occ = self.stage_occ(Stage::Source(nu.0, INVOKE));
             let n = &mut self.nus[nu.0 as usize];
             n.outbound_peak = n.outbound_peak.max(occ);
@@ -964,6 +1046,8 @@ impl Sim {
             call: self.nus[nu.0 as usize].op_call,
             queued: Some(self.now),
             sent: None,
+            // Set by `send_request`.
+            seq: 0,
         };
         self.send_request(nu, owner, MsgKind::Invoke { desc, call });
         self.respond(
@@ -1036,19 +1120,76 @@ impl Sim {
             .reqs
             .open(owner, key, purpose)
             .expect("remote dependency capacity checked");
-        if let (Some(t), Purpose::TaskDep(task)) = (self.tracer.as_mut(), purpose) {
-            let gid = self.nus[nu.0 as usize].rec(task).gid;
-            t.dep_remote_open(nu, msg.request.0, gid, key);
+        let gid = match purpose {
+            Purpose::TaskDep(task) => Some(self.nus[nu.0 as usize].rec(task).gid),
+            Purpose::Wait(_) => None,
+        };
+        let now = self.now;
+        if let Some(t) = self.tracer.as_mut() {
+            if let Some(gid) = gid {
+                t.dep_remote_open(nu, msg.request.0, gid, key);
+            }
+            let e = TableEntry {
+                gid,
+                peer: Some(owner),
+                ..TableEntry::new(nu, Table::OutboundDeps, msg.request.0 as u64).key(key)
+            };
+            t.entry_open(&e, now);
         }
         self.send(nu, owner, MsgKind::Await { msg });
     }
 
-    /// The tracer's view of a satisfied remote request of `nu`.
-    fn trace_dep_done(&mut self, nu: NeutrinoId, req: u32, purpose: Purpose) {
+    /// The tracer's view of a satisfied remote request of `nu`; `flags`
+    /// for its outbound dep entry.
+    fn trace_dep_done(&mut self, nu: NeutrinoId, req: u32, purpose: Purpose, flags: u8) {
+        let now = self.now;
+        let Some(t) = self.tracer.as_mut() else {
+            return;
+        };
         if let Purpose::TaskDep(_) = purpose {
-            let now = self.now;
-            trace!(self, t => t.dep_remote_done(nu, req, now));
+            t.dep_remote_done(nu, req, now);
         }
+        let e = TableEntry {
+            flags,
+            ..TableEntry::new(nu, Table::OutboundDeps, req as u64)
+        };
+        t.entry_close(&e, now);
+    }
+
+    /// The tracer's view of an `Await` at its owner: the pending entries
+    /// its lookup created and, when registered, its inbound ref. The ref's
+    /// task is the consumer at the requester.
+    fn trace_await(&mut self, m: &AwaitMsg, ack: AwaitAck, fx: &nu_model::Effects) {
+        self.trace_pending(m.to, fx, tr::PENDING_AWAIT, Some(m.from));
+        if ack != AwaitAck::Registered {
+            return;
+        }
+        let r = &self.nus[m.from.0 as usize];
+        let gid = match r.reqs.purpose(m.request) {
+            Some(Purpose::TaskDep(t)) => Some(r.rec(t).gid),
+            _ => None,
+        };
+        let e = TableEntry {
+            gid,
+            peer: Some(m.from),
+            ..TableEntry::new(m.to, Table::InboundRefs, ref_id(m.from, m.request)).key(m.key)
+        };
+        let now = self.now;
+        trace!(self, t => t.entry_open(&e, now));
+    }
+
+    /// Ready/valid: message `id` leaves the invoke source queue `s` (a
+    /// request's outbound invoke entry), which frees at `end`.
+    fn close_outbound(&mut self, s: Stage, id: u32, end: Cycle) {
+        let Stage::Source(nu, INVOKE) = s else {
+            return;
+        };
+        if self.flow != Flow::ReadyValid || self.tracer.is_none() {
+            return;
+        }
+        let seq = self.msgs[id as usize].as_ref().expect("message").seq;
+        let e = TableEntry::new(NeutrinoId(nu), Table::OutboundInvokes, seq);
+        trace!(self, t => t.entry_close(&e, end));
     }
 
     /// A program wait on a key that `owner` owns.
@@ -1099,6 +1240,15 @@ impl Sim {
             match self.enter_task(nu, desc, entry) {
                 Ok(e) => {
                     moved = true;
+                    if let (Some(t), Entry::Inbound(call)) = (self.tracer.as_mut(), entry) {
+                        let id = inbound_id(call.src, call.seq);
+                        let x = TableEntry {
+                            gid: Some(e.gid),
+                            version: e.version,
+                            ..TableEntry::new(nu, Table::InboundInvokes, id)
+                        };
+                        t.entry_close(&x, self.now);
+                    }
                     if e.ready {
                         self.on_ready(nu, e.task);
                     }

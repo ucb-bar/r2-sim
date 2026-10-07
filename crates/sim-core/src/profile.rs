@@ -469,11 +469,24 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         quantize,
         row_panel,
         ref rates,
+        ref masters,
         ..
     } = node.pe.params
     else {
         panic!("matmul opcode on PE {}", node.pe.name);
     };
+    // The route between the SMEM block of `dst` and the array (over
+    // `lbus`), for a tracer only: (reads, writes).
+    let smem_route = node
+        .memories
+        .iter()
+        .find(|m| m.range.covers(&desc.dst))
+        .map_or((None, None), |m| {
+            (
+                node.topology.best_pair(&m.attach, masters),
+                node.topology.best_pair(masters, &m.attach),
+            )
+        });
     // The slower operand type sets the rate: the array charges
     // MACs * max / rate, as a utilization of rate / max.
     let utilization = match rates.iter().map(|r| r.1).max_by(ratio_cmp) {
@@ -532,16 +545,28 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             // A and B and C in are reads; C out and the accumulator flush
             // are writes (one resource: charged as their sum).
             let read = a_bytes + b_dtype.bytes_for(k * qn) + c_in;
+            let write = c_out + flush;
+            let use_of = |p: Option<(AttachId, AttachId)>, bytes, dir| {
+                p.map(|(from, to)| RouteUse {
+                    from,
+                    to,
+                    bytes,
+                    dir,
+                })
+            };
             chunks.push(Chunk {
                 demand: vec![
                     ops,
                     Demand::read(smem_port, read),
-                    Demand::write(smem_port, c_out + flush),
+                    Demand::write(smem_port, write),
                 ],
                 path: Vec::new(),
                 rate: Ratio::ONE,
                 latency: 0,
-                routes: [None; 2],
+                routes: [
+                    use_of(smem_route.0, read, Dir::Read),
+                    use_of(smem_route.1, write, Dir::Write),
+                ],
             });
         }
     }

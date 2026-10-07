@@ -128,6 +128,11 @@ impl OutboundDeps {
         self.capacity.saturating_sub(self.reqs.len())
     }
 
+    /// The purpose of open request `id`.
+    pub fn purpose(&self, id: RequestId) -> Option<Purpose> {
+        self.reqs.get(id.0 as usize).map(|r| r.purpose)
+    }
+
     /// Opens a request and returns the message to send.
     pub fn open(
         &mut self,

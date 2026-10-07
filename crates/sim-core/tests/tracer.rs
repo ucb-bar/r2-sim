@@ -164,14 +164,18 @@ fn a_traced_two_sm_run_ends_at_the_untraced_cycle() {
     let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
     // P0: called at 0, local. M: called at 8 (after P0's c_invoke),
     // queued at 16 after its own, sent at once, in sm1's scoreboard at 48.
-    let call = |call, queued, sent| TaskCall {
+    let call = |call, queued, sent, seq| TaskCall {
         src: sm0,
         call,
         queued,
         sent,
+        seq,
     };
-    assert_eq!(seen.invokes[0], (0, sm0, call(0, None, None), 8));
-    assert_eq!(seen.invokes[1], (1, sm1, call(8, Some(16), Some(16)), 48));
+    assert_eq!(seen.invokes[0], (0, sm0, call(0, None, None, 0), 8));
+    assert_eq!(
+        seen.invokes[1],
+        (1, sm1, call(8, Some(16), Some(16), 1), 48)
+    );
     assert_eq!(seen.retires, 2);
     // M's remote dep on A: Registered, then the Resolve at 230.
     assert_eq!(seen.remote.len(), 1);

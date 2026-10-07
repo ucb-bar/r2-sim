@@ -176,6 +176,10 @@ pub enum PeParams {
         /// accumulate task on the same dst reads it from there. C goes to
         /// SMEM at the end of the chain or on eviction.
         acc_buffer: u64,
+        /// The array's attachments to the buses it masters (`lbus`): the
+        /// tracer draws its SMEM traffic on that route; nothing is
+        /// charged there (its bytes are charged on the SMEM port).
+        masters: Vec<crate::topology::AttachId>,
     },
     /// A SIMT core modeled as an opaque vector PE (Section 3.4).
     Muon {
