@@ -26,12 +26,14 @@ device:
   neutrino: {c_base: 0, c_dep: 0, c_word: 0}
   children:
     - name: gpc0
-      bridge: {data: $parent.sbus, control: $parent.cbus}
       fidelity: numeric
       fabric:
         # Control at 1/8 of the data rate (8 B/cycle per port).
         - {name: clsbus, bw_bytes: 64}
         - {name: clcbus, bw_bytes: 8, control: true}
+        # Unlimited links to the device.
+        - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus}
+        - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, control: true}
       memory:
         - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
       neutrino: {c_base: 0, c_dep: 0, c_word: 0}

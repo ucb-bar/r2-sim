@@ -1318,7 +1318,7 @@ impl Tracer for RawTracer {
 // ---- the manifest ----
 
 /// Ids of the unlimited links, after the real resources, in a fixed
-/// order: attachment ports, shared buses, bridge lanes.
+/// order: attachment ports, shared buses, link directions.
 fn unlimited_links(sim: &Sim) -> HashMap<Link, u16> {
     let topo = sim.topology();
     let mut next = sim.resources().len() as u16;
@@ -1345,12 +1345,12 @@ fn unlimited_links(sim: &Sim) -> HashMap<Link, u16> {
             add(Link::Bus(sim_core::BusId(b as u32)));
         }
     }
-    for (i, br) in topo.bridges().iter().enumerate() {
+    for (i, br) in topo.fabric_links().iter().enumerate() {
         if br.ab.is_none() {
-            add(Link::Bridge(i as u32, true));
+            add(Link::Fabric(i as u32, true));
         }
         if br.ba.is_none() {
-            add(Link::Bridge(i as u32, false));
+            add(Link::Fabric(i as u32, false));
         }
     }
     m
@@ -1509,7 +1509,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 "component_type": info.map(|i| match i.kind {
                     Component::Memory => "memory",
                     Component::Neutrino => "neutrino",
-                    Component::Bridge => "bridge",
+                    Component::Link => "link",
                     Component::Compute => "compute",
                 }),
                 "role": info.map(|i| match i.role {
@@ -1536,24 +1536,29 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             })
         })
         .collect();
-    let bridge_rows: Vec<Value> = topo
-        .bridges()
+    let link_rows: Vec<Value> = topo
+        .fabric_links()
         .iter()
         .enumerate()
-        .map(|(i, br)| {
-            for (lane, dir) in [(br.ab, "ab"), (br.ba, "ba")] {
+        .map(|(i, l)| {
+            for (lane, dir) in [(l.ab, "ab"), (l.ba, "ba")] {
                 if let Some(r) = lane {
-                    set_role(r, json!({"type": "bridge", "bridge": i, "dir": dir}));
+                    set_role(r, json!({"type": "link", "link": i, "dir": dir}));
                 }
             }
-            let info = lay.bridges.get(i);
+            let info = lay.links.get(i);
             json!({
-                "id": i, "path": info.map(|b| b.path.clone()),
-                "type": info.map(|b| if b.cache { "cache" } else { "child" }),
-                "a": br.att_a.0, "b": br.att_b.0,
-                "ab": lane_id(br.ab, Link::Bridge(i as u32, true)),
-                "ba": lane_id(br.ba, Link::Bridge(i as u32, false)),
-                "latency": br.latency,
+                "id": i, "path": info.map(|x| x.path.clone()),
+                "node": info.map(|x| x.node.0),
+                "control": info.map(|x| x.control),
+                "from_bus": l.a.0, "to_bus": l.b.0,
+                "from_attachment": l.att_a.0, "to_attachment": l.att_b.0,
+                "ab": lane_id(l.ab, Link::Fabric(i as u32, true)),
+                "ba": lane_id(l.ba, Link::Fabric(i as u32, false)),
+                "bw_bytes": bw(info.and_then(|x| x.rate)),
+                "beat_bytes": info.map(|x| x.beat),
+                "latency": l.latency,
+                "cache": info.and_then(|x| x.cache),
             })
         })
         .collect();
@@ -1606,18 +1611,16 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 json!({"type": "port", "attachment": a.0, "dir": "out"}),
             ),
             Link::Bus(b) => (topo.bus(b).name.clone(), json!({"type": "bus", "bus": b.0})),
-            Link::Bridge(i, ab) => {
+            Link::Fabric(i, ab) => {
                 let path = lay
-                    .bridges
+                    .links
                     .get(i as usize)
-                    .map_or(format!("bridge{i}"), |b| b.path.clone());
-                let d = if ab { "up" } else { "down" };
-                let name = match path.strip_suffix(".ctl") {
-                    Some(p) => format!("{p}.{d}.ctl"),
-                    None => format!("{path}.{d}"),
-                };
+                    .map_or(format!("link{i}"), |l| l.path.clone());
                 let dir = if ab { "ab" } else { "ba" };
-                (name, json!({"type": "bridge", "bridge": i, "dir": dir}))
+                (
+                    format!("{path}.{dir}"),
+                    json!({"type": "link", "link": i, "dir": dir}),
+                )
             }
         };
         res_rows.push(json!({
@@ -1637,7 +1640,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
     json!({
         "format": "r2raw",
-        "version": [1, 1],
+        "version": [1, 2],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},
@@ -1648,7 +1651,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         "filters": filters_json(f),
         "records": records,
         "nodes": node_rows, "pes": pe_rows, "buses": bus_rows, "attachments": att_rows,
-        "bridges": bridge_rows, "memories": mem_rows, "resources": res_rows,
+        "links": link_rows, "memories": mem_rows, "resources": res_rows,
         "opcodes": sim.profiles().names().collect::<Vec<_>>(),
         "message_kinds": MESSAGE_KINDS,
         "label": {

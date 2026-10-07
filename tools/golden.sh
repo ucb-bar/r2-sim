@@ -10,7 +10,7 @@
 # every run (for example GOLDEN_ARGS="--set global.endpoint_charging=false").
 # The rows run the default hierarchical program (configs/forward.toml);
 # GOLDEN_ARGS="--param drivers=single" runs the single driver. References:
-# scratch/fwd12 (hierarchical), scratch/fwd12-single.
+# scratch/fwd14 (hierarchical), scratch/fwd14-single.
 # "check" exits with 1 when a summary line or a JSON file differs; the
 # comparison leaves out the wall time and the functional worker's progress
 # at each load (thread timing).

@@ -427,7 +427,7 @@ pub struct Resources {
     merged: Vec<Demand>,
     /// Per merged demand: its amount by direction.
     merged_dir: Vec<DirCycles>,
-    own: Vec<(ResourceId, u64, Cycle)>,
+    own: Vec<Own>,
     /// Scratch buffer of `reserve_path`.
     plan: Vec<Placed>,
 }
@@ -442,6 +442,20 @@ pub struct PathHop {
     pub dir: Dir,
     /// Cycles from this hop's start to the next hop's earliest start.
     pub latency: Cycle,
+}
+
+/// One demand of a compute chunk while it is co-charged.
+#[derive(Debug, Clone, Copy)]
+struct Own {
+    resource: ResourceId,
+    /// Own duration with every lane.
+    dur: u64,
+    /// The cycles it is charged.
+    charged: u64,
+    /// The lanes it holds.
+    lanes: u32,
+    /// Its own earliest start.
+    start: Cycle,
 }
 
 /// A hop's window while a transfer is placed.
@@ -591,32 +605,48 @@ impl Resources {
         &mut self,
         merged: &[Demand],
         merged_dir: &[DirCycles],
-        own: &mut Vec<(ResourceId, u64, Cycle)>,
+        own: &mut Vec<Own>,
         earliest: Cycle,
     ) -> Option<Grant> {
         if merged.is_empty() {
             return None;
         }
-        // Step 1: own durations and own earliest starts.
-        own.extend(merged.iter().map(|d| {
-            let f = self.flow(d.resource);
-            let dur = f.duration(d.amount, d.utilization);
-            (d.resource, dur, f.earliest(earliest, dur, f.lanes))
+        // Step 1: own durations (all lanes assumed) and the chunk's D.
+        own.extend(merged.iter().map(|d| Own {
+            resource: d.resource,
+            dur: self.flow(d.resource).duration(d.amount, d.utilization),
+            charged: 0,
+            lanes: 0,
+            start: 0,
         }));
-        // Step 2.
-        let mut t = own.iter().map(|o| o.2).max().expect("nonempty");
-        let big_d = own.iter().map(|o| o.1).max().expect("nonempty");
-        // Step 3: fixpoint; t only advances. Each resource must be free for
-        // the length it is charged.
+        let big_d = own.iter().map(|o| o.dur).max().expect("nonempty");
+        // What each resource holds: a resource with lanes holds the lanes
+        // its own rate needs over D, `ceil(amount / (D x lane rate))` (at
+        // least one, at most all), for D; a one-lane resource holds its
+        // lane for its own duration (or D under the longest rule).
         let own_mode = self.cocharge == CoCharge::Own;
-        let charged = |d: u64| if own_mode { d } else { big_d };
+        for (o, d) in own.iter_mut().zip(merged) {
+            let f = self.flow(o.resource);
+            if f.lanes > 1 && big_d > 0 {
+                let lr = f.lane_rate;
+                let k =
+                    (d.amount as u128 * lr.den as u128).div_ceil(big_d as u128 * lr.num as u128);
+                o.lanes = k.clamp(1, f.lanes as u128) as u32;
+                o.charged = big_d;
+            } else {
+                o.lanes = f.lanes;
+                o.charged = if own_mode { o.dur } else { big_d };
+            }
+            o.start = f.earliest(earliest, o.charged, o.lanes);
+        }
+        // Step 2.
+        let mut t = own.iter().map(|o| o.start).max().expect("nonempty");
+        // Step 3: fixpoint; t only advances. Each resource must have its
+        // lanes free for the length it is charged.
         loop {
             let next = own
                 .iter()
-                .map(|o| {
-                    let f = self.flow(o.0);
-                    f.earliest(t, charged(o.1), f.lanes)
-                })
+                .map(|o| self.flow(o.resource).earliest(t, o.charged, o.lanes))
                 .max()
                 .expect("nonempty");
             if next == t {
@@ -624,27 +654,31 @@ impl Resources {
             }
             t = next;
         }
-        // Step 4: a compute chunk holds every lane.
-        for (i, &(r, d, _)) in own.iter().enumerate() {
-            let f = self.flow_mut(r);
-            let k = f.lanes;
-            f.occupy(t, charged(d), k);
-            let parts = f.account(charged(d), k, &merged_dir[i]);
-            self.record_charge(r, &merged_dir[i], t, charged(d), &parts);
+        // Step 4.
+        for (i, o) in own.iter().enumerate() {
+            let f = self.flow_mut(o.resource);
+            f.occupy(t, o.charged, o.lanes);
+            let parts = f.account(o.charged, o.lanes, &merged_dir[i]);
+            self.record_charge(o.resource, &merged_dir[i], t, o.charged, &parts);
         }
         // Culprit: longest own duration; on a tie, the latest own start.
         let culprit = own
             .iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)).then(b.0.cmp(&a.0)))
+            .max_by(|a, b| {
+                a.dur
+                    .cmp(&b.dur)
+                    .then(a.start.cmp(&b.start))
+                    .then(b.resource.cmp(&a.resource))
+            })
             .expect("nonempty")
-            .0;
+            .resource;
         self.flow_mut(culprit).culprit_total += big_d;
         let queue_culprit = (t > earliest).then(|| {
             let queued = own
                 .iter()
-                .max_by(|a, b| a.2.cmp(&b.2).then(b.0.cmp(&a.0)))
+                .max_by(|a, b| a.start.cmp(&b.start).then(b.resource.cmp(&a.resource)))
                 .expect("nonempty")
-                .0;
+                .resource;
             self.flow_mut(queued).delay_total += t - earliest;
             queued
         });

@@ -28,10 +28,11 @@ KIND_COLORS = {
 
 def resource_class(name: str) -> str:
     """The class of a resource name, for aggregating over SMs."""
-    if name.endswith(".ctl"):
-        return "control lane"
-    if ".bridge." in name:
-        return "link"
+    # A link direction is `<link>.ab` or `.ba`; by the naming convention
+    # `<from>_to_<to>`, a control link starts at a control bus (`*cbus`).
+    parts = name.split(".")
+    if len(parts) > 1 and parts[-1] in ("ab", "ba"):
+        return "control link" if parts[-2].split("_to_")[0].endswith("cbus") else "link"
     if any(part.endswith("BUS") for part in name.split(".")):
         return "bus"
     for suffix, cls in (

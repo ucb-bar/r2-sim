@@ -1,6 +1,6 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.1). The checks are the
+The format is r2-vis's `trace-raw.md` (version 1.2). The checks are the
 ones of its Section 8, plus the file layout:
 
 * the manifest's record layouts have the record sizes of the format, every
@@ -188,10 +188,11 @@ def check_links(r: Report, manifest: dict) -> None:
             for d in ("in", "out"):
                 if a[d] is None or not 0 <= a[d] < n:
                     miss.append(f"attachment {a['id']} {d}")
-    for b in manifest["bridges"]:
+    # Version 1.2 has `links`; 1.0 and 1.1 have `bridges`.
+    for b in manifest.get("links", manifest.get("bridges", [])):
         for d in ("ab", "ba"):
             if b[d] is None or not 0 <= b[d] < n:
-                miss.append(f"bridge {b['id']} {d}")
+                miss.append(f"link {b['id']} {d}")
     roles = {(x["role"]["type"], x["role"].get("bus")) for x in manifest["resources"]}
     for b in buses:
         if b["topology"] == "bus" and ("bus", b["id"]) not in roles:

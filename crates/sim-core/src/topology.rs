@@ -1,25 +1,26 @@
 //! The hardware tree and the fabric (architecture Sections 3.1, 3.5 and 8).
 //!
 //! The tree has one node per Neutrino. The fabric is a graph of buses:
-//! every bus is a vertex, and a bridge is an edge between two buses (one
-//! side of a child's bridge to a parent bus, or a cache that is a slave on
-//! one bus and a master on another). A bus is a data bus or a control bus;
-//! a child's bridge joins its data bus to the parent's data bus and its
-//! control bus to the parent's control bus, so data and control traffic
-//! never share a resource. Memories, a node's Neutrino, compute masters and
-//! each end of a bridge are **attachments** of a bus; transfers go from one
-//! attachment to another. A compute master's attachment has no port.
+//! every bus is a vertex, and a **link** (a `topology: link` fabric entry,
+//! architecture Section 8.2) is an edge between two buses: usually a
+//! child's bus to its parent's bus, or a cache that is a slave on one bus
+//! and a master on another. A bus is a data bus or a control bus; data
+//! links join data buses and control links control buses, so data and
+//! control traffic never share a resource. Memories, a node's Neutrino,
+//! compute masters and each end of a link are **attachments** of a bus;
+//! transfers go from one attachment to another. A compute master's
+//! attachment has no port.
 //!
 //! What a transfer charges on a bus depends on its topology (Section 3.5):
 //! an `xbar` has per attachment an ingress and an egress resource, and a
 //! transfer from attachment s to attachment d charges s's ingress and d's
 //! egress; a `bus` has one shared resource. A bus without a rate is
-//! unlimited. A bridge keeps one resource per direction.
+//! unlimited. A link keeps one resource per direction (full duplex).
 //!
-//! A route is the path with the fewest bridges, found when the fabric is
+//! A route is the path with the fewest links, found when the fabric is
 //! finished. Its latency is the sum of the latencies of every bus and
-//! bridge on it. Between sets of attachments (a memory attached to two
-//! buses, a master of two buses) the route with the fewest bridges wins;
+//! link on it. Between sets of attachments (a memory attached to two
+//! buses, a master of two buses) the route with the fewest links wins;
 //! a tie goes to the first pair in attachment order.
 
 use std::collections::VecDeque;
@@ -50,7 +51,7 @@ pub struct BusId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AttachId(pub u32);
 
-/// The resource of one direction of a port, a bus or a bridge; `None` is
+/// The resource of one direction of a port, a bus or a link; `None` is
 /// unlimited.
 pub type Lane = Option<ResourceId>;
 
@@ -91,10 +92,10 @@ pub struct Attachment {
     pub egress: Lane,
 }
 
-/// A bridge between buses `a` and `b`, attached to them as `att_a` and
-/// `att_b`.
+/// A link between buses `a` (its `from`) and `b` (its `to`), attached to
+/// them as `att_a` and `att_b`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Bridge {
+pub struct FabricLink {
     pub a: BusId,
     pub b: BusId,
     pub att_a: AttachId,
@@ -114,8 +115,9 @@ pub enum Link {
     Out(AttachId),
     /// The shared lane of a `Shared` bus.
     Bus(BusId),
-    /// A bridge lane: the bridge index, and true for `a` to `b`.
-    Bridge(u32, bool),
+    /// One direction of a fabric link: its index, and true for `a` to `b`
+    /// (from to to).
+    Fabric(u32, bool),
 }
 
 /// One hop of a control route: a resource and the latency after it.
@@ -140,8 +142,8 @@ pub struct Path {
     pub hops: Vec<Hop>,
     /// Control routes: latency before the first hop.
     pub lead: Cycle,
-    /// Bridges on the route.
-    pub bridges: u32,
+    /// Links on the route.
+    pub links: u32,
 }
 
 impl Path {
@@ -166,7 +168,7 @@ pub struct Topology {
     data_hub: Vec<Vec<AttachId>>,
     buses: Vec<Bus>,
     attachments: Vec<Attachment>,
-    bridges: Vec<Bridge>,
+    links: Vec<FabricLink>,
     /// Routes by (from, to) attachment, after `finish`; `None` where no
     /// route exists.
     routes: Vec<Option<Path>>,
@@ -180,10 +182,10 @@ static EMPTY: Path = Path {
     latency: 0,
     hops: Vec::new(),
     lead: 0,
-    bridges: 0,
+    links: 0,
 };
 
-/// One bus of a bus-level route and the bridge (index, direction a to b)
+/// One bus of a bus-level route and the link (index, direction a to b)
 /// that reached it.
 type Step = (usize, Option<(usize, bool)>);
 
@@ -221,7 +223,7 @@ impl Topology {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn add_bridge(
+    pub(crate) fn add_link(
         &mut self,
         att_a: AttachId,
         att_b: AttachId,
@@ -231,7 +233,7 @@ impl Topology {
     ) {
         self.finished = false;
         let (a, b) = (self.attachment(att_a).bus, self.attachment(att_b).bus);
-        self.bridges.push(Bridge {
+        self.links.push(FabricLink {
             a,
             b,
             att_a,
@@ -255,11 +257,11 @@ impl Topology {
         }
         let nb = self.buses.len();
         let mut adj: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); nb];
-        for (i, br) in self.bridges.iter().enumerate() {
+        for (i, br) in self.links.iter().enumerate() {
             adj[br.a.0 as usize].push((br.b.0 as usize, i, true));
             adj[br.b.0 as usize].push((br.a.0 as usize, i, false));
         }
-        // Bus-level routes: the buses and the bridges that reach them.
+        // Bus-level routes: the buses and the links that reach them.
         let mut steps: Vec<Option<Vec<Step>>> = vec![None; nb * nb];
         for from in 0..nb {
             let mut hops = vec![usize::MAX; nb];
@@ -329,9 +331,9 @@ impl Topology {
             let entry = match via {
                 None => s,
                 Some((br, fwd)) => {
-                    let b = &self.bridges[br];
+                    let b = &self.links[br];
                     f(
-                        Link::Bridge(br as u32, fwd),
+                        Link::Fabric(br as u32, fwd),
                         if fwd { b.ab } else { b.ba },
                         b.latency,
                     );
@@ -341,10 +343,10 @@ impl Topology {
             let exit = match route.get(i + 1) {
                 None => d,
                 Some(&(_, Some((br, fwd)))) => {
-                    let b = &self.bridges[br];
+                    let b = &self.links[br];
                     (if fwd { b.att_a } else { b.att_b }).0 as usize
                 }
-                Some(&(_, None)) => unreachable!("only the first step has no bridge"),
+                Some(&(_, None)) => unreachable!("only the first step has no link"),
             };
             let b = &self.buses[bus];
             match b.topology {
@@ -384,7 +386,7 @@ impl Topology {
     /// `route`.
     fn route_of(&self, s: usize, d: usize, route: &[Step]) -> Path {
         let mut p = Path {
-            bridges: route.len() as u32 - 1,
+            links: route.len() as u32 - 1,
             ..Path::default()
         };
         self.walk(s, d, route, |_, lane, latency| {
@@ -401,7 +403,7 @@ impl Topology {
         self.routes[a.0 as usize * self.attachments.len() + b.0 as usize].as_ref()
     }
 
-    /// The route with the fewest bridges from any of `from` to any of `to`;
+    /// The route with the fewest links from any of `from` to any of `to`;
     /// a tie goes to the first pair in order. Empty when either set is
     /// empty; `None` when no pair has a route.
     pub fn best_path(&self, from: &[AttachId], to: &[AttachId]) -> Option<&Path> {
@@ -419,8 +421,8 @@ impl Topology {
         for &a in from {
             for &b in to {
                 if let Some(p) = self.route(a, b) {
-                    if best.is_none_or(|q| p.bridges < q.2) {
-                        best = Some((a, b, p.bridges));
+                    if best.is_none_or(|q| p.links < q.2) {
+                        best = Some((a, b, p.links));
                     }
                 }
             }
@@ -436,7 +438,7 @@ impl Topology {
             data_hub: self.data_hub.clone(),
             buses: self.buses.clone(),
             attachments: self.attachments.clone(),
-            bridges: self.bridges.clone(),
+            links: self.links.clone(),
             routes: Vec::new(),
             steps: self.steps.clone(),
             finished: self.finished,
@@ -453,9 +455,9 @@ impl Topology {
         self.attachments.len()
     }
 
-    /// The bridges, in insertion order.
-    pub fn bridges(&self) -> &[Bridge] {
-        &self.bridges
+    /// The fabric links, in insertion order.
+    pub fn fabric_links(&self) -> &[FabricLink] {
+        &self.links
     }
 
     /// The largest latency of any route (0 before `finish`).

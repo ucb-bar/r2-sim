@@ -138,7 +138,7 @@ pub enum PeParams {
         /// ports and the fabric routes.
         links: Vec<ResourceId>,
         /// The engine's attachments to the buses it masters: a transfer
-        /// takes the fewest-bridge route from the source block to one of
+        /// takes the fewest-link route from the source block to one of
         /// them and from one of them to the destination block.
         masters: Vec<crate::topology::AttachId>,
         /// Latency of every chunk (Section 5.7).
@@ -183,7 +183,7 @@ pub enum PeParams {
         vector: ResourceId,
         /// The unit's attachments to the buses it masters: a task charges
         /// the block that holds its `dst`, over the route with the fewest
-        /// bridges.
+        /// links.
         masters: Vec<crate::topology::AttachId>,
         /// Efficiency of the vector resource, in (0, 1].
         utilization: Ratio,
@@ -240,6 +240,6 @@ pub enum RaceCheck {
 mod yaml;
 
 pub use self::yaml::{
-    build, build_file, build_str, AttachInfo, BridgeInfo, Built, Component, ConfigError, Layout,
+    build, build_file, build_str, AttachInfo, Built, Component, ConfigError, Layout, LinkInfo,
     MemInfo, Role,
 };

@@ -1,12 +1,13 @@
-# An SM of tiny.yaml. The bridge's control side runs at 1/8 of its data
+# An SM of tiny.yaml. The control link runs at 1/8 of the data link's
 # rate (4 B/cycle).
 # The hand-computed tests on this file exclude descriptor assembly:
 # every Neutrino has c_base, c_dep and c_word 0 (c_invoke only).
-bridge: {data: $parent.clsbus, control: $parent.clcbus, bw_bytes: 32, control_bw_bytes: 4, latency: 10}
 fabric:
   - {name: smsbus}
   - {name: smcbus, control: true}
   - {name: lbus}
+  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 32, latency: 10}
+  - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 4, latency: 10, control: true}
 memory:
   - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 128, latency: 10, slave: [$this.lbus, $this.smsbus]}
   - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}

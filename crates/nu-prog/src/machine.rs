@@ -218,16 +218,30 @@ impl Machine {
             let cmem = ppath
                 .as_ref()
                 .and_then(|cp| b.try_memory(&format!("{cp}.cmem")));
-            // The bridge of a node to its parent each way: down is parent to
-            // child.
-            let link = |n: NeutrinoId| {
-                topo.node(n).parent.map_or((0.0, 0.0), |_| {
-                    let c = topo.path_name(n);
-                    (
-                        rate_named(format!("{c}.bridge.down")),
-                        rate_named(format!("{c}.bridge.up")),
-                    )
-                })
+            // The data link of a node to its parent each way (down: parent
+            // to child), found by its buses: one end on a bus of the
+            // parent. 0 when unlimited or absent.
+            let link = |n: NeutrinoId| -> (f64, f64) {
+                let Some(p) = topo.node(n).parent else {
+                    return (0.0, 0.0);
+                };
+                let ppath = topo.path_name(p);
+                let on_parent = |bus: sim_core::BusId| {
+                    topo.bus(bus).name.rsplit_once('.').map(|x| x.0) == Some(ppath.as_str())
+                };
+                let rate = |l: sim_core::Lane| l.map_or(0.0, |r| res.flow(r).rate().to_f64());
+                for (info, l) in b.layout.links.iter().zip(topo.fabric_links()) {
+                    if info.node != n || info.control || info.cache.is_some() {
+                        continue;
+                    }
+                    if on_parent(l.b) {
+                        return (rate(l.ba), rate(l.ab));
+                    }
+                    if on_parent(l.a) {
+                        return (rate(l.ab), rate(l.ba));
+                    }
+                }
+                (0.0, 0.0)
             };
             let (link_down, link_up) = link(nu);
             // The cluster's link to its parent.

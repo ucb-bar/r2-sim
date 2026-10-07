@@ -2,7 +2,7 @@
 //!
 //! A file has two sections, `global` and `device` (the root node). Every
 //! node has the sections `fabric`, `memory`, `compute`, `neutrino` and
-//! `children`, and every node but the root a `bridge`. A child entry has a
+//! `children`. A child entry has a
 //! `name` and either its sections inline or `config: FILE`, a file
 //! (relative to the including file) that holds them; other keys of the
 //! entry override the file's (mappings merge key by key, anything else is
@@ -11,14 +11,20 @@
 //! includes, applies the overrides, resolves names, then builds.
 //!
 //! Fabric: a bus is a data bus, or a control bus with `control: true`
-//! (protocol messages). A node's `bridge: {data, control, bw_bytes,
-//! control_bw_bytes, latency}` joins its first data bus to the parent data
-//! bus `data` and its first control bus to the parent control bus
-//! `control`, each with one resource per direction (`control_bw_bytes`
-//! defaults to `bw_bytes`). `slave` (memories) and `master` (compute, and
-//! the Neutrino) are a bus or a list of buses; the default Neutrino master
-//! is the node's first control bus and every data bus. A transfer takes
-//! the route with the fewest bridges among them.
+//! (protocol messages). A **link** is a fabric entry with `topology:
+//! link`, `from` and `to` (two buses, usually `$this.x` and `$parent.y`),
+//! `bw_bytes`, `beat_bytes`, `latency` and `control` (Section 8.2): full
+//! duplex, one resource per direction, `<link>.ab` (from to to) and
+//! `<link>.ba`. A data link joins data buses and a control link control
+//! buses; every node but the root needs a data link and a control link to
+//! its parent's buses. On a bus of the link's own node the link's
+//! attachment is named after the link; on another node's bus, after the
+//! link's path from that node (`sm1.smsbus_to_clsbus`). `slave`
+//! (memories) and `master` (compute, and the Neutrino) are a bus or a
+//! list of buses; the default Neutrino master is the node's first control
+//! bus and every data bus. A transfer takes the route with the fewest
+//! links among them. A cache (a memory with `slave` and `master`) is a
+//! link through its port.
 //!
 //! Every element has a dotted name from the root (`root.gpc0.sm1.atlas`);
 //! `$this` and `$parent` in a bus reference name the node being defined
@@ -36,7 +42,7 @@
 //!   latency), `flow` (readyvalid | ticket), `hop_queue` (messages one
 //!   hop stage holds per protocol class, default 1: a pipeline register,
 //!   not a buffer to size).
-//! * buses and bridges: a bus or bridge without `bw_bytes` is unlimited.
+//! * buses and links: a bus or link without `bw_bytes` is unlimited.
 //! * nodes: `fidelity` (null | numeric; inherited; the root defaults to
 //!   null).
 //! * `neutrino`: every key of [`NeutrinoConfig`] (`scoreboard`, `execution`, `pending`,
@@ -395,7 +401,6 @@ struct NodeSec {
     neutrino: Option<NuSec>,
     #[serde(default)]
     children: Vec<NodeSec>,
-    bridge: Option<BridgeSec>,
     fidelity: Option<String>,
 }
 
@@ -410,23 +415,12 @@ struct BusSec {
     /// A control bus (protocol messages).
     #[serde(default)]
     control: bool,
-    /// Beat of the bus's ports or shared lane (default 64).
+    /// Beat of the bus's ports or shared lane, or of a link's two
+    /// directions (default 64).
     beat_bytes: Option<Num>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BridgeSec {
-    /// The parent data bus.
-    data: String,
-    /// The parent control bus.
-    control: String,
-    bw_bytes: Option<Num>,
-    control_bw_bytes: Option<Num>,
-    #[serde(default)]
-    latency: u64,
-    /// Beat of the four bridge lanes (default 64).
-    beat_bytes: Option<Num>,
+    /// A link's two buses (`topology: link` only).
+    from: Option<String>,
+    to: Option<String>,
 }
 
 /// A bus reference or a list of them.
@@ -605,7 +599,7 @@ pub(crate) fn parse_rate(s: &str) -> Result<Ratio, ConfigError> {
 pub enum Component {
     Memory,
     Neutrino,
-    Bridge,
+    Link,
     Compute,
 }
 
@@ -625,12 +619,20 @@ pub struct AttachInfo {
     pub role: Role,
 }
 
-/// One bridge: a child node's bridge (`<node>.bridge`, its control side
-/// `<node>.bridge.ctl`) or a cache.
+/// One link of the fabric (by `Topology::fabric_links` index).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BridgeInfo {
+pub struct LinkInfo {
+    /// Dotted name: the link entry's, or the cache's.
     pub path: String,
-    pub cache: bool,
+    /// The node whose fabric lists the link (a cache: the cache's node).
+    pub node: NeutrinoId,
+    pub control: bool,
+    /// The cache's index in [`Layout::memories`] when the link is a cache.
+    pub cache: Option<usize>,
+    /// `bw_bytes`; `None`: unlimited.
+    pub rate: Option<Ratio>,
+    pub beat: u64,
+    pub latency: u64,
 }
 
 /// One memory of the configuration: a block, a cache or a sync range.
@@ -653,8 +655,8 @@ pub struct MemInfo {
 pub struct Layout {
     /// By `AttachId`.
     pub attachments: Vec<AttachInfo>,
-    /// By bridge index (`Topology::bridges`).
-    pub bridges: Vec<BridgeInfo>,
+    /// By link index (`Topology::fabric_links`).
+    pub links: Vec<LinkInfo>,
     /// The blocks, then the caches, then the sync ranges.
     pub memories: Vec<MemInfo>,
 }
@@ -804,7 +806,7 @@ struct PendingMem {
     slaves: Vec<String>,
 }
 
-/// A cache: a bridge from its slave bus to its master bus through its port.
+/// A cache: a link from its slave bus to its master bus through its port.
 struct PendingCache {
     name: String,
     node: NeutrinoId,
@@ -903,25 +905,24 @@ impl Builder {
         });
     }
 
-    /// Adds a bridge and records its two attachments and its path.
+    /// Adds a link and records its two attachments and its path.
     #[allow(clippy::too_many_arguments)]
-    fn bridge(
+    fn link(
         &mut self,
         (a, a_name, a_role): (BusId, &str, Role),
         (b, b_name, b_role): (BusId, &str, Role),
         (ab, ba): (Lane, Lane),
-        latency: u64,
-        info: BridgeInfo,
+        info: LinkInfo,
         kind: Component,
     ) -> (AttachId, AttachId) {
         let first = AttachId(self.built.sim.topology().attachment_count() as u32);
         let second = AttachId(first.0 + 1);
         self.built
             .sim
-            .add_bridge(a, a_name, b, b_name, ab, ba, latency);
+            .add_link(a, a_name, b, b_name, ab, ba, info.latency);
         self.note_attach(first, &info.path, kind, a_role);
         self.note_attach(second, &info.path, kind, b_role);
-        self.built.layout.bridges.push(info);
+        self.built.layout.links.push(info);
         (first, second)
     }
 
@@ -942,13 +943,9 @@ impl Builder {
                 compute: Vec::new(),
                 neutrino: None,
                 children: Vec::new(),
-                bridge: None,
                 fidelity: None,
             },
         );
-        if root.bridge.is_some() {
-            return err("the root has no bridge");
-        }
         // Parents before children, in configuration order.
         let mut stack: Vec<Pending> = vec![(&root, None, Vec::new(), false)];
         while let Some((sec, parent, fields, parent_numeric)) = stack.pop() {
@@ -970,19 +967,28 @@ impl Builder {
             }
         }
         let mut caches = Vec::new();
+        // (link index, cache number): the cache's memory index is known
+        // once the blocks are in the layout.
+        let mut cache_links = Vec::new();
         for c in std::mem::take(&mut self.caches) {
             let (a, b) = (self.bus(&c.slave, &c.name)?, self.bus(&c.master, &c.name)?);
             let lane = Some(c.port);
             let short = c.name.rsplit('.').next().unwrap_or(&c.name).to_string();
-            let info = BridgeInfo {
+            let res = self.built.sim.resources();
+            let info = LinkInfo {
                 path: c.name.clone(),
-                cache: true,
+                node: c.node,
+                control: false,
+                cache: None,
+                rate: res.flow_rate(c.port),
+                beat: res.flow(c.port).beat().unwrap_or(DEFAULT_BEAT),
+                latency: c.latency,
             };
-            let (x, y) = self.bridge(
+            cache_links.push((self.built.layout.links.len(), caches.len()));
+            let (x, y) = self.link(
                 (a, &short, Role::Slave),
                 (b, &short, Role::Master),
                 (lane, lane),
-                c.latency,
                 info,
                 Component::Memory,
             );
@@ -1015,6 +1021,10 @@ impl Builder {
                 latency: block.load_latency,
             });
             self.built.sim.add_memory(block);
+        }
+        let blocks = self.built.layout.memories.len();
+        for (l, c) in cache_links {
+            self.built.layout.links[l].cache = Some(blocks + c);
         }
         self.built.layout.memories.extend(caches);
         let syncs = std::mem::take(&mut self.syncs);
@@ -1093,34 +1103,25 @@ impl Builder {
                 }
             }
         }
-        // Bridge resources first: data, then control.
-        let bridge = match (parent, &sec.bridge) {
-            (None, _) => None,
-            (Some(_), None) => return err(format!("{path}: a child needs a bridge")),
-            (Some(_), Some(br)) => {
-                let data = self.bus(&resolve(&br.data, &path, ppath)?, &path)?;
-                let control = self.bus(&resolve(&br.control, &path, ppath)?, &path)?;
-                if self.built.sim.topology().bus(data).control
-                    || !self.built.sim.topology().bus(control).control
-                {
-                    return err(format!(
-                        "{path}: bridge data must be a data bus and control a control bus"
-                    ));
-                }
-                let rate = opt_rate(&br.bw_bytes)?;
-                let ctl_rate = opt_rate(&br.control_bw_bytes)?.or(rate);
-                let r = &mut self.built.sim;
-                let up = r.lane(&format!("{path}.bridge.up"), rate);
-                let down = r.lane(&format!("{path}.bridge.down"), rate);
-                let up_ctl = r.lane(&format!("{path}.bridge.up.ctl"), ctl_rate);
-                let down_ctl = r.lane(&format!("{path}.bridge.down.ctl"), ctl_rate);
-                let beat = beat_of(&br.beat_bytes, &path)?;
-                for l in [up, down, up_ctl, down_ctl].into_iter().flatten() {
-                    r.resources_mut().set_beat(l, beat);
-                }
-                Some((data, control, (up, down), (up_ctl, down_ctl), br.latency))
+        // Link resources first, in fabric order (data, then control, as
+        // the configurations list them).
+        let mut links = Vec::new();
+        for b in sec.fabric.iter().filter(|b| is_link(b)) {
+            let lpath = format!("{path}.{}", b.name);
+            let (Some(from), Some(to)) = (&b.from, &b.to) else {
+                return err(format!("{lpath}: a link needs from and to"));
+            };
+            let rate = opt_rate(&b.bw_bytes)?;
+            let beat = beat_of(&b.beat_bytes, &lpath)?;
+            let r = &mut self.built.sim;
+            let ab = r.lane(&format!("{lpath}.ab"), rate);
+            let ba = r.lane(&format!("{lpath}.ba"), rate);
+            for l in [ab, ba].into_iter().flatten() {
+                r.resources_mut().set_beat(l, beat);
             }
-        };
+            let ends = (resolve(from, &path, ppath)?, resolve(to, &path, ppath)?);
+            links.push((b, lpath, ends, (ab, ba), rate, beat));
+        }
         let Some(nsec) = &sec.neutrino else {
             return err(format!(
                 "{path}: no neutrino section (nodes without a Neutrino are not supported yet)"
@@ -1161,13 +1162,16 @@ impl Builder {
         }
         // Buses.
         let mut own_buses = Vec::new();
-        for b in &sec.fabric {
+        for b in sec.fabric.iter().filter(|b| !is_link(b)) {
             let name = format!("{path}.{}", b.name);
+            if b.from.is_some() || b.to.is_some() {
+                return err(format!("{name}: from and to are link keys"));
+            }
             let topology = match b.topology.as_deref().unwrap_or("xbar") {
                 "xbar" => BusTopology::Xbar,
                 "bus" => BusTopology::Shared,
                 "ring" => return err(format!("{name}: topology ring is not implemented")),
-                t => return err(format!("{name}: unknown topology {t:?} (xbar, bus)")),
+                t => return err(format!("{name}: unknown topology {t:?} (xbar, bus, link)")),
             };
             let id = self.built.sim.add_bus(
                 &name,
@@ -1183,10 +1187,9 @@ impl Builder {
             }
             own_buses.push((name, id, b.control));
         }
-        let first = |control: bool| own_buses.iter().find(|b| b.2 == control).map(|b| b.1);
-        let (Some(hub_data), Some(hub_ctl)) = (first(false), first(true)) else {
+        if !own_buses.iter().any(|b| b.2) || !own_buses.iter().any(|b| !b.2) {
             return err(format!("{path}: needs a data bus and a control bus"));
-        };
+        }
         // The Neutrino: its control bus (messages) and its data buses (loads
         // and stores).
         let masters: Vec<String> = match &nsec.master {
@@ -1224,24 +1227,43 @@ impl Builder {
             return err(format!("{path}.neutrino: masters no control bus"));
         };
         self.built.sim.set_hub(nu, nu_ctl, nu_data);
-        if let Some((data, control, (up, down), (up_ctl, down_ctl), latency)) = bridge {
-            for (child, parent, lanes, suffix) in [
-                (hub_data, data, (up, down), ""),
-                (hub_ctl, control, (up_ctl, down_ctl), ".ctl"),
-            ] {
-                let info = BridgeInfo {
-                    path: format!("{path}.bridge{suffix}"),
-                    cache: false,
-                };
-                self.bridge(
-                    (child, "bridge", Role::Both),
-                    (parent, &sec.name, Role::Both),
-                    lanes,
-                    latency,
-                    info,
-                    Component::Bridge,
-                );
+        // The links, after the Neutrino's attachments. A child needs a data
+        // link and a control link to its parent's buses.
+        let mut upward = [false; 2];
+        for (b, lpath, (from, to), lanes, rate, beat) in links {
+            let (fb, tb) = (self.bus(&from, &lpath)?, self.bus(&to, &lpath)?);
+            let topo = self.built.sim.topology();
+            if topo.bus(fb).control != b.control || topo.bus(tb).control != b.control {
+                let kind = if b.control { "control" } else { "data" };
+                return err(format!("{lpath}: a {kind} link joins two {kind} buses"));
             }
+            for bus in [&from, &to] {
+                if ppath.is_some_and(|p| bus_node(bus) == p) {
+                    upward[b.control as usize] = true;
+                }
+            }
+            let info = LinkInfo {
+                path: lpath.clone(),
+                node: nu,
+                control: b.control,
+                cache: None,
+                rate,
+                beat,
+                latency: b.latency,
+            };
+            let (fname, tname) = (attach_name(&lpath, &from), attach_name(&lpath, &to));
+            self.link(
+                (fb, &fname, Role::Both),
+                (tb, &tname, Role::Both),
+                lanes,
+                info,
+                Component::Link,
+            );
+        }
+        if parent.is_some() && upward != [true; 2] {
+            return err(format!(
+                "{path}: a child needs a data link and a control link to its parent's buses"
+            ));
         }
         self.memories(sec, &path, ppath, nu, own.base, numeric)?;
         self.compute(sec, &path, ppath, nu)?;
@@ -1485,7 +1507,29 @@ impl Builder {
     }
 }
 
-/// The default beat of a bus, bridge, memory port, compute element or
+/// True for a `topology: link` fabric entry.
+fn is_link(b: &BusSec) -> bool {
+    b.topology.as_deref() == Some("link")
+}
+
+/// The path of the node that defines bus `bus` (its name less the last
+/// component).
+fn bus_node(bus: &str) -> &str {
+    bus.rsplit_once('.').map_or("", |(n, _)| n)
+}
+
+/// The name of link `link`'s attachment on bus `bus`: the link's path from
+/// the bus's node (`smsbus_to_clsbus` on the link's own node,
+/// `sm1.smsbus_to_clsbus` on its parent's).
+fn attach_name(link: &str, bus: &str) -> String {
+    let node = bus_node(bus);
+    link.strip_prefix(node)
+        .and_then(|r| r.strip_prefix('.'))
+        .unwrap_or(link)
+        .to_string()
+}
+
+/// The default beat of a bus, link, memory port, compute element or
 /// Neutrino (Section 5.4, data-path rule 3).
 const DEFAULT_BEAT: u64 = 64;
 

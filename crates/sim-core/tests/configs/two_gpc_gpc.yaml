@@ -1,10 +1,11 @@
 # A gpc of two_gpc.yaml: its HBM slice, a copy engine, two SMs.
 # The hand-computed tests on this file exclude descriptor assembly:
 # every Neutrino has c_base, c_dep and c_word 0 (c_invoke only).
-bridge: {data: $parent.sbus, control: $parent.cbus, bw_bytes: 64, latency: 20}
 fabric:
   - {name: clsbus, bw_bytes: 64}
   - {name: clcbus, bw_bytes: 64, control: true}
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 64, latency: 20}
+  - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 64, latency: 20, control: true}
 memory:
   - {name: hbm, type: dram, addr: [[0x0, 0x400000]], bw_bytes: 256, latency: 200, slave: $this.clsbus}
   - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}

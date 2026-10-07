@@ -155,13 +155,14 @@ fn one_moe_dispatch() {
     // both SMEM lanes and waits for the up weight's DMA, which holds one
     // lane at 32 B/cycle until 6681: [6681, 7205); up matmul [7205, 7729);
     // down weight from 7259 (latency 50 after the gate matmul's
-    // completion; its SMEM hop after the up matmul, [7729, 9777)); the
-    // vector op waits for that DMA's SMEM lane, [9777, 9809); down matmul
-    // 2 x 264 cycles [9813, 10341), done 10345. Home depends on the down
-    // matmul's output directly (a pin, no end join): Resolve reaches home
-    // at 10413; pull [10463, 10515); add [10529, 10553), done 10557; the
-    // driver resumes at 10557.
-    assert_eq!(r.step_end[0], 10557);
+    // completion; its SMEM hop after the up matmul, [7729, 9777)), done
+    // 9781. The vector op is bound by its Muon, so its SMEM demand takes
+    // one of the two lanes and runs beside that DMA, [7743, 7775). Down
+    // matmul (it reads the down weight) 2 x 264 cycles [9781, 10309), done
+    // 10313. Home depends on the down matmul's output directly (a pin, no
+    // end join): Resolve reaches home at 10381; pull [10431, 10483); add
+    // [10497, 10521), done 10525; the driver resumes at 10525.
+    assert_eq!(r.step_end[0], 10525);
     // 16 Invoke, 2 Await, 2 AwaitAck, 2 Resolve.
     assert_eq!(s.messages, 22);
 }
@@ -327,8 +328,14 @@ fn an_invoke_to_a_full_owner_delays_an_invoke_to_a_free_owner() {
     // Head-of-line cycles on M5's path: S1 M5 [282, T+48); S2 M4
     // [240, T+32); sm0's source queue M2 [16,66), M3 [66,124), M4
     // [124,182), M5 [182,240). None after the port to sm2.
-    assert_eq!(hol("root.gpc0.sm0.bridge.up.ctl.invoke"), t + 48 - 282);
-    assert_eq!(hol("root.gpc0.clcbus.sm0.in.invoke"), t + 32 - 240);
+    assert_eq!(
+        hol("root.gpc0.sm0.smcbus_to_clcbus.ab.invoke"),
+        t + 48 - 282
+    );
+    assert_eq!(
+        hol("root.gpc0.clcbus.sm0.smcbus_to_clcbus.in.invoke"),
+        t + 32 - 240
+    );
     assert_eq!(hol("root.gpc0.sm0.source.invoke"), 50 + 58 + 58 + 58);
-    assert_eq!(hol("root.gpc0.clcbus.sm2.out.invoke"), 0);
+    assert_eq!(hol("root.gpc0.clcbus.sm2.smcbus_to_clcbus.out.invoke"), 0);
 }

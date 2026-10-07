@@ -1,16 +1,19 @@
 # gpc.yaml plus a cluster memory tier: one cmem SRAM block of 64 MiB
 # (2p-cmem-large.yaml: 1.5 GiB) on the data crossbar.
 
-bridge: {data: $parent.sbus, control: $parent.cbus, bw_bytes: 256, latency: 20}
 fidelity: numeric
 fabric:
   - {name: clsbus, topology: xbar, bw_bytes: 512}
   - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
+  # Links to the device: data and control, 256 B/cycle per direction (the
+  # control link at the data rate, as the bridge before it), latency 20.
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, latency: 20}
+  - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 256, latency: 20, control: true}
 memory:
   - {name: hbm, type: dram, addr: [[0x0, 0xF0000000]], bw_bytes: 512, latency: 200,
      slave: $this.clsbus}
   # cmem is L2-class SRAM: port 1024 B/cycle (2x the 512 B/cycle of the four
-  # SM bridges), latency 30 cycles, 64 MiB, above the HBM slice.
+  # SM links), latency 30 cycles, 64 MiB, above the HBM slice.
   - {name: cmem, type: scratch, addr: [[0x100000000, 0x104000000]], bw_bytes: 1024, latency: 30,
      slave: $this.clsbus}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}

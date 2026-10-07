@@ -103,10 +103,10 @@ fn config_builds_owners_and_paths() {
     assert_eq!(
         names,
         vec![
-            "root.gpc0.sm0.bridge.up",
-            "root.gpc0.clsbus.sm0.in",
-            "root.gpc0.clsbus.sm1.out",
-            "root.gpc0.sm1.bridge.down"
+            "root.gpc0.sm0.smsbus_to_clsbus.ab",
+            "root.gpc0.clsbus.sm0.smsbus_to_clsbus.in",
+            "root.gpc0.clsbus.sm1.smsbus_to_clsbus.out",
+            "root.gpc0.sm1.smsbus_to_clsbus.ba"
         ]
     );
     // From the cluster's Neutrino (an attachment of clsbus) to sm0: its
@@ -122,8 +122,8 @@ fn config_builds_owners_and_paths() {
         names,
         vec![
             "root.gpc0.clsbus.neutrino.in",
-            "root.gpc0.clsbus.sm0.out",
-            "root.gpc0.sm0.bridge.down"
+            "root.gpc0.clsbus.sm0.smsbus_to_clsbus.out",
+            "root.gpc0.sm0.smsbus_to_clsbus.ba"
         ]
     );
     // Up to the device: two links.
@@ -387,10 +387,10 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     assert_eq!((t.chunks[0].start, t.chunks[0].end), (108, 384));
     assert_eq!(t.complete, Some(388));
     for name in [
-        "root.gpc0.sm1.bridge.up",
-        "root.gpc0.clsbus.sm1.in",
-        "root.gpc0.clsbus.sm0.out",
-        "root.gpc0.sm0.bridge.down",
+        "root.gpc0.sm1.smsbus_to_clsbus.ab",
+        "root.gpc0.clsbus.sm1.smsbus_to_clsbus.in",
+        "root.gpc0.clsbus.sm0.smsbus_to_clsbus.out",
+        "root.gpc0.sm0.smsbus_to_clsbus.ba",
     ] {
         assert_eq!(
             s.resources[res(&s, name).0 as usize].busy_cycles,
@@ -402,7 +402,7 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     // narrowest (the hops after it are narrowed to its rate).
     assert_eq!(
         t.chunks[0].culprit,
-        Some(res(&s, "root.gpc0.sm1.bridge.up"))
+        Some(res(&s, "root.gpc0.sm1.smsbus_to_clsbus.ab"))
     );
 }
 

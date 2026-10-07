@@ -36,18 +36,18 @@ fn an_xbar_charges_ports_and_a_bus_one_resource() {
     assert_eq!(
         names(&b, sm0, cl),
         vec![
-            "root.gpc0.sm0.bridge.up",
-            "root.gpc0.clsbus.sm0.in",
+            "root.gpc0.sm0.smsbus_to_clsbus.ab",
+            "root.gpc0.clsbus.sm0.smsbus_to_clsbus.in",
             "root.gpc0.clsbus.neutrino.out"
         ]
     );
     assert_eq!(
         names(&b, sm1, sm0),
         vec![
-            "root.gpc0.sm1.bridge.up",
-            "root.gpc0.clsbus.sm1.in",
-            "root.gpc0.clsbus.sm0.out",
-            "root.gpc0.sm0.bridge.down"
+            "root.gpc0.sm1.smsbus_to_clsbus.ab",
+            "root.gpc0.clsbus.sm1.smsbus_to_clsbus.in",
+            "root.gpc0.clsbus.sm0.smsbus_to_clsbus.out",
+            "root.gpc0.sm0.smsbus_to_clsbus.ba"
         ]
     );
     // bus: one shared resource for every transfer on it.
@@ -55,9 +55,9 @@ fn an_xbar_charges_ports_and_a_bus_one_resource() {
     assert_eq!(
         names(&b, sm1, sm0),
         vec![
-            "root.gpc0.sm1.bridge.up",
+            "root.gpc0.sm1.smsbus_to_clsbus.ab",
             "root.gpc0.clsbus",
-            "root.gpc0.sm0.bridge.down"
+            "root.gpc0.sm0.smsbus_to_clsbus.ba"
         ]
     );
     // ring: not implemented.
@@ -248,22 +248,22 @@ fn every_gpc_owns_its_hbm_slice() {
         dma_route(&b, "root.gpc0.sm1.dma", "root.gpc0.hbm"),
         vec![
             "root.gpc0.clsbus.hbm.in",
-            "root.gpc0.clsbus.sm1.out",
-            "root.gpc0.sm1.bridge.down"
+            "root.gpc0.clsbus.sm1.smsbus_to_clsbus.out",
+            "root.gpc0.sm1.smsbus_to_clsbus.ba"
         ]
     );
     assert_eq!(
         dma_route(&b, "root.gpc0.sm1.dma", "root.gpc1.hbm"),
         vec![
             "root.gpc1.clsbus.hbm.in",
-            "root.gpc1.clsbus.bridge.out",
-            "root.gpc1.bridge.up",
-            "root.sbus.gpc1.in",
-            "root.sbus.gpc0.out",
-            "root.gpc0.bridge.down",
-            "root.gpc0.clsbus.bridge.in",
-            "root.gpc0.clsbus.sm1.out",
-            "root.gpc0.sm1.bridge.down"
+            "root.gpc1.clsbus.clsbus_to_sbus.out",
+            "root.gpc1.clsbus_to_sbus.ab",
+            "root.sbus.gpc1.clsbus_to_sbus.in",
+            "root.sbus.gpc0.clsbus_to_sbus.out",
+            "root.gpc0.clsbus_to_sbus.ba",
+            "root.gpc0.clsbus.clsbus_to_sbus.in",
+            "root.gpc0.clsbus.sm1.smsbus_to_clsbus.out",
+            "root.gpc0.sm1.smsbus_to_clsbus.ba"
         ]
     );
 }
@@ -283,7 +283,7 @@ fn one_gpc_file_is_instantiated_twice() {
             assert!(b
                 .sim
                 .resources()
-                .by_name(&format!("root.gpc{g}.clsbus.sm{s}.in"))
+                .by_name(&format!("root.gpc{g}.clsbus.sm{s}.smsbus_to_clsbus.in"))
                 .is_some());
         }
     }
@@ -293,32 +293,28 @@ fn one_gpc_file_is_instantiated_twice() {
 }
 
 #[test]
-fn a_child_entry_overrides_its_files_bridge() {
-    // The bridge is in the child's file (two_sm_sm.yaml: 32 B/cycle); the
-    // parent's entry for sm1 overrides its width only, so the parent buses
-    // stay those of the file.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/configs");
-    let text = std::fs::read_to_string(dir.join("two_sm.yaml"))
-        .unwrap()
-        .replace(
-            "- {name: sm1, config: two_sm_sm.yaml}",
-            "- {name: sm1, config: two_sm_sm.yaml, bridge: {bw_bytes: 16}}",
-        );
-    let b = sim_core::build_config_str::<&str>(&text, &dir, &[], ProfileRegistry::with_builtins())
-        .unwrap();
+fn a_set_overrides_one_link_of_a_child() {
+    // The links are in the child's file (two_sm_sm.yaml: 32 B/cycle); an
+    // override by name changes sm1's two links only, and their buses stay
+    // those of the file.
+    let b = two_sm(&[
+        "root.gpc0.sm1.smsbus_to_clsbus.bw_bytes=16",
+        "root.gpc0.sm1.smcbus_to_clcbus.bw_bytes=16",
+    ])
+    .unwrap();
     let rate = |n: &str| {
         let r = b.sim.resources();
         let x = r.flow(r.by_name(n).unwrap()).rate();
         x.num / x.den
     };
-    assert_eq!(rate("root.gpc0.sm0.bridge.up"), 32);
-    assert_eq!(rate("root.gpc0.sm1.bridge.up"), 16);
-    assert_eq!(rate("root.gpc0.sm1.bridge.down.ctl"), 16);
+    assert_eq!(rate("root.gpc0.sm0.smsbus_to_clsbus.ab"), 32);
+    assert_eq!(rate("root.gpc0.sm1.smsbus_to_clsbus.ab"), 16);
+    assert_eq!(rate("root.gpc0.sm1.smcbus_to_clcbus.ba"), 16);
     assert_eq!(
         names(&b, "root.gpc0.sm1", "root.gpc0"),
         vec![
-            "root.gpc0.sm1.bridge.up",
-            "root.gpc0.clsbus.sm1.in",
+            "root.gpc0.sm1.smsbus_to_clsbus.ab",
+            "root.gpc0.clsbus.sm1.smsbus_to_clsbus.in",
             "root.gpc0.clsbus.neutrino.out"
         ]
     );
@@ -346,8 +342,12 @@ device:
   neutrino: {}
   children:
     - name: sm0
-      bridge: {data: $parent.sbus, control: $parent.cbus, bw_bytes: 16, latency: 20}
-      fabric: [{name: smsbus}, {name: smcbus, control: true}, {name: lbus}]
+      fabric:
+        - {name: smsbus}
+        - {name: smcbus, control: true}
+        - {name: lbus}
+        - {name: smsbus_to_sbus, topology: link, from: $this.smsbus, to: $parent.sbus, bw_bytes: 16, latency: 20}
+        - {name: smcbus_to_cbus, topology: link, from: $this.smcbus, to: $parent.cbus, bw_bytes: 16, latency: 20, control: true}
       memory:
         - {name: smem, type: scratch, addr: [[0x0, 0x10000]], bw_bytes: 128, slave: [$this.lbus, $this.smsbus]}
         - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
@@ -469,7 +469,10 @@ fn demands_record_reads_and_writes() {
     };
     let (hr, hw, _) = r("root.hbm.port");
     assert!(hr > 0 && hw == 0, "HBM port: read");
-    for n in ["root.gpc0.bridge.down", "root.gpc0.sm0.bridge.down"] {
+    for n in [
+        "root.gpc0.clsbus_to_sbus.ba",
+        "root.gpc0.sm0.smsbus_to_clsbus.ba",
+    ] {
         let (rd, wr, _) = r(n);
         assert!(rd > 0 && wr == 0, "{n}: on the route to the engine, read");
     }
@@ -491,7 +494,7 @@ fn demands_record_reads_and_writes() {
 }
 
 /// One SM under the device: HBM (1024 B/cycle) at the device, the SM's
-/// bridge at 128 B/cycle with no latency, SMEM at 1024 B/cycle, and a DMA
+/// link at 128 B/cycle with no latency, SMEM at 1024 B/cycle, and a DMA
 /// engine with the compute keys `dma` (`burst_bytes`, `outstanding`,
 /// `latency`). No descriptor assembly.
 fn burst_node(dma: &str) -> Built {
@@ -509,8 +512,12 @@ device:
   neutrino: {{c_base: 0, c_dep: 0, c_word: 0}}
   children:
     - name: sm0
-      bridge: {{data: $parent.sbus, control: $parent.cbus, bw_bytes: 128, latency: 0}}
-      fabric: [{{name: smsbus}}, {{name: smcbus, control: true}}, {{name: lbus}}]
+      fabric:
+        - {{name: smsbus}}
+        - {{name: smcbus, control: true}}
+        - {{name: lbus}}
+        - {{name: smsbus_to_sbus, topology: link, from: $this.smsbus, to: $parent.sbus, bw_bytes: 128}}
+        - {{name: smcbus_to_cbus, topology: link, from: $this.smcbus, to: $parent.cbus, bw_bytes: 128, control: true}}
       memory:
         - {{name: smem, type: scratch, addr: [[0x0, 0x10000]], bw_bytes: 1024, slave: [$this.lbus, $this.smsbus]}}
         - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
@@ -645,4 +652,89 @@ device:
         vec!["root.dma: beat_bytes 512 exceeds every bus it masters (at most 256 B/cycle)"]
     );
     assert!(warnings(256).is_empty());
+}
+
+#[test]
+fn a_cache_is_a_link_through_its_port() {
+    // l2 is a slave on sbus and a master on mbus, where HBM is: a link from
+    // sbus to mbus whose two directions are the cache's port, with `cache`
+    // its memory; the cache stays a memory whose attachments are the
+    // link's ends.
+    let b = build_config(
+        "global:
+  neutrino_granule: 512
+  address: {fields: [{name: sm, bits: 2}], offset_bits: 24}
+device:
+  name: root
+  fabric: [{name: sbus}, {name: mbus}, {name: cbus, control: true}]
+  memory:
+    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], bw_bytes: 64, slave: $this.mbus}
+    - {name: l2, type: cache, addr: [[0x0, 0x100000]], bw_bytes: 256, latency: 5, slave: $this.sbus, master: $this.mbus}
+    - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+  neutrino: {}
+",
+        ProfileRegistry::with_builtins(),
+    )
+    .unwrap();
+    let topo = b.sim.topology();
+    let links = &b.layout.links;
+    assert_eq!(links.len(), 1);
+    let (info, link) = (&links[0], &topo.fabric_links()[0]);
+    assert_eq!(info.path, "root.l2");
+    let mem = &b.layout.memories[info.cache.expect("a cache link")];
+    assert_eq!((mem.path.as_str(), mem.kind), ("root.l2", "cache"));
+    assert_eq!(link.ab, mem.port);
+    assert_eq!(link.ba, mem.port);
+    assert_eq!(mem.attachments, vec![link.att_a, link.att_b]);
+    assert_eq!(link.latency, 5);
+}
+
+#[test]
+fn a_child_needs_links_to_its_parent_and_a_link_joins_like_buses() {
+    let config = |sm0_fabric: &str| {
+        build_config(
+            &format!(
+                "global:
+  neutrino_granule: 512
+  address: {{fields: [{{name: sm, bits: 2}}], offset_bits: 24}}
+device:
+  name: root
+  fabric: [{{name: sbus}}, {{name: cbus, control: true}}]
+  memory:
+    - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
+  neutrino: {{}}
+  children:
+    - name: sm0
+      fabric: {sm0_fabric}
+      neutrino: {{}}
+"
+            ),
+            ProfileRegistry::with_builtins(),
+        )
+        .err()
+        .map(|e| e.to_string())
+    };
+    let e = config("[{name: smsbus}, {name: smcbus, control: true}]").unwrap();
+    assert!(
+        e.contains("a child needs a data link and a control link"),
+        "{e}"
+    );
+    let e = config(
+        "[{name: smsbus}, {name: smcbus, control: true},
+         {name: up, topology: link, from: $this.smsbus, to: $parent.sbus},
+         {name: up_ctl, topology: link, from: $this.smcbus, to: $parent.sbus, control: true}]",
+    )
+    .unwrap();
+    assert!(
+        e.contains("root.sm0.up_ctl: a control link joins two control buses"),
+        "{e}"
+    );
+    assert_eq!(
+        config(
+            "[{name: smsbus}, {name: smcbus, control: true},
+             {name: up, topology: link, from: $this.smsbus, to: $parent.sbus},
+             {name: up_ctl, topology: link, from: $this.smcbus, to: $parent.cbus, control: true}]"
+        ),
+        None
+    );
 }

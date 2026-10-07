@@ -433,9 +433,9 @@ fn backpressure_holds_invokes_across_two_hops() {
     // and M3 [214,392); the stage after the port to sm1 M3 [58,200); none
     // after the port from sm0; sm0's source queue M2 [16,24) and M3
     // [24,40).
-    assert_eq!(hol("root.gpc0.sm1.bridge.down.ctl.invoke"), 144 + 178);
-    assert_eq!(hol("root.gpc0.clcbus.sm1.out.invoke"), 142);
-    assert_eq!(hol("root.gpc0.clcbus.sm0.in.invoke"), 0);
+    assert_eq!(hol("root.gpc0.sm1.smcbus_to_clcbus.ba.invoke"), 144 + 178);
+    assert_eq!(hol("root.gpc0.clcbus.sm1.smcbus_to_clcbus.out.invoke"), 142);
+    assert_eq!(hol("root.gpc0.clcbus.sm0.smcbus_to_clcbus.in.invoke"), 0);
     assert_eq!(hol("root.gpc0.sm0.source.invoke"), 8 + 16);
 }
 
@@ -472,7 +472,7 @@ fn the_deadlock_detector_fires_on_a_cycle() {
     assert_eq!((t1.scoreboard, t1.inbound_invokes, t1.pending), (1, 1, 1));
     assert_eq!(tables[sm0.0 as usize].outbound_invokes, 0);
     assert_eq!(stages.len(), 1, "{stages:?}");
-    assert_eq!(stages[0].stage, "root.gpc0.sm1.bridge.down.ctl.invoke");
+    assert_eq!(stages[0].stage, "root.gpc0.sm1.smcbus_to_clcbus.ba.invoke");
     assert_eq!(stages[0].messages, 1);
 }
 

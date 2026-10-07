@@ -585,10 +585,11 @@ impl Sim {
         })
     }
 
-    /// Adds a bridge from `a` (attached as `a_name`) to `b` (attached as
-    /// `b_name`) with the resource of each direction (`ab` from `a` to `b`).
+    /// Adds a link from bus `a` (attached as `a_name`) to bus `b` (attached
+    /// as `b_name`) with the resource of each direction (`ab` from `a` to
+    /// `b`).
     #[allow(clippy::too_many_arguments)]
-    pub fn add_bridge(
+    pub fn add_link(
         &mut self,
         a: BusId,
         a_name: &str,
@@ -599,7 +600,7 @@ impl Sim {
         latency: Cycle,
     ) {
         let (att_a, att_b) = (self.attach(a, a_name, true), self.attach(b, b_name, true));
-        self.topo.add_bridge(att_a, att_b, ab, ba, latency);
+        self.topo.add_link(att_a, att_b, ab, ba, latency);
     }
 
     /// The attachments of Neutrino `nu`: on its control bus (messages) and

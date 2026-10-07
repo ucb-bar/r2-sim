@@ -3,16 +3,19 @@
 # root.gpcN.sm0 .. sm3.
 
 # Bridge to the device: 256 B/cycle each way, latency 20 cycles.
-bridge: {data: $parent.sbus, control: $parent.cbus, bw_bytes: 256, latency: 20}
 # SMEM keeps data (router outputs, activations); HBM has no values:
 # weights have no values, and a DMA from HBM copies nothing.
 fidelity: numeric
 fabric:
-  # Data crossbar 512 B/cycle: four SM bridges at full rate, and the HBM
+  # Data crossbar 512 B/cycle: four SM links at full rate, and the HBM
   # slice.
   - {name: clsbus, topology: xbar, bw_bytes: 512}
   # Control crossbar 64 B/cycle per port.
   - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
+  # Links to the device: data and control, 256 B/cycle per direction (the
+  # control link at the data rate, as the bridge before it), latency 20.
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, latency: 20}
+  - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 256, latency: 20, control: true}
 memory:
   # The gpc's HBM slice (NUMA, architecture Section 8.2): 3.75 GiB, half of
   # the 7.5 GiB of the 2p device; 512 B/cycle at 1 GHz, about the per-GPC

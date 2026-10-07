@@ -27,11 +27,15 @@
 #   tables count messages (a multi-beat message is one entry). The 5a
 #   values are in 2p-smallrefs.yaml.
 
-bridge: {data: $parent.clsbus, control: $parent.clcbus, bw_bytes: 128, latency: 10}
 fabric:
   - {name: smsbus, topology: xbar}
   - {name: smcbus, topology: xbar, control: true}
   - {name: lbus, topology: xbar}
+  # Links to the gpc (architecture Section 8.2): data and control, each
+  # 128 B/cycle per direction (the control link at the data rate, as the
+  # bridge before it), latency 10 cycles.
+  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 128, latency: 10}
+  - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 128, latency: 10, control: true}
 memory:
   - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 256, latency: 10,
      slave: [$this.lbus, $this.smsbus]}

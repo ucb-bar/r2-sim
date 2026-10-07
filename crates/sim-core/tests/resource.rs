@@ -228,3 +228,31 @@ fn narrow_flows_share_the_lanes_of_a_wide_port() {
         .collect();
     assert_eq!(ends, vec![(0, 32), (32, 64)]);
 }
+
+#[test]
+fn an_array_bound_chunk_leaves_port_lanes_to_a_dma() {
+    // SMEM port 256 B/cycle of 64 B beats: 4 lanes. A DMA at its 64 B beat
+    // holds one lane for 6400 / 64 = 100 cycles, [0, 100).
+    let mut r = Resources::new();
+    let port = r.add_flow("smem.port", Kind::Bandwidth, Ratio::int(256));
+    r.set_beat(port, 64);
+    let array = r.add_flow("array", Kind::TensorOps, Ratio::int(10));
+    let dma = r
+        .reserve_path(&[hop(port, 6400, 0)], Ratio::int(64), 0)
+        .unwrap();
+    assert_eq!((dma.start, dma.end), (0, 100));
+    // An array-bound matmul: 1000 MAC at 10 per cycle, D = 100; its 12800
+    // B on the port need ceil(12800 / (100 x 64)) = 2 lanes for D. Two of
+    // the three free lanes: it runs beside the DMA.
+    let mm = r
+        .reserve(&[Demand::work(array, 1000), Demand::read(port, 12800)], 0)
+        .unwrap();
+    assert_eq!((mm.start, mm.end, mm.culprit), (0, 100, array));
+    assert_eq!(r.stats()[port.0 as usize].busy_cycles, 100 + 2 * 100);
+    // A port-bound matmul (51200 B: 200 cycles at the full port, D = 200)
+    // needs all 4 lanes and waits for the DMA's lane: [100, 300).
+    let mm = r
+        .reserve(&[Demand::work(array, 1000), Demand::read(port, 51200)], 0)
+        .unwrap();
+    assert_eq!((mm.start, mm.end, mm.culprit), (100, 300, port));
+}

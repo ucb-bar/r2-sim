@@ -28,10 +28,11 @@ device:
   neutrino: {c_base: 0, c_dep: 0, c_word: 0}
   children:
     - name: gpc0
-      bridge: {data: $parent.sbus, control: $parent.cbus, bw_bytes: 64, latency: 20}
       fabric:
         - {name: clsbus, bw_bytes: 64}
         - {name: clcbus, bw_bytes: 64, control: true}
+        - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 64, latency: 20}
+        - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 64, latency: 20, control: true}
       memory:
         - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
       neutrino: {c_base: 0, c_dep: 0, c_word: 0}

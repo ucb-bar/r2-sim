@@ -27,8 +27,8 @@ mod writers;
 
 pub use config::{
     build as build_config, build_file as build_config_file, build_str as build_config_str,
-    AttachInfo, BridgeInfo, Built, Component, ConfigError, Layout, MemBlock, MemInfo,
-    NeutrinoConfig, NuCosts, PeConfig, PeParams, RaceCheck, Role,
+    AttachInfo, Built, Component, ConfigError, Layout, LinkInfo, MemBlock, MemInfo, NeutrinoConfig,
+    NuCosts, PeConfig, PeParams, RaceCheck, Role,
 };
 pub use func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
 pub use profile::{
@@ -47,7 +47,7 @@ pub use stats::{
 };
 pub use time::{Cycle, Ratio};
 pub use topology::{
-    AttachId, Attachment, Bridge, Bus, BusId, BusTopology, Hop, Lane, Link, Path, TopoNode,
+    AttachId, Attachment, Bus, BusId, BusTopology, FabricLink, Hop, Lane, Link, Path, TopoNode,
     Topology,
 };
 pub use tracer::{
