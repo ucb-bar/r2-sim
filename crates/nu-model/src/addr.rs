@@ -1,9 +1,11 @@
-//! Global addresses, ranges, and prefix ownership.
+//! Global addresses, ranges, address sets, and ownership.
 //!
 //! Addresses are 64 bit. The high bits are prefix fields that select a node
 //! of the hardware tree; the owner of an address is the Neutrino whose
-//! prefix covers it. The field layout comes from the configuration, so this
-//! module only sees the result: a sorted list of owner ranges.
+//! address sets contain it (architecture Section 3.1). The field layout
+//! comes from the configuration, so this module only sees the result: the
+//! owners' address sets. Task write ranges and transfer spans stay
+//! contiguous [`Range`]s; ownership and memory blocks use [`AddressSet`]s.
 
 use std::fmt;
 
@@ -79,45 +81,186 @@ impl fmt::Display for Range {
     }
 }
 
-/// Maps addresses to their owning Neutrino.
+/// A set of addresses in the Chisel/Rocket sense: `mask` marks the
+/// address bits that are free, so the set holds `a` when
+/// `(a & !mask) == base`. `base & mask == 0` always. A block of a
+/// power-of-two size aligned to its base is `base` with `mask = size - 1`;
+/// a slice of an interleaved memory has free bits above and below its
+/// selector bits.
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AddressSet {
+    pub base: u64,
+    pub mask: u64,
+}
+
+impl AddressSet {
+    /// Builds a set; panics if `base` has a bit of `mask`.
+    pub fn new(base: u64, mask: u64) -> Self {
+        assert!(
+            base & mask == 0,
+            "address set base {base:#x} has bits of its mask {mask:#x}"
+        );
+        Self { base, mask }
+    }
+
+    /// The block `[base, base + size)`; panics unless `size` is a power of
+    /// two and `base` a multiple of it.
+    pub fn block(base: u64, size: u64) -> Self {
+        assert!(
+            size.is_power_of_two() && base.is_multiple_of(size),
+            "[{base:#x}, +{size:#x}) is not an aligned power-of-two block"
+        );
+        Self::new(base, size - 1)
+    }
+
+    /// The fewest aligned power-of-two blocks whose union is `r`, in
+    /// address order. Empty for an empty range.
+    pub fn decompose(r: &Range) -> Vec<AddressSet> {
+        let mut out = Vec::new();
+        let mut a = r.base;
+        while a < r.bound {
+            // The largest block that starts at `a` (its alignment) and fits.
+            let align = if a == 0 {
+                1u64 << 63
+            } else {
+                1u64 << a.trailing_zeros()
+            };
+            let mut size = align;
+            while size > r.bound - a {
+                size >>= 1;
+            }
+            out.push(Self::block(a, size));
+            a += size;
+        }
+        out
+    }
+
+    /// True when the set holds `addr`.
+    pub fn contains(&self, addr: Addr) -> bool {
+        addr.0 & !self.mask == self.base
+    }
+
+    /// True when the two sets share an address.
+    pub fn overlaps(&self, other: &AddressSet) -> bool {
+        (self.base ^ other.base) & !self.mask & !other.mask == 0
+    }
+
+    /// The low part of the mask: its trailing ones.
+    fn low(&self) -> u64 {
+        self.mask & !(self.mask.wrapping_add(1))
+    }
+
+    /// The contiguous bytes from `addr` inside the set (0 when the set
+    /// does not hold `addr`): `size - offset` for a block, `G - (addr mod
+    /// G)` for a slice of interleave `G`.
+    pub fn run(&self, addr: u64) -> u64 {
+        if !self.contains(Addr(addr)) {
+            return 0;
+        }
+        let low = self.low();
+        (low - (addr & low)).saturating_add(1)
+    }
+
+    /// True when the set holds every byte of `r` (a nonempty range).
+    pub fn covers(&self, r: &Range) -> bool {
+        !r.is_empty() && self.run(r.base) >= r.len()
+    }
+
+    /// True when the set is one contiguous block.
+    pub fn is_contiguous(&self) -> bool {
+        self.mask == self.low()
+    }
+
+    /// Bytes in the set (saturated at `u64::MAX`).
+    pub fn size(&self) -> u64 {
+        1u64.checked_shl(self.mask.count_ones()).unwrap_or(u64::MAX)
+    }
+
+    /// The lowest and one past the highest address of the set: the
+    /// extent of a contiguous set.
+    pub fn extent(&self) -> Range {
+        Range::new(self.base, (self.base | self.mask).saturating_add(1))
+    }
+}
+
+impl fmt::Display for AddressSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{base {:#x}, mask {:#x}}}", self.base, self.mask)
+    }
+}
+
+/// Maps addresses to their owning Neutrino by address set.
 ///
-/// Owner ranges are disjoint and sorted by base. A prefix in the address
-/// layout is always a contiguous range, so a sorted list is enough and the
-/// map stays independent of the field layout.
+/// Sets are disjoint. Contiguous sets (every prefix and plain block) are
+/// kept sorted by base for a binary search; other sets are searched in
+/// order.
 #[derive(Debug, Clone, Default)]
 pub struct OwnerMap {
-    owners: Vec<(Range, NeutrinoId)>,
+    /// Contiguous sets by base, as extents.
+    blocks: Vec<(Range, NeutrinoId)>,
+    /// The other sets.
+    sets: Vec<(AddressSet, NeutrinoId)>,
 }
 
 impl OwnerMap {
-    /// Adds an owner range. Panics if it overlaps an existing one.
-    pub fn insert(&mut self, range: Range, owner: NeutrinoId) {
-        for (r, o) in &self.owners {
-            assert!(
-                !r.overlaps(&range),
-                "owner range {range} overlaps {r} of {o:?}"
-            );
+    /// Adds an owner set. Panics if it overlaps an existing one.
+    pub fn insert(&mut self, set: AddressSet, owner: NeutrinoId) {
+        let all = self
+            .blocks
+            .iter()
+            .flat_map(|(r, o)| AddressSet::decompose(r).into_iter().map(move |s| (s, *o)))
+            .chain(self.sets.iter().copied());
+        for (s, o) in all {
+            assert!(!s.overlaps(&set), "owner set {set} overlaps {s} of {o:?}");
         }
-        let pos = self.owners.partition_point(|(r, _)| r.base < range.base);
-        self.owners.insert(pos, (range, owner));
+        if set.is_contiguous() {
+            let r = set.extent();
+            let pos = self.blocks.partition_point(|(b, _)| b.base < r.base);
+            self.blocks.insert(pos, (r, owner));
+        } else {
+            self.sets.push((set, owner));
+        }
+    }
+
+    /// Adds the sets of the range `r` (its decomposition).
+    pub fn insert_range(&mut self, r: &Range, owner: NeutrinoId) {
+        for s in AddressSet::decompose(r) {
+            self.insert(s, owner);
+        }
+    }
+
+    /// The owner of `addr` and the contiguous bytes from `addr` in the
+    /// set that holds it.
+    fn lookup(&self, addr: u64) -> Option<(NeutrinoId, u64)> {
+        let i = self.blocks.partition_point(|(r, _)| r.bound <= addr);
+        if let Some((r, o)) = self.blocks.get(i).filter(|(r, _)| r.contains(Addr(addr))) {
+            return Some((*o, r.bound - addr));
+        }
+        self.sets
+            .iter()
+            .find(|(s, _)| s.contains(Addr(addr)))
+            .map(|(s, o)| (*o, s.run(addr)))
     }
 
     /// The Neutrino that owns `addr`, if any.
     pub fn owner_of(&self, addr: Addr) -> Option<NeutrinoId> {
-        let i = self.owners.partition_point(|(r, _)| r.bound <= addr.0);
-        self.owners
-            .get(i)
-            .filter(|(r, _)| r.contains(addr))
-            .map(|(_, o)| *o)
+        self.lookup(addr.0).map(|(o, _)| o)
     }
 
-    /// The Neutrino that owns the whole `range`, or `None` if the range is
-    /// unowned or crosses an owner boundary.
+    /// The Neutrino that owns the whole `range` (in one or more of its
+    /// sets), or `None` if a byte is unowned or another Neutrino's.
     pub fn owner_of_range(&self, range: &Range) -> Option<NeutrinoId> {
-        let i = self.owners.partition_point(|(r, _)| r.bound <= range.base);
-        self.owners
-            .get(i)
-            .filter(|(r, _)| r.covers(range))
-            .map(|(_, o)| *o)
+        let (owner, mut run) = self.lookup(range.base)?;
+        let mut a = range.base;
+        while range.bound - a > run {
+            a += run;
+            let (o, r) = self.lookup(a)?;
+            if o != owner {
+                return None;
+            }
+            run = r;
+        }
+        Some(owner)
     }
 }

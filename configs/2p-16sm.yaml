@@ -1,5 +1,5 @@
 # 2p.yaml with four gpcs of 4 SMs (16 SMs; the SM-count axis of the
-# sensitivity sweep): four HBM slices of 3.75 GiB at 512 B/cycle each.
+# sensitivity sweep): four HBM slices of 4 GiB at 512 B/cycle each.
 
 global:
   neutrino_granule: 512    # Neutrino2 range alignment

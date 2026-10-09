@@ -1613,6 +1613,9 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         if let Some(p) = m.port {
             set_role(p, json!({"type": "mem_port", "memory": i}));
         }
+        if let Some(w) = m.wport {
+            set_role(w, json!({"type": "mem_port", "memory": i, "write": true}));
+        }
     }
     let pe_rows: Vec<Value> = (0..sim.pe_count())
         .map(|i| {
@@ -1720,6 +1723,9 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             })
         })
         .collect();
+    // A sliced memory's blocks are not contiguous ranges: with slices, every
+    // memory also gives its address sets (`sets`, [base, mask]).
+    let sliced = lay.memories.iter().any(|m| m.sliced);
     let mem_rows: Vec<Value> = lay
         .memories
         .iter()
@@ -1730,13 +1736,25 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 .iter()
                 .map(|r| json!([hex(r.base), hex(r.bound)]))
                 .collect();
-            json!({
+            let mut row = json!({
                 "id": i, "path": m.path, "node": m.node.0, "type": m.kind, "ranges": ranges,
                 "attachments": m.attachments.iter().map(|a| a.0).collect::<Vec<_>>(),
                 "port": m.port.map(|p| p.0),
                 "bw_bytes": bw(m.port.and_then(|p| res.flow_rate(p))),
                 "latency": m.latency,
-            })
+            });
+            if sliced {
+                row["sets"] = m
+                    .sets
+                    .iter()
+                    .map(|s| json!([hex(s.base), hex(s.mask)]))
+                    .collect();
+            }
+            if let Some(w) = m.wport {
+                row["wport"] = json!(w.0);
+                row["wr_bytes"] = bw(res.flow_rate(w));
+            }
+            row
         })
         .collect();
 

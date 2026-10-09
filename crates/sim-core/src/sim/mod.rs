@@ -229,6 +229,14 @@ struct Running {
     /// Next chunk to request.
     next: usize,
     ended: usize,
+    /// A transfer (its chunks have a fabric path): chunks are issued at
+    /// the engine's beat rate, not when the previous one ends (Section
+    /// 5.3, issue-driven chunks).
+    stream: bool,
+    /// Streaming: the next chunk is due but the outstanding cap holds it.
+    held: bool,
+    /// Streaming: the latest end of the chunks issued so far.
+    last_end: Cycle,
 }
 
 struct Pe {
@@ -267,6 +275,12 @@ pub struct Sim {
     pes: Vec<Pe>,
     res: Resources,
     memories: Vec<MemBlock>,
+    /// The routing function of transfers, built at the start of the run.
+    routes: crate::profile::TransferRoutes,
+    /// The hops of the transfer chunk being reserved (kept across chunks).
+    hop_buf: Vec<PathHop>,
+    /// Some memory block is a slice.
+    any_sliced: bool,
     profiles: ProfileRegistry,
     /// The backend before the run; it moves into `plane` at the start.
     backend: Option<Box<dyn FunctionalBackend>>,
@@ -330,6 +344,9 @@ impl Sim {
             pes: Vec::new(),
             res: Resources::new(),
             memories: Vec::new(),
+            routes: Default::default(),
+            hop_buf: Vec::new(),
+            any_sliced: false,
             profiles,
             backend: Some(Box::new(NullBackend)),
             plane: None,
@@ -535,6 +552,7 @@ impl Sim {
             lane,
             latency,
             control,
+            block: None,
         })
     }
 
@@ -604,6 +622,17 @@ impl Sim {
         self.topo.add_link(att_a, att_b, ab, ba, latency);
     }
 
+    /// Sets the transaction size (`block_bytes`) of a bus.
+    pub fn set_bus_block(&mut self, bus: BusId, block: u64) {
+        self.topo.set_bus_block(bus, block);
+    }
+
+    /// Sets the transaction size (`block_bytes`) of the fabric link of
+    /// index `link` (in [`Topology::fabric_links`] order).
+    pub fn set_link_block(&mut self, link: usize, block: u64) {
+        self.topo.set_link_block(link, block);
+    }
+
     /// The attachments of Neutrino `nu`: on its control bus (messages) and
     /// on its data buses (loads and stores).
     pub fn set_hub(&mut self, nu: NeutrinoId, control: AttachId, data: Vec<AttachId>) {
@@ -648,7 +677,7 @@ impl Sim {
     fn push_neutrino(&mut self, cfg: NeutrinoConfig, owned: &[Range]) -> NeutrinoId {
         let id = NeutrinoId(self.nus.len() as u32);
         for r in owned {
-            self.owners.insert(*r, id);
+            self.owners.insert_range(r, id);
         }
         let scalar = self.res.add_flow(
             &format!("{}.scalar", cfg.name),
@@ -786,7 +815,39 @@ impl Sim {
 
     /// Adds a memory block.
     pub fn add_memory(&mut self, mem: MemBlock) {
+        self.any_sliced |= mem.sliced;
         self.memories.push(mem);
+    }
+
+    /// A compute task on `pe` whose `dst` or source lies in a slice of a
+    /// sliced memory: the error. A compute PE charges one block per
+    /// operand, so it does not read or write a sliced memory (the rule
+    /// for spreading its demand over the slices is open).
+    fn sliced_compute(&self, pe: PeId, desc: &Descriptor) -> Option<String> {
+        if !self.any_sliced {
+            return None;
+        }
+        let p = &self.pes[pe.0 as usize].cfg;
+        if matches!(p.params, crate::config::PeParams::Dma { .. }) {
+            return None;
+        }
+        let src = match desc.args {
+            Args::Vector { src, .. } => src,
+            _ => None,
+        };
+        let addrs = [Some(Addr(desc.dst.base)), src];
+        addrs.into_iter().flatten().find_map(|a| {
+            self.memories
+                .iter()
+                .find(|m| m.sliced && m.holds(a))
+                .map(|m| {
+                    format!(
+                        "address {:#x} of the task is in {}, a slice of a sliced memory; \
+                         a compute PE ({}) does not read or write a sliced memory",
+                        a.0, m.name, p.name
+                    )
+                })
+        })
     }
 
     /// Starts `program` on `nu` at the current time.
@@ -835,6 +896,8 @@ impl Sim {
         if let Err(e) = self.topo.finish() {
             panic!("fabric: {e}");
         }
+        let pes: Vec<&PeConfig> = self.pes.iter().map(|p| &p.cfg).collect();
+        self.routes = crate::profile::TransferRoutes::build(&pes, &self.memories, &self.topo);
         self.livelock = self.livelock_cycles.unwrap_or_else(|| {
             let t_retry = self.nus.iter().map(|n| n.cfg.t_retry).max().unwrap_or(0);
             10 * t_retry + self.topo.max_latency()
@@ -992,6 +1055,7 @@ impl Sim {
             Event::NuResume(nu) => self.resume(nu),
             Event::NuExec(nu) => self.exec(nu),
             Event::ChunkEnd { pe, nu, task } => self.chunk_end(pe, nu, task),
+            Event::ChunkIssue { pe, nu, task } => self.chunk_issue(pe, nu, task),
             Event::Complete { nu, task } => self.complete(nu, task),
             Event::MemDone(nu) => self.mem_done(nu),
             Event::MsgArrive { msg } => self.msg_arrive(msg),
@@ -1286,30 +1350,67 @@ impl Sim {
             Request::Store { addr, bytes } => (*addr, bytes.len() as u64),
             _ => unreachable!("not a memory request"),
         };
-        let range = Range::from_len(addr.0, len);
-        let Some(mem) = self.memories.iter().find(|m| m.range.covers(&range)) else {
-            return self.fatal(nu, None, FatalError::Unowned(range));
+        let load = matches!(req, Request::Load { .. });
+        // One piece per block it touches: a piece never crosses a block
+        // boundary (Section 5.3). The access is done when its last piece
+        // is.
+        let (mut a, stop, mut done) = (addr.0, addr.0 + len, self.now);
+        loop {
+            let Some(i) = self.memories.iter().position(|m| m.holds(Addr(a))) else {
+                return self.fatal(nu, None, FatalError::Unowned(Range::from_len(addr.0, len)));
+            };
+            let n = self.memories[i].run(a).min(stop - a);
+            let n = n.min(self.mem_grid(nu, i, a, load));
+            match self.mem_piece(nu, i, n, load) {
+                Ok(end) => done = done.max(end),
+                Err(msg) => return self.fatal(nu, None, FatalError::Invalid(msg)),
+            }
+            a += n;
+            if a >= stop {
+                break;
+            }
+        }
+        self.nus[nu.0 as usize].op = Some(req);
+        self.queue.push(done, Event::MemDone(nu));
+    }
+
+    /// The most a load or store piece at `a` in memory block `i` may move:
+    /// the `block_bytes` grid of the block's port and of the route the
+    /// data takes (Section 5.3).
+    fn mem_grid(&self, nu: NeutrinoId, i: usize, a: u64, load: bool) -> u64 {
+        let mem = &self.memories[i];
+        let hub = self.topo.data_hub(nu);
+        let route = if load {
+            self.topo.best_path(&mem.attach, hub)
+        } else {
+            self.topo.best_path(hub, &mem.attach)
         };
+        let blocks = route.map_or(&[][..], |p| &p.blocks[..]);
+        crate::topology::grid_run(a, blocks).min(mem.block.map_or(u64::MAX, |b| b - a % b))
+    }
+
+    /// Reserves `n` bytes of a load or store in memory block `i`;
+    /// returns the cycle it is done.
+    fn mem_piece(&mut self, nu: NeutrinoId, i: usize, n: u64, load: bool) -> Result<Cycle, String> {
+        let mem = &self.memories[i];
         // A transfer in data order (Section 5.4, data-path rule). A load:
         // the request takes the route to the block and the block latency,
         // then the data comes back from the port over the return route. A
         // store: the data takes the route to the block, then the port;
         // the block latency follows the port.
-        let (port, block_latency, attach) = (mem.port, mem.load_latency, mem.attach.clone());
-        let load = matches!(req, Request::Load { .. });
-        let hub = self.topo.data_hub(nu).to_vec();
+        let dir = if load { Dir::Read } else { Dir::Write };
+        let (port, block_latency, attach) = (mem.port_for(dir), mem.load_latency, &mem.attach);
+        let hub = self.topo.data_hub(nu);
         let (to_block, from_block) = (
-            self.topo.best_path(&hub, &attach).cloned(),
-            self.topo.best_path(&attach, &hub).cloned(),
+            self.topo.best_path(hub, attach).cloned(),
+            self.topo.best_path(attach, hub).cloned(),
         );
         let (Some(to_block), Some(from_block)) = (to_block, from_block) else {
-            let msg = format!("no data route between {:?} and {}", nu, mem.name);
-            return self.fatal(nu, None, FatalError::Invalid(msg));
+            return Err(format!("no data route between {:?} and {}", nu, mem.name));
         };
-        let dir = if load { Dir::Read } else { Dir::Write };
         let hop = |resource, latency| PathHop {
             resource,
-            amount: len,
+            amount: n,
             dir,
             latency,
         };
@@ -1331,7 +1432,7 @@ impl Sim {
         let pair = self
             .tracer
             .is_some()
-            .then(|| self.topo.best_pair(self.topo.data_hub(nu), &mem.attach))
+            .then(|| self.topo.best_pair(hub, attach))
             .flatten();
         let mut g = self.reserve_path(&path, rate, earliest, Who::Program(nu));
         if !self.zero_time {
@@ -1341,13 +1442,12 @@ impl Sim {
             let r = RouteUse {
                 from,
                 to,
-                bytes: len,
+                bytes: n,
                 dir,
             };
             trace!(self, t => t.route(&r, g.start, g.end, Who::Program(nu)));
         }
-        self.nus[nu.0 as usize].op = Some(req);
-        self.queue.push(g.end, Event::MemDone(nu));
+        Ok(g.end)
     }
 
     /// The memory access of a load or store is done: sync or emit.
@@ -1885,10 +1985,17 @@ impl Sim {
                 return;
             }
             if n.rec(t).profile.is_none() {
+                if let Some(msg) = self.sliced_compute(pe, &n.rec(t).desc) {
+                    let gid = n.rec(t).gid;
+                    return self.fatal(nu, Some(gid), FatalError::Invalid(msg));
+                }
+                let n = &self.nus[nu.0 as usize];
                 let acc = acc_flags(&mut self.pes[pe.0 as usize], &n.rec(t).desc);
                 let p = &self.pes[pe.0 as usize];
                 let node = NodeConfig {
                     pe: &p.cfg,
+                    pe_id: pe,
+                    routes: &self.routes,
                     memories: &self.memories,
                     topology: &self.topo,
                     acc,
@@ -1927,6 +2034,7 @@ impl Sim {
             self.unstall(nu);
 
             let nchunks = profile.chunks.len();
+            let stream = profile.chunks.iter().any(|c| c.transfer.is_some());
             let p = &mut self.pes[pe.0 as usize];
             p.running.push(Running {
                 nu,
@@ -1935,9 +2043,16 @@ impl Sim {
                 profile,
                 next: 0,
                 ended: 0,
+                stream,
+                held: false,
+                last_end: 0,
             });
             if nchunks == 0 {
                 self.finish_task(pe, nu, t);
+                continue;
+            }
+            if stream {
+                self.issue_chunk(pe, nu, t);
                 continue;
             }
             let ahead = nchunks.min(p.cfg.max_outstanding as usize);
@@ -1947,8 +2062,59 @@ impl Sim {
         }
     }
 
+    /// Issues the next chunk of transfer `t` now (Section 5.3): reserves it
+    /// at or after now + its latency, and schedules the issue of the one
+    /// after it at now + this chunk's bytes at the engine's beat rate.
+    /// Without an outstanding cap only the last chunk gets an end event,
+    /// at the latest end of all of them.
+    fn issue_chunk(&mut self, pe: PeId, nu: NeutrinoId, t: TaskId) {
+        let p = &self.pes[pe.0 as usize];
+        let capped = p.cfg.max_outstanding != u32::MAX;
+        let r = &p.running[running_pos(p, nu, t)];
+        let chunk = &r.profile.chunks[r.next];
+        let bytes = chunk.transfer.as_ref().map_or(0, |c| c.bytes);
+        let rate = chunk.rate;
+        let issue = if self.zero_time {
+            0
+        } else {
+            (bytes as u128 * rate.den as u128).div_ceil(rate.num as u128) as u64
+        };
+        let end = self.reserve_chunk(pe, nu, t, capped);
+        let p = &mut self.pes[pe.0 as usize];
+        let ri = running_pos(p, nu, t);
+        let r = &mut p.running[ri];
+        r.last_end = r.last_end.max(end);
+        if r.next < r.profile.chunks.len() {
+            self.queue
+                .push(self.now + issue, Event::ChunkIssue { pe, nu, task: t });
+        } else if !capped {
+            let end = r.last_end;
+            self.queue.push(end, Event::ChunkEnd { pe, nu, task: t });
+        }
+    }
+
+    /// The next chunk of transfer `t` is due: issued unless the
+    /// outstanding cap holds it until a chunk ends.
+    fn chunk_issue(&mut self, pe: PeId, nu: NeutrinoId, t: TaskId) {
+        let p = &mut self.pes[pe.0 as usize];
+        let cap = p.cfg.max_outstanding as usize;
+        let ri = running_pos(p, nu, t);
+        let r = &mut p.running[ri];
+        if r.next - r.ended >= cap {
+            r.held = true;
+            return;
+        }
+        self.issue_chunk(pe, nu, t);
+    }
+
     /// Reserves the next chunk of `t` at or after now + its latency.
     fn request_chunk(&mut self, pe: PeId, nu: NeutrinoId, t: TaskId) {
+        self.reserve_chunk(pe, nu, t, true);
+    }
+
+    /// Reserves the next chunk of `t` at or after now + its latency and,
+    /// with `end_event`, schedules its end; returns its end.
+    fn reserve_chunk(&mut self, pe: PeId, nu: NeutrinoId, t: TaskId, end_event: bool) -> Cycle {
         let p = &mut self.pes[pe.0 as usize];
         let ri = running_pos(p, nu, t);
         let r = &mut p.running[ri];
@@ -1961,11 +2127,17 @@ impl Sim {
         // `self.pes` across the reservation.
         let (routes, rate) = (chunk.routes, chunk.rate);
         let demand = std::mem::take(&mut r.profile.chunks[i].demand);
-        let path = std::mem::take(&mut r.profile.chunks[i].path);
-        let g = if path.is_empty() {
-            self.reserve(&demand, earliest, Who::Task(gid))
-        } else {
-            self.reserve_path(&path, rate, earliest, Who::Task(gid))
+        let transfer = r.profile.chunks[i].transfer.take();
+        let g = match transfer {
+            None => self.reserve(&demand, earliest, Who::Task(gid)),
+            Some(tc) => {
+                // The hops into a buffer kept across chunks.
+                let mut hops = std::mem::take(&mut self.hop_buf);
+                tc.hops_into(&mut hops);
+                let g = self.reserve_path(&hops, rate, earliest, Who::Task(gid));
+                self.hop_buf = hops;
+                g
+            }
         };
         if let Some(tr) = self.tracer.as_mut() {
             tr.chunk_grant(&ChunkGrant {
@@ -1980,19 +2152,27 @@ impl Sim {
                 tr.route(u, g.start, g.end, Who::Task(gid));
             }
         }
-        self.queue.push(g.end, Event::ChunkEnd { pe, nu, task: t });
+        if end_event {
+            self.queue.push(g.end, Event::ChunkEnd { pe, nu, task: t });
+        }
+        g.end
     }
 
     fn chunk_end(&mut self, pe: PeId, nu: NeutrinoId, t: TaskId) {
         let p = &mut self.pes[pe.0 as usize];
+        let capped = p.cfg.max_outstanding != u32::MAX;
         let i = running_pos(p, nu, t);
         let r = &mut p.running[i];
-        r.ended += 1;
-        let (more, all) = (
-            r.next < r.profile.chunks.len(),
-            r.ended == r.profile.chunks.len(),
-        );
-        if more {
+        let n = r.profile.chunks.len();
+        // An uncapped transfer has one end event, for all its chunks.
+        r.ended = if r.stream && !capped { n } else { r.ended + 1 };
+        let (more, all) = (r.next < n, r.ended == n);
+        if r.stream {
+            if more && r.held {
+                r.held = false;
+                self.issue_chunk(pe, nu, t);
+            }
+        } else if more {
             self.request_chunk(pe, nu, t);
         }
         if all {

@@ -350,7 +350,7 @@ fn run(argv: &[String]) -> Result<(), String> {
         .sim
         .memories()
         .iter()
-        .filter(|m| m.name.ends_with(".hbm"))
+        .filter(|m| m.memory_name().ends_with(".hbm"))
         .map(|m| {
             let r = b.sim.resources().flow(m.port).rate();
             r.num as f64 / r.den as f64

@@ -167,12 +167,15 @@ impl Machine {
         let mut sms = Vec::new();
         let mut hbm = Vec::new();
         let mut cmem_nodes = Vec::new();
+        // The port rate of the memory of range `r`: the sum over the
+        // slices of a sliced memory.
         let rate_of = |r: Range| -> f64 {
             b.sim
                 .memories()
                 .iter()
-                .find(|m| m.range == r)
-                .map_or(0.0, |m| res.flow(m.port).rate().to_f64())
+                .filter(|m| m.range == r)
+                .map(|m| res.flow(m.port).rate().to_f64())
+                .sum()
         };
         let rate_named = |name: String| {
             res.by_name(&name)

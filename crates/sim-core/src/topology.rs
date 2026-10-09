@@ -77,6 +77,9 @@ pub struct Bus {
     pub latency: Cycle,
     /// A control bus (protocol messages); otherwise a data bus.
     pub control: bool,
+    /// Transaction size: a transfer through the bus is cut at multiples
+    /// of it (architecture Section 5.3).
+    pub block: Option<u64>,
 }
 
 /// One attachment of a bus.
@@ -104,6 +107,8 @@ pub struct FabricLink {
     pub ab: Lane,
     pub ba: Lane,
     pub latency: Cycle,
+    /// Transaction size, as [`Bus::block`].
+    pub block: Option<u64>,
 }
 
 /// One link of a route, rated or unlimited.
@@ -144,6 +149,14 @@ pub struct Path {
     pub lead: Cycle,
     /// Links on the route.
     pub links: u32,
+    /// The distinct `block_bytes` of the buses and links on the route.
+    pub blocks: Vec<u64>,
+}
+
+/// The bytes from address `a` to the next multiple of each of `blocks`:
+/// the most a chunk at `a` may move (`u64::MAX` without blocks).
+pub fn grid_run(a: u64, blocks: &[u64]) -> u64 {
+    blocks.iter().map(|b| b - a % b).min().unwrap_or(u64::MAX)
 }
 
 impl Path {
@@ -183,6 +196,7 @@ static EMPTY: Path = Path {
     hops: Vec::new(),
     lead: 0,
     links: 0,
+    blocks: Vec::new(),
 };
 
 /// One bus of a bus-level route and the link (index, direction a to b)
@@ -241,7 +255,18 @@ impl Topology {
             ab,
             ba,
             latency,
+            block: None,
         });
+    }
+
+    pub(crate) fn set_bus_block(&mut self, bus: BusId, block: u64) {
+        self.finished = false;
+        self.buses[bus.0 as usize].block = Some(block);
+    }
+
+    pub(crate) fn set_link_block(&mut self, link: usize, block: u64) {
+        self.finished = false;
+        self.links[link].block = Some(block);
     }
 
     pub(crate) fn set_hub(&mut self, nu: NeutrinoId, control: AttachId, data: Vec<AttachId>) {
@@ -394,6 +419,14 @@ impl Topology {
             p.push_hop(lane, latency);
             p.latency += latency;
         });
+        for &(bus, via) in route {
+            let link = via.and_then(|(l, _)| self.links[l].block);
+            for b in [link, self.buses[bus].block].into_iter().flatten() {
+                if !p.blocks.contains(&b) {
+                    p.blocks.push(b);
+                }
+            }
+        }
         p
     }
 

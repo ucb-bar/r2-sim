@@ -16,7 +16,7 @@ pub mod remote;
 pub mod scoreboard;
 mod slab;
 
-pub use addr::{Addr, NeutrinoId, OwnerMap, Range};
+pub use addr::{Addr, AddressSet, NeutrinoId, OwnerMap, Range};
 pub use remote::{
     handle_await, AckAction, AwaitAck, AwaitMsg, Awaiter, OutboundDeps, OutboundDepsFull, Purpose,
     RequestId,

@@ -7,15 +7,13 @@ use sim_core::{
 fn trace(records: Records) -> Trace {
     let mut t = Trace::new(records);
     t.configure(
-        &[MemBlock {
-            name: "m".into(),
-            owner: NeutrinoId(0),
-            attach: Vec::new(),
-            numeric: true,
-            range: Range::new(0, 0x10_0000),
-            port: ResourceId(0),
-            load_latency: 0,
-        }],
+        &[MemBlock::plain(
+            "m".into(),
+            NeutrinoId(0),
+            Range::new(0, 0x10_0000),
+            ResourceId(0),
+            0,
+        )],
         &[],
     );
     t

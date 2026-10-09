@@ -43,6 +43,11 @@
 //!   hop stage holds per protocol class, default 1: a pipeline register,
 //!   not a buffer to size).
 //! * buses and links: a bus or link without `bw_bytes` is unlimited.
+//! * buses, links and memories (scratch, dram, cache; per slice too):
+//!   `block_bytes`, the transaction size (Section 5.3). A DMA chunk, or a
+//!   load or store piece, that passes through it ends at the next
+//!   multiple of it: the source address bounds the read half of the
+//!   route and the source port, the destination address the write half.
 //! * nodes: `fidelity` (null | numeric; inherited; the root defaults to
 //!   null).
 //! * `neutrino`: every key of [`NeutrinoConfig`] (`scoreboard`, `execution`, `pending`,
@@ -52,17 +57,32 @@
 //!   `c_plan` (per planned task), `c_wait`, `c_version`, `c_vreset`, `c_complete`,
 //!   `c_load`, `c_store`, `c_spawn`, `c_resolve`, `scalar_rate`,
 //!   `complete_rate`), and `master`.
-//! * compute: `utilization` (tensor and vector), `inflight` and
-//!   `outstanding` on every type (default 1), `burst_bytes` (dma: the
-//!   chunk size of every transfer; default the descriptor's tile; a
-//!   warning in [`Built::warnings`] when `(outstanding - 1) x burst_bytes`
-//!   does not cover latency x rate of the engine's paths).
+//! * compute: `utilization` (tensor and vector), `inflight` (default 1),
+//!   `outstanding` (a DMA engine: a cap on chunks issued and not ended,
+//!   default none, Section 5.3 issue-driven chunks; another PE: chunks
+//!   requested ahead, default 1), `burst_bytes` (dma: the chunk size of
+//!   every transfer; default the descriptor's tile; with `outstanding`
+//!   set, a warning in [`Built::warnings`] when `(outstanding - 1) x
+//!   burst_bytes` does not cover latency x rate of the engine's paths).
+//! * memories (scratch and dram): `wr_bytes` (a separate write port
+//!   `<mem>.wport` charged by write demands; without it `<mem>.port`
+//!   serves both directions); `slices` and `interleave` (both powers of
+//!   two; architecture Section 3.1): S blocks `<mem>.s<i>`, slice i
+//!   holding the `interleave`-byte granules whose index modulo S is i,
+//!   each with its own ports, latency and attachments; `bw_bytes`,
+//!   `wr_bytes`, `latency` and `beat_bytes` are per slice, and `slice:
+//!   {s<i>: {...}}` overrides them for one slice (an override PATH
+//!   `<mem>.s<i>.<key>` or `<mem>.s*.<key>` writes there). A sliced
+//!   memory's range is a power-of-two size aligned to its base, and no
+//!   compute PE may use it (Atlas SMEM, Muon source or destination).
 //!
 //! Addressing: an address is [field 1] .. [field n] [offset]. A child's
 //! field value is its index among its parent's children plus one; value 0
 //! at a level is the parent's own space. Scratch, dram and sync ranges are
 //! offsets inside the node's own space; cache ranges are global. A node
-//! owns its scratch, dram and sync ranges.
+//! owns its scratch, dram and sync ranges. Ownership and blocks are
+//! address sets (Section 3.1): a range that is not a power-of-two size
+//! aligned to its base is decomposed into the fewest aligned sets.
 //!
 //! Rates and sizes: YAML numbers, or strings with a rational ("2/3") or a
 //! unit ("512 KiB").
@@ -70,7 +90,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use nu_model::{DepConfig, NeutrinoId, Range};
+use nu_model::{AddressSet, DepConfig, NeutrinoId, Range};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
@@ -274,6 +294,47 @@ fn set_in_map(t: &mut Mapping, segs: &[Seg], v: &Value, insert: bool) -> usize {
     n
 }
 
+/// True when `seg` names slices of a sliced memory: `s<i>` or `s*`.
+fn is_slice_key(seg: &Seg) -> bool {
+    let k = &seg.key;
+    seg.idx.is_empty()
+        && (k == "s*"
+            || k.strip_prefix('s')
+                .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// Sets `v` at `segs[1..]` in the per-slice overrides (`slice: {s<i>:
+/// ...}`) of the sliced memory `mem`, for every slice that `segs[0]`
+/// names.
+fn set_in_slices(mem: &mut Value, segs: &[Seg], v: &Value) -> usize {
+    let Some(slices) = mem.get("slices").and_then(Value::as_u64) else {
+        return 0;
+    };
+    let Some(map) = mem.as_mapping_mut() else {
+        return 0;
+    };
+    let table = map
+        .entry(Value::String("slice".into()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let Some(table) = table.as_mapping_mut() else {
+        return 0;
+    };
+    let mut n = 0;
+    for i in 0..slices {
+        let name = format!("s{i}");
+        if !glob(&segs[0].key, &name) {
+            continue;
+        }
+        let entry = table
+            .entry(Value::String(name))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if let Some(m) = entry.as_mapping_mut() {
+            n += set_in_map(m, &segs[1..], v, true);
+        }
+    }
+    n
+}
+
 fn name_of(v: &Value) -> Option<&str> {
     v.get("name").and_then(Value::as_str)
 }
@@ -301,6 +362,8 @@ fn set_in_node(node: &mut Value, segs: &[Seg], v: &Value, literal: bool) -> usiz
             let literal = !seg.key.contains('*');
             n += if list == "children" {
                 set_in_node(item, rest, v, literal)
+            } else if list == "memory" && rest.len() > 1 && is_slice_key(&rest[0]) {
+                set_in_slices(item, rest, v)
             } else {
                 item.as_mapping_mut()
                     .map_or(0, |m| set_in_map(m, rest, v, literal))
@@ -418,6 +481,8 @@ struct BusSec {
     /// Beat of the bus's ports or shared lane, or of a link's two
     /// directions (default 64).
     beat_bytes: Option<Num>,
+    /// Transaction size: transfers through it are cut at its multiples.
+    block_bytes: Option<Num>,
     /// A link's two buses (`topology: link` only).
     from: Option<String>,
     to: Option<String>,
@@ -455,6 +520,41 @@ struct MemSec {
     master: Option<String>,
     /// Beat of the port (default 64).
     beat_bytes: Option<Num>,
+    /// Transaction size of the port: transfers are cut at its multiples.
+    block_bytes: Option<Num>,
+    /// Rate of a separate write port; without it the port serves both
+    /// directions.
+    wr_bytes: Option<Num>,
+    /// Slices of a sliced memory (a power of two; default 1).
+    slices: Option<u64>,
+    /// Bytes of one slice's granule (a power of two).
+    interleave: Option<Num>,
+    /// Per-slice overrides, by slice name (`s0`, `s1`, ...).
+    #[serde(default)]
+    slice: HashMap<String, SliceSec>,
+}
+
+/// The keys of one slice that can differ from the memory's.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SliceSec {
+    bw_bytes: Option<Num>,
+    wr_bytes: Option<Num>,
+    latency: Option<u64>,
+    beat_bytes: Option<Num>,
+    block_bytes: Option<Num>,
+}
+
+/// `block_bytes` of `name`, if set: a power of two (Section 5.3: one grid
+/// per route half then holds every boundary of the half).
+fn block_of(b: &Option<Num>, name: &str) -> Result<Option<u64>, ConfigError> {
+    match b {
+        None => Ok(None),
+        Some(n) => match n.bytes()? {
+            v if v.is_power_of_two() => Ok(Some(v)),
+            v => err(format!("{name}: block_bytes {v} is not a power of two")),
+        },
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -642,10 +742,16 @@ pub struct MemInfo {
     pub node: NeutrinoId,
     /// "scratch", "dram", "cache" or "sync".
     pub kind: &'static str,
-    /// Global address ranges.
+    /// Global address ranges (of a slice: the whole sliced memory).
     pub ranges: Vec<Range>,
+    /// The block's address sets.
+    pub sets: Vec<AddressSet>,
+    /// True for a slice of a sliced memory.
+    pub sliced: bool,
     pub attachments: Vec<AttachId>,
     pub port: Option<ResourceId>,
+    /// The write port (`wr_bytes`).
+    pub wport: Option<ResourceId>,
     pub latency: u64,
 }
 
@@ -815,6 +921,8 @@ struct PendingCache {
     slave: String,
     master: String,
     latency: u64,
+    /// `block_bytes` of its port (a block of the link).
+    block: Option<u64>,
 }
 
 /// A node still to build: its section, its parent (id and name), its
@@ -828,6 +936,8 @@ struct Builder {
     buses: HashMap<String, BusId>,
     mems: Vec<PendingMem>,
     caches: Vec<PendingCache>,
+    /// Sliced scratch memories by name.
+    sliced_scratch: Vec<String>,
     /// Sync ranges for the layout, in node order.
     syncs: Vec<MemInfo>,
     /// Scratch memories with their slave bus name and port, for the SMEM
@@ -887,6 +997,7 @@ impl Builder {
             },
             buses: HashMap::new(),
             mems: Vec::new(),
+            sliced_scratch: Vec::new(),
             caches: Vec::new(),
             syncs: Vec::new(),
             scratch_ports: Vec::new(),
@@ -984,7 +1095,11 @@ impl Builder {
                 beat: res.flow(c.port).beat().unwrap_or(DEFAULT_BEAT),
                 latency: c.latency,
             };
-            cache_links.push((self.built.layout.links.len(), caches.len()));
+            let index = self.built.layout.links.len();
+            if let Some(blk) = c.block {
+                self.built.sim.set_link_block(index, blk);
+            }
+            cache_links.push((index, caches.len()));
             let (x, y) = self.link(
                 (a, &short, Role::Slave),
                 (b, &short, Role::Master),
@@ -996,9 +1111,12 @@ impl Builder {
                 path: c.name,
                 node: c.node,
                 kind: "cache",
+                sets: c.ranges.iter().flat_map(AddressSet::decompose).collect(),
                 ranges: c.ranges,
+                sliced: false,
                 attachments: vec![x, y],
                 port: Some(c.port),
+                wport: None,
                 latency: c.latency,
             });
         }
@@ -1016,8 +1134,11 @@ impl Builder {
                 node: block.owner,
                 kind: m.kind,
                 ranges: vec![block.range],
+                sets: block.sets.clone(),
+                sliced: block.sliced,
                 attachments: block.attach.clone(),
                 port: Some(block.port),
+                wport: block.wport,
                 latency: block.load_latency,
             });
             self.built.sim.add_memory(block);
@@ -1155,8 +1276,11 @@ impl Builder {
                 node: nu,
                 kind: "sync",
                 ranges: vec![r],
+                sets: AddressSet::decompose(&r),
+                sliced: false,
                 attachments: Vec::new(),
                 port: None,
+                wport: None,
                 latency: 0,
             });
         }
@@ -1182,6 +1306,9 @@ impl Builder {
             );
             let beat = beat_of(&b.beat_bytes, &name)?;
             self.built.sim.set_bus_beat(id, beat);
+            if let Some(blk) = block_of(&b.block_bytes, &name)? {
+                self.built.sim.set_bus_block(id, blk);
+            }
             if self.buses.insert(name.clone(), id).is_some() {
                 return err(format!("{name}: two buses of this name"));
             }
@@ -1252,6 +1379,7 @@ impl Builder {
                 latency: b.latency,
             };
             let (fname, tname) = (attach_name(&lpath, &from), attach_name(&lpath, &to));
+            let index = self.built.layout.links.len();
             self.link(
                 (fb, &fname, Role::Both),
                 (tb, &tname, Role::Both),
@@ -1259,6 +1387,9 @@ impl Builder {
                 info,
                 Component::Link,
             );
+            if let Some(blk) = block_of(&b.block_bytes, &lpath)? {
+                self.built.sim.set_link_block(index, blk);
+            }
         }
         if parent.is_some() && upward != [true; 2] {
             return err(format!(
@@ -1281,19 +1412,26 @@ impl Builder {
     ) -> Result<(), ConfigError> {
         for m in &sec.memory {
             let name = format!("{path}.{}", m.name);
+            let sliced = m.slices.is_some() || m.interleave.is_some() || !m.slice.is_empty();
             if m.kind == "sync" {
+                if sliced || m.wr_bytes.is_some() || m.block_bytes.is_some() {
+                    return err(format!("{name}: a sync range has no slices or ports"));
+                }
+                continue;
+            }
+            if m.kind != "scratch" && m.kind != "dram" && (sliced || m.wr_bytes.is_some()) {
+                return err(format!(
+                    "{name}: slices, interleave and wr_bytes are keys of a scratch or dram block"
+                ));
+            }
+            if sliced {
+                self.sliced(m, &name, path, ppath, nu, base, numeric)?;
                 continue;
             }
             let Some(bw) = &m.bw_bytes else {
                 return err(format!("{name}: needs bw_bytes"));
             };
-            let port = self.built.sim.resources_mut().add_flow(
-                &format!("{name}.port"),
-                Kind::Bandwidth,
-                bw.rate()?,
-            );
-            let beat = beat_of(&m.beat_bytes, &name)?;
-            self.built.sim.resources_mut().set_beat(port, beat);
+            let (port, wport) = self.ports(&name, bw, m.wr_bytes.as_ref(), &m.beat_bytes)?;
             let Some(slave) = &m.slave else {
                 return err(format!("{name}: needs slave"));
             };
@@ -1324,13 +1462,10 @@ impl Builder {
                             "dram"
                         },
                         block: MemBlock {
-                            name,
-                            owner: nu,
-                            attach: Vec::new(),
                             numeric,
-                            range,
-                            port,
-                            load_latency: m.latency,
+                            wport,
+                            block: block_of(&m.block_bytes, &name)?,
+                            ..MemBlock::plain(name, nu, range, port, m.latency)
                         },
                         slaves,
                     });
@@ -1346,6 +1481,7 @@ impl Builder {
                     for [a, b] in &m.addr {
                         ranges.push(Range::new(a.bytes()?, b.bytes()?));
                     }
+                    let block = block_of(&m.block_bytes, &name)?;
                     self.caches.push(PendingCache {
                         name,
                         node: nu,
@@ -1354,11 +1490,146 @@ impl Builder {
                         slave: slave.clone(),
                         master: resolve(master, path, ppath)?,
                         latency: m.latency,
+                        block,
                     });
                 }
                 k => return err(format!("{name}: unknown memory type {k:?}")),
             }
         }
+        Ok(())
+    }
+
+    /// The port of block `name` at `bw` (`<name>.port`) and, with `wr`, its
+    /// write port (`<name>.wport`), with their beat.
+    fn ports(
+        &mut self,
+        name: &str,
+        bw: &Num,
+        wr: Option<&Num>,
+        beat: &Option<Num>,
+    ) -> Result<(ResourceId, Option<ResourceId>), ConfigError> {
+        let beat = beat_of(beat, name)?;
+        let r = self.built.sim.resources_mut();
+        let port = r.add_flow(&format!("{name}.port"), Kind::Bandwidth, bw.rate()?);
+        r.set_beat(port, beat);
+        let wport = match wr {
+            Some(w) => {
+                let id = r.add_flow(&format!("{name}.wport"), Kind::Bandwidth, w.rate()?);
+                r.set_beat(id, beat);
+                Some(id)
+            }
+            None => None,
+        };
+        Ok((port, wport))
+    }
+
+    /// A sliced memory (architecture Section 3.1): one block per slice,
+    /// `<name>.s<i>`, with its own ports, latency and attachments. Slice
+    /// `i` holds the addresses whose bits `log2 G ..< log2 G + log2 S`
+    /// equal `i`.
+    #[allow(clippy::too_many_arguments)]
+    fn sliced(
+        &mut self,
+        m: &MemSec,
+        name: &str,
+        path: &str,
+        ppath: Option<&str>,
+        nu: NeutrinoId,
+        base: u64,
+        numeric: bool,
+    ) -> Result<(), ConfigError> {
+        let (Some(slices), Some(g)) = (m.slices, &m.interleave) else {
+            return err(format!(
+                "{name}: a sliced memory needs slices and interleave"
+            ));
+        };
+        let g = g.bytes()?;
+        if !slices.is_power_of_two() || !g.is_power_of_two() {
+            return err(format!("{name}: slices and interleave are powers of two"));
+        }
+        let [[a, b]] = m.addr.as_slice() else {
+            return err(format!("{name}: needs exactly one addr range"));
+        };
+        let range = Range::new(base + a.bytes()?, base + b.bytes()?);
+        let size = range.len();
+        if !size.is_power_of_two() || !range.base.is_multiple_of(size) {
+            return err(format!(
+                "{name}: a sliced memory is a power-of-two size aligned to its base, not {range}"
+            ));
+        }
+        if size < slices * g {
+            return err(format!(
+                "{name}: {range} is smaller than slices x interleave"
+            ));
+        }
+        if m.master.is_some() {
+            return err(format!("{name}: only a cache has a master bus"));
+        }
+        let Some(slave) = &m.slave else {
+            return err(format!("{name}: needs slave"));
+        };
+        let slaves: Vec<String> = slave
+            .list()
+            .into_iter()
+            .map(|b| resolve(b, path, ppath))
+            .collect::<Result<_, _>>()?;
+        if let Some(k) = m
+            .slice
+            .keys()
+            .find(|k| !(0..slices).any(|i| **k == format!("s{i}")))
+        {
+            return err(format!("{name}: no slice {k:?}"));
+        }
+        let shift = g.trailing_zeros();
+        let none = SliceSec::default();
+        for i in 0..slices {
+            let sname = format!("{name}.s{i}");
+            let o = m.slice.get(&format!("s{i}")).unwrap_or(&none);
+            let Some(bw) = o.bw_bytes.as_ref().or(m.bw_bytes.as_ref()) else {
+                return err(format!("{sname}: needs bw_bytes"));
+            };
+            let wr = o.wr_bytes.as_ref().or(m.wr_bytes.as_ref());
+            let beat = if o.beat_bytes.is_some() {
+                &o.beat_bytes
+            } else {
+                &m.beat_bytes
+            };
+            let (port, wport) = self.ports(&sname, bw, wr, beat)?;
+            if m.kind == "scratch" {
+                self.sliced_scratch.push(name.to_string());
+                for sl in &slaves {
+                    self.scratch_ports.push((sname.clone(), sl.clone(), port));
+                }
+            }
+            let set = AddressSet::new(
+                range.base | (i << shift),
+                (size - 1) & !((slices - 1) << shift),
+            );
+            self.mems.push(PendingMem {
+                kind: if m.kind == "scratch" {
+                    "scratch"
+                } else {
+                    "dram"
+                },
+                block: MemBlock {
+                    numeric,
+                    sets: vec![set],
+                    sliced: true,
+                    wport,
+                    block: block_of(
+                        if o.block_bytes.is_some() {
+                            &o.block_bytes
+                        } else {
+                            &m.block_bytes
+                        },
+                        &sname,
+                    )?,
+                    ..MemBlock::plain(sname, nu, range, port, o.latency.unwrap_or(m.latency))
+                },
+                slaves: slaves.clone(),
+            });
+        }
+        self.built.memories.insert(name.to_string(), range);
         Ok(())
     }
 
@@ -1371,6 +1642,15 @@ impl Builder {
             .filter(|s| buses.contains(&s.1))
             .collect();
         found.dedup_by(|a, b| a.0 == b.0);
+        if let Some(s) = found.iter().find_map(|s| {
+            self.sliced_scratch
+                .iter()
+                .find(|m| s.0.starts_with(&format!("{m}.s")))
+        }) {
+            return err(format!(
+                "{name}: {s} is sliced; a compute PE does not read a sliced memory"
+            ));
+        }
         match found.as_slice() {
             [s] => Ok(s.2),
             [] => err(format!("{name}: no scratch memory is a slave on {buses:?}")),
@@ -1436,6 +1716,11 @@ impl Builder {
                         max,
                     );
                     let smem_port = self.smem_port(&name, &masters)?;
+                    let smem_wport = self
+                        .mems
+                        .iter()
+                        .find(|m| m.block.port == smem_port)
+                        .and_then(|m| m.block.wport);
                     let quantize = match c.quantize.as_deref().unwrap_or("tile") {
                         "tile" => true,
                         "none" => false,
@@ -1458,6 +1743,7 @@ impl Builder {
                         array,
                         rates,
                         smem_port,
+                        smem_wport,
                         utilization: utilization()?,
                         masters: atts.clone(),
                     }
@@ -1498,7 +1784,13 @@ impl Builder {
                 PeConfig {
                     name: name.clone(),
                     max_inflight: c.inflight.unwrap_or(1),
-                    max_outstanding: c.outstanding.unwrap_or(1),
+                    max_outstanding: match (c.outstanding, c.kind.as_str()) {
+                        (Some(0), _) => return err(format!("{name}: outstanding 0")),
+                        (Some(n), _) => n,
+                        // A DMA engine streams its chunks; uncapped.
+                        (None, "dma") => u32::MAX,
+                        (None, _) => 1,
+                    },
                     params,
                 },
             );

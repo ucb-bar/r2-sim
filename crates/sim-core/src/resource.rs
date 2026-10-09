@@ -10,7 +10,7 @@
 //! demand vector (Section 5.4) and returns the granted interval and the
 //! culprit.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::time::{Cycle, Ratio};
 
@@ -142,7 +142,9 @@ pub struct FlowResource {
     /// The beat in bytes, when the resource has lanes.
     beat: Option<u64>,
     /// Lanes in use from each key until the next one; 0 after the last.
-    used: BTreeMap<Cycle, u32>,
+    /// Sorted by time. A calendar holds a few tens of keys after pruning,
+    /// so a sorted deque beats a tree on every operation.
+    used: VecDeque<(Cycle, u32)>,
     /// Lane-cycles charged.
     busy_total: u64,
     /// `busy_total` by direction.
@@ -171,7 +173,7 @@ impl FlowResource {
             lanes: 1,
             lane_rate: rate,
             beat: None,
-            used: BTreeMap::new(),
+            used: VecDeque::new(),
             busy_total: 0,
             busy_dir: [0; 3],
             culprit_total: 0,
@@ -230,36 +232,70 @@ impl FlowResource {
         k.clamp(1, self.lanes as u128) as u32
     }
 
-    /// Lanes in use at `t`.
-    fn used_at(&self, t: Cycle) -> u32 {
-        self.used.range(..=t).next_back().map_or(0, |(_, &v)| v)
+    /// Keys at or before `t`.
+    fn keys_to(&self, t: Cycle) -> usize {
+        self.used.partition_point(|&(k, _)| k <= t)
     }
 
-    /// The earliest `t' >= t` with `k` lanes free over `[t', t' + d)`.
+    /// Lanes in use at `t`.
+    fn used_at(&self, t: Cycle) -> u32 {
+        match self.keys_to(t) {
+            0 => 0,
+            i => self.used[i - 1].1,
+        }
+    }
+
+    /// The earliest `t' >= t` with `k` lanes free over `[t', t' + d)`: one
+    /// forward pass over the keys from `t`.
     pub(crate) fn earliest(&self, t: Cycle, d: u64, k: u32) -> Cycle {
-        use std::ops::Bound::{Excluded, Unbounded};
         if d == 0 {
+            return t;
+        }
+        // The tail: at or after the last key every lane is free.
+        if self.used.back().is_none_or(|&(last, _)| last <= t) {
             return t;
         }
         let free = self.lanes - k.min(self.lanes);
         let mut cand = t;
-        'search: loop {
-            if self.used_at(cand) > free {
-                // The lanes in use change only at keys; the last is 0.
-                match self.used.range((Excluded(cand), Unbounded)).next() {
-                    Some((&next, _)) => cand = next,
-                    None => return cand,
-                }
-                continue;
+        // Lanes in use at `cand`; they change only at keys, and the last
+        // key's value is 0.
+        let i = self.keys_to(t);
+        let mut busy = i > 0 && self.used[i - 1].1 > free;
+        for &(at, v) in self.used.range(i..) {
+            if busy {
+                // No window yet: it may start at this key.
+                cand = at;
+                busy = v > free;
+            } else if at >= cand + d {
+                return cand;
+            } else if v > free {
+                // The window from `cand` breaks here.
+                cand = at;
+                busy = true;
             }
-            for (&at, &v) in self.used.range((Excluded(cand), Excluded(cand + d))) {
-                if v > free {
-                    cand = at;
-                    continue 'search;
-                }
-            }
-            return cand;
         }
+        cand
+    }
+
+    /// The index of key `t`, inserted with the lanes in use there if it is
+    /// not a key.
+    fn key(&mut self, t: Cycle) -> usize {
+        let i = self.used.partition_point(|&(k, _)| k < t);
+        if self.used.get(i).is_none_or(|&(k, _)| k != t) {
+            let v = if i == 0 { 0 } else { self.used[i - 1].1 };
+            self.used.insert(i, (t, v));
+        }
+        i
+    }
+
+    /// Removes key `i` when it repeats the lanes in use before it.
+    fn coalesce(&mut self, i: usize) -> bool {
+        let before = if i == 0 { 0 } else { self.used[i - 1].1 };
+        let same = before == self.used[i].1;
+        if same {
+            self.used.remove(i);
+        }
+        same
     }
 
     /// Adds `delta` lanes in use over `[t, t + d)`.
@@ -268,23 +304,16 @@ impl FlowResource {
             return;
         }
         let e = t + d;
-        let (vt, ve) = (self.used_at(t), self.used_at(e));
-        self.used.entry(t).or_insert(vt);
-        self.used.entry(e).or_insert(ve);
-        for (_, v) in self.used.range_mut(t..e) {
+        let it = self.key(t);
+        let ie = self.key(e);
+        for (_, v) in self.used.range_mut(it..ie) {
             let n = *v as i64 + delta;
             debug_assert!(n >= 0 && n <= self.lanes as i64, "lanes over capacity");
             *v = n as u32;
         }
         // Coalesce at the two ends.
-        let before =
-            |m: &BTreeMap<Cycle, u32>, x: Cycle| m.range(..x).next_back().map_or(0, |(_, &v)| v);
-        if before(&self.used, t) == self.used[&t] {
-            self.used.remove(&t);
-        }
-        if before(&self.used, e) == self.used[&e] {
-            self.used.remove(&e);
-        }
+        let ie = if self.coalesce(it) { ie - 1 } else { ie };
+        self.coalesce(ie);
     }
 
     /// Holds `k` lanes over `[t, t + d)` (the calendar only).
@@ -312,14 +341,10 @@ impl FlowResource {
     /// Drops the calendar before `now`.
     fn prune(&mut self, now: Cycle) {
         let v = self.used_at(now);
-        while let Some((&k, _)) = self.used.first_key_value() {
-            if k >= now {
-                break;
-            }
-            self.used.pop_first();
-        }
-        if v > 0 {
-            self.used.entry(now).or_insert(v);
+        let gone = self.used.partition_point(|&(k, _)| k < now);
+        self.used.drain(..gone);
+        if v > 0 && self.used.front().is_none_or(|&(k, _)| k != now) {
+            self.used.push_front((now, v));
         }
     }
 }
@@ -915,6 +940,133 @@ fn merge(demand: &[Demand], out: &mut Vec<Demand>, dirs: &mut Vec<DirCycles>) {
                 let mut a = [0; 3];
                 a[d.dir.index()] = d.amount;
                 dirs.push(a);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::FlowResource;
+    use crate::time::Ratio;
+
+    /// The calendar as it was before 2026-10-08: a tree, with the search
+    /// that looks up every key it passes. The reference for the deque.
+    #[derive(Default)]
+    struct Tree(BTreeMap<u64, u32>);
+
+    impl Tree {
+        fn used_at(&self, t: u64) -> u32 {
+            self.0.range(..=t).next_back().map_or(0, |(_, &v)| v)
+        }
+
+        fn earliest(&self, lanes: u32, t: u64, d: u64, k: u32) -> u64 {
+            use std::ops::Bound::{Excluded, Unbounded};
+            if d == 0 {
+                return t;
+            }
+            let free = lanes - k.min(lanes);
+            let mut cand = t;
+            'search: loop {
+                if self.used_at(cand) > free {
+                    match self.0.range((Excluded(cand), Unbounded)).next() {
+                        Some((&next, _)) => cand = next,
+                        None => return cand,
+                    }
+                    continue;
+                }
+                for (&at, &v) in self.0.range((Excluded(cand), Excluded(cand + d))) {
+                    if v > free {
+                        cand = at;
+                        continue 'search;
+                    }
+                }
+                return cand;
+            }
+        }
+
+        fn add(&mut self, t: u64, d: u64, delta: i64) {
+            if d == 0 {
+                return;
+            }
+            let e = t + d;
+            let (vt, ve) = (self.used_at(t), self.used_at(e));
+            self.0.entry(t).or_insert(vt);
+            self.0.entry(e).or_insert(ve);
+            for (_, v) in self.0.range_mut(t..e) {
+                *v = (*v as i64 + delta) as u32;
+            }
+            let before =
+                |m: &BTreeMap<u64, u32>, x: u64| m.range(..x).next_back().map_or(0, |(_, &v)| v);
+            if before(&self.0, t) == self.0[&t] {
+                self.0.remove(&t);
+            }
+            if before(&self.0, e) == self.0[&e] {
+                self.0.remove(&e);
+            }
+        }
+
+        fn prune(&mut self, now: u64) {
+            let v = self.used_at(now);
+            while let Some((&k, _)) = self.0.first_key_value() {
+                if k >= now {
+                    break;
+                }
+                self.0.pop_first();
+            }
+            if v > 0 {
+                self.0.entry(now).or_insert(v);
+            }
+        }
+    }
+
+    #[test]
+    fn the_calendar_matches_the_tree_on_random_reservations() {
+        // A linear congruential generator: the same sequence every run.
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u64| {
+            x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (x >> 33) % n
+        };
+        for lanes in [1u32, 2, 4, 8] {
+            let mut f = FlowResource::new(Ratio::int(64 * lanes as u64));
+            f.set_beat(64);
+            assert_eq!(f.lanes, lanes);
+            let mut tree = Tree::default();
+            let mut held: Vec<(u64, u64, u32)> = Vec::new();
+            let mut now = 0;
+            for _ in 0..20_000 {
+                match rnd(10) {
+                    // Reserve at the earliest window.
+                    0..=5 => {
+                        let (t, d, k) = (now + rnd(200), 1 + rnd(40), 1 + rnd(lanes as u64) as u32);
+                        let s = f.earliest(t, d, k);
+                        assert_eq!(s, tree.earliest(lanes, t, d, k), "earliest({t}, {d}, {k})");
+                        f.occupy(s, d, k);
+                        tree.add(s, d, k as i64);
+                        held.push((s, d, k));
+                    }
+                    // Release a held window (the backward pass does).
+                    6 | 7 if !held.is_empty() => {
+                        let (s, d, k) = held.swap_remove(rnd(held.len() as u64) as usize);
+                        if s >= now {
+                            f.release(s, d, k);
+                            tree.add(s, d, -(k as i64));
+                        }
+                    }
+                    // Time passes.
+                    _ => {
+                        now += rnd(30);
+                        f.prune(now);
+                        tree.prune(now);
+                        held.retain(|&(s, _, _)| s >= now);
+                    }
+                }
+                let keys: Vec<(u64, u32)> = f.used.iter().copied().collect();
+                let want: Vec<(u64, u32)> = tree.0.iter().map(|(&k, &v)| (k, v)).collect();
+                assert_eq!(keys, want);
             }
         }
     }

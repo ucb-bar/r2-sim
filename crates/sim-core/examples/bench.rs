@@ -41,15 +41,13 @@ fn main() {
         },
         &[Range::new(0, SPAN)],
     );
-    sim.add_memory(MemBlock {
-        name: "dram".into(),
-        owner: device,
-        attach: Vec::new(),
-        numeric: true,
-        range: Range::new(0, SPAN),
-        port: dram_port,
-        load_latency: 100,
-    });
+    sim.add_memory(MemBlock::plain(
+        "dram".into(),
+        device,
+        Range::new(0, SPAN),
+        dram_port,
+        100,
+    ));
     for i in 0..nnu {
         let base = SPAN * (1 + 3 * i);
         let r = sim.resources_mut();
@@ -77,15 +75,13 @@ fn main() {
             &[Range::new(base, base + 3 * SPAN)],
         );
         let (smem, sync) = (base, base + SPAN);
-        sim.add_memory(MemBlock {
-            name: format!("smem{i}"),
-            owner: nu,
-            attach: Vec::new(),
-            numeric: true,
-            range: Range::new(smem, smem + SPAN),
-            port: smem_port,
-            load_latency: 10,
-        });
+        sim.add_memory(MemBlock::plain(
+            format!("smem{i}"),
+            nu,
+            Range::new(smem, smem + SPAN),
+            smem_port,
+            10,
+        ));
         sim.add_sync_only(Range::new(sync, sync + SPAN));
         let dma = sim.add_pe(
             nu,
@@ -116,6 +112,7 @@ fn main() {
                     acc_buffer: 0,
                     array,
                     smem_port,
+                    smem_wport: None,
                     utilization: Ratio::ONE,
                     quantize: true,
                 },

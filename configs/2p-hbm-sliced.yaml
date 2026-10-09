@@ -1,0 +1,11 @@
+# 2p.yaml with each gpc's HBM as a sliced memory (architecture Section
+# 3.1): 4 slices of 512 B granules, 128 B/cycle each (512 B/cycle in all,
+# as 2p.yaml), and a write port per slice at the same rate. A DMA chunk
+# that touches the HBM is at most one 512 B granule (Section 5.3): this
+# file measures the cost of that chunking.
+base: 2p.yaml
+set:
+  - root.gpc*.hbm.slices=4
+  - root.gpc*.hbm.interleave=512
+  - root.gpc*.hbm.bw_bytes=128
+  - root.gpc*.hbm.wr_bytes=128

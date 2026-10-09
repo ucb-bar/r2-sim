@@ -100,24 +100,20 @@ pub fn node(k: Knobs) -> Node {
         &[Range::new(0, 0x4000_0000)],
     );
     sim.add_sync_only(Range::new(SYNC, SYNC + 0x100_0000));
-    sim.add_memory(MemBlock {
-        name: "dram".into(),
-        owner: nu,
-        attach: Vec::new(),
-        numeric: true,
-        range: Range::new(DRAM, SMEM),
-        port: dram_port,
-        load_latency: 100,
-    });
-    sim.add_memory(MemBlock {
-        name: "smem".into(),
-        owner: nu,
-        attach: Vec::new(),
-        numeric: true,
-        range: Range::new(SMEM, SMEM + 0x8_0000),
-        port: smem_port,
-        load_latency: 10,
-    });
+    sim.add_memory(MemBlock::plain(
+        "dram".into(),
+        nu,
+        Range::new(DRAM, SMEM),
+        dram_port,
+        100,
+    ));
+    sim.add_memory(MemBlock::plain(
+        "smem".into(),
+        nu,
+        Range::new(SMEM, SMEM + 0x8_0000),
+        smem_port,
+        10,
+    ));
     let dma = sim.add_pe(
         nu,
         PeConfig {
@@ -147,6 +143,7 @@ pub fn node(k: Knobs) -> Node {
                 array,
                 rates: Vec::new(),
                 smem_port,
+                smem_wport: None,
                 utilization: Ratio::ONE,
                 quantize: true,
             },

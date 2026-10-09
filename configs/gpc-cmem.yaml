@@ -10,7 +10,7 @@ fabric:
   - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, latency: 20}
   - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 256, latency: 20, control: true}
 memory:
-  - {name: hbm, type: dram, addr: [[0x0, 0xF0000000]], bw_bytes: 512, latency: 200,
+  - {name: hbm, type: dram, addr: [[0x0, 0x100000000]], bw_bytes: 512, latency: 200,
      slave: $this.clsbus}
   # cmem is L2-class SRAM: port 1024 B/cycle (2x the 512 B/cycle of the four
   # SM links), latency 30 cycles, 64 MiB, above the HBM slice.
@@ -21,7 +21,7 @@ compute:
   # Copy engine: every write into the slice or the cmem is a task of the
   # gpc on it.
   # Beat 512 B: sized to the bus it masters (clsbus, 512 B/cycle).
-  - {name: dma, type: dma, latency: 100, inflight: 8, outstanding: 4, beat_bytes: 512, master: [$this.clsbus]}
+  - {name: dma, type: dma, latency: 100, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
 children:
   - {name: sm0, config: sm.yaml}

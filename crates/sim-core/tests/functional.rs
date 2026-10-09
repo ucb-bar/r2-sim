@@ -234,6 +234,7 @@ fn load_does_not_wait_for_unrelated_ops() {
                 acc_buffer: 0,
                 array: n.array,
                 smem_port: n.smem_port,
+                smem_wport: None,
                 utilization: Ratio::ONE,
                 quantize: true,
             },

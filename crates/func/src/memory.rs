@@ -28,14 +28,18 @@ pub(crate) fn err<T>(msg: String) -> Result<T, FuncError> {
 
 impl Memory {
     pub fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range]) {
-        self.blocks = memories
-            .iter()
-            .map(|m| Block {
-                range: m.range,
-                numeric: m.numeric,
-                pages: HashMap::new(),
-            })
-            .collect();
+        // One store per memory: the slices of a sliced memory share its
+        // range.
+        self.blocks = Vec::new();
+        for m in memories {
+            if !self.blocks.iter().any(|b| b.range == m.range) {
+                self.blocks.push(Block {
+                    range: m.range,
+                    numeric: m.numeric,
+                    pages: HashMap::new(),
+                });
+            }
+        }
         self.sync_only = sync_only.to_vec();
     }
 

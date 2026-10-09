@@ -18,15 +18,13 @@ fn bf16_rounds_to_nearest_even() {
 fn numeric() -> Numeric {
     let mut n = Numeric::new();
     n.configure(
-        &[MemBlock {
-            name: "m".into(),
-            owner: nu_model::NeutrinoId(0),
-            attach: Vec::new(),
-            numeric: true,
-            range: Range::new(0x10_0000, 0x30_0000),
-            port: ResourceId(0),
-            load_latency: 0,
-        }],
+        &[MemBlock::plain(
+            "m".into(),
+            nu_model::NeutrinoId(0),
+            Range::new(0x10_0000, 0x30_0000),
+            ResourceId(0),
+            0,
+        )],
         &[Range::new(0x20_0000, 0x21_0000)],
     );
     n

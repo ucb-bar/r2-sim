@@ -5,6 +5,8 @@
 //! demand vector and a latency, and the occupancy held from issue to
 //! completion. A profile never reads functional data.
 
+use std::rc::Rc;
+
 use nu_model::{Addr, Dep, NeutrinoId, Range};
 
 use crate::config::{MemBlock, PeConfig, PeParams};
@@ -231,8 +233,9 @@ pub struct Occupancy {
 pub struct Chunk {
     /// Compute: co-charged over one interval.
     pub demand: Vec<Demand>,
-    /// Transfer: the hops in route order; empty for a compute chunk.
-    pub path: Vec<PathHop>,
+    /// Transfer: its two route halves and bytes; `None` for a compute
+    /// chunk.
+    pub transfer: Option<TransferChunk>,
     /// Transfer: the master's beat rate, the start of the narrowing chain.
     pub rate: Ratio,
     /// Cycles after the request before the demand (or the first hop) may
@@ -241,6 +244,209 @@ pub struct Chunk {
     /// The fabric routes the chunk's bytes take, for a tracer (the
     /// unlimited links of a route have no demand).
     pub routes: [Option<RouteUse>; 2],
+}
+
+/// One half of a transfer's route between a memory block and a DMA
+/// engine (Section 5.3, routing function), computed once per engine and
+/// block: the hops with no amount, and the half's transaction grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Half {
+    /// Read half: the block's port, the route to the engine and the
+    /// engine's links. Write half: the route from the engine and the
+    /// block's write port. A latency before the route's first rated hop
+    /// is on the hop before it.
+    pub hops: Rc<[PathHop]>,
+    /// Write half: the latency before its first rated hop, added to the
+    /// last hop of the read half.
+    pub lead: Cycle,
+    /// The attachments the bytes move between, for a tracer.
+    pub pair: Option<(AttachId, AttachId)>,
+    /// The smallest `block_bytes` on the half's buses, links and port
+    /// (`u64::MAX`: none); all are powers of two, so its multiples are
+    /// every boundary of the half.
+    pub grid: u64,
+}
+
+/// A transfer chunk: `bytes` over the read half then the write half.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferChunk {
+    pub read: Rc<Half>,
+    pub write: Rc<Half>,
+    pub bytes: u64,
+}
+
+impl TransferChunk {
+    /// The hops of the chunk in route order with its bytes, into `buf`.
+    pub fn hops_into(&self, buf: &mut Vec<PathHop>) {
+        buf.clear();
+        buf.extend(self.read.hops.iter().map(|h| PathHop {
+            amount: self.bytes,
+            ..*h
+        }));
+        if let Some(last) = buf.last_mut() {
+            last.latency += self.write.lead;
+        }
+        buf.extend(self.write.hops.iter().map(|h| PathHop {
+            amount: self.bytes,
+            ..*h
+        }));
+    }
+}
+
+/// One memory of the block table: its range, and its blocks (one, or the
+/// slices in slice order with the granule's shift).
+#[derive(Debug, Clone)]
+struct MemEntry {
+    range: Range,
+    blocks: Vec<usize>,
+    shift: u32,
+}
+
+/// The routing function of transfers (Section 5.3): memory blocks by
+/// address, and per DMA engine and block the two route halves, in dense
+/// tables built once per run.
+#[derive(Debug, Clone, Default)]
+pub struct TransferRoutes {
+    /// Memories sorted by base; a sliced memory is one entry.
+    mems: Vec<MemEntry>,
+    /// Per block: the end of its memory's range, and its slice granule (0
+    /// for a block that is not a slice).
+    runs: Vec<(u64, u64)>,
+    nblocks: usize,
+    /// `[pe * nblocks + block]`: the read and write halves; `None` for a
+    /// PE that is not a DMA engine, or a block without a route.
+    halves: Vec<Halves>,
+}
+
+/// The read and write halves of one engine and block.
+type Halves = (Option<Rc<Half>>, Option<Rc<Half>>);
+
+impl TransferRoutes {
+    /// The tables for `pes` (by id) and `memories` (by index).
+    pub fn build(pes: &[&PeConfig], memories: &[MemBlock], topo: &Topology) -> Self {
+        let mut mems: Vec<MemEntry> = Vec::new();
+        let mut runs = Vec::with_capacity(memories.len());
+        for (i, m) in memories.iter().enumerate() {
+            let granule = if m.sliced {
+                m.sets[0].run(m.sets[0].base)
+            } else {
+                0
+            };
+            runs.push((m.range.bound, granule));
+            match mems.iter_mut().find(|e| e.range == m.range) {
+                Some(e) => e.blocks.push(i),
+                None => mems.push(MemEntry {
+                    range: m.range,
+                    blocks: vec![i],
+                    shift: granule.trailing_zeros(),
+                }),
+            }
+        }
+        // Slices in slice order: slice j holds granule bits equal to j.
+        for e in &mut mems {
+            if e.blocks.len() > 1 {
+                let mask = e.blocks.len() as u64 - 1;
+                e.blocks
+                    .sort_by_key(|&b| (memories[b].sets[0].base >> e.shift) & mask);
+            }
+        }
+        mems.sort_by_key(|e| e.range.base);
+        let nblocks = memories.len();
+        let mut halves = Vec::with_capacity(pes.len() * nblocks);
+        for pe in pes {
+            let PeParams::Dma { links, masters, .. } = &pe.params else {
+                halves.extend((0..nblocks).map(|_| (None, None)));
+                continue;
+            };
+            for m in memories {
+                let hop = |resource, dir, latency| PathHop {
+                    resource,
+                    amount: 0,
+                    dir,
+                    latency,
+                };
+                let grid = |blocks: &[u64]| {
+                    blocks
+                        .iter()
+                        .chain(m.block.as_ref())
+                        .copied()
+                        .min()
+                        .unwrap_or(u64::MAX)
+                };
+                let read = topo.best_path(&m.attach, masters).map(|p| {
+                    let mut hops = vec![hop(m.port, Dir::Read, p.lead)];
+                    hops.extend(p.hops.iter().map(|h| hop(h.lane, Dir::Read, h.latency)));
+                    hops.extend(links.iter().map(|l| hop(*l, Dir::Read, 0)));
+                    Rc::new(Half {
+                        hops: hops.into(),
+                        lead: 0,
+                        pair: topo.best_pair(&m.attach, masters),
+                        grid: grid(&p.blocks),
+                    })
+                });
+                let write = topo.best_path(masters, &m.attach).map(|p| {
+                    let mut hops: Vec<PathHop> = p
+                        .hops
+                        .iter()
+                        .map(|h| hop(h.lane, Dir::Write, h.latency))
+                        .collect();
+                    hops.push(hop(m.port_for(Dir::Write), Dir::Write, 0));
+                    Rc::new(Half {
+                        hops: hops.into(),
+                        lead: p.lead,
+                        pair: topo.best_pair(masters, &m.attach),
+                        grid: grid(&p.blocks),
+                    })
+                });
+                halves.push((read, write));
+            }
+        }
+        Self {
+            mems,
+            runs,
+            nblocks,
+            halves,
+        }
+    }
+
+    /// The block that holds `a`.
+    pub fn block(&self, a: u64) -> Option<usize> {
+        let i = self.mems.partition_point(|e| e.range.base <= a);
+        let e = self.mems.get(i.checked_sub(1)?)?;
+        if !e.range.contains(Addr(a)) {
+            return None;
+        }
+        let mask = e.blocks.len() as u64 - 1;
+        Some(e.blocks[((a >> e.shift) & mask) as usize])
+    }
+
+    /// The bytes from `a` to the end of block `b`'s run: the end of its
+    /// range, or of its slice granule.
+    pub fn run(&self, b: usize, a: u64) -> u64 {
+        match self.runs[b] {
+            (bound, 0) => bound - a,
+            (_, g) => g - (a & (g - 1)),
+        }
+    }
+
+    /// The read half from block `b` to DMA engine `pe`.
+    pub fn read(&self, pe: PeId, b: usize) -> Option<&Rc<Half>> {
+        self.halves[pe.0 as usize * self.nblocks + b].0.as_ref()
+    }
+
+    /// The write half from DMA engine `pe` to block `b`.
+    pub fn write(&self, pe: PeId, b: usize) -> Option<&Rc<Half>> {
+        self.halves[pe.0 as usize * self.nblocks + b].1.as_ref()
+    }
+}
+
+/// The bytes from `a` to the next multiple of `grid` (`u64::MAX`: none).
+fn grid_run(a: u64, grid: u64) -> u64 {
+    if grid == u64::MAX {
+        u64::MAX
+    } else {
+        grid - (a & (grid - 1))
+    }
 }
 
 /// The timing of one task: its chunks and the occupancy it holds.
@@ -257,6 +463,10 @@ pub struct Profile {
 pub struct NodeConfig<'a> {
     /// The executing PE.
     pub pe: &'a PeConfig,
+    /// Its id.
+    pub pe_id: PeId,
+    /// The routing function of transfers.
+    pub routes: &'a TransferRoutes,
     /// All memory blocks.
     pub memories: &'a [MemBlock],
     /// The fabric topology.
@@ -284,7 +494,7 @@ impl NodeConfig<'_> {
     pub fn memory(&self, addr: Addr) -> &MemBlock {
         self.memories
             .iter()
-            .find(|m| m.range.contains(addr))
+            .find(|m| m.holds(addr))
             .unwrap_or_else(|| panic!("address {:#x} is in no memory block", addr.0))
     }
 }
@@ -373,11 +583,10 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         panic!("dma with args {:?}", desc.args);
     };
     let PeParams::Dma {
-        links,
         latency,
-        masters,
         burst,
         beat,
+        ..
     } = &node.pe.params
     else {
         panic!("dma opcode on PE {}", node.pe.name);
@@ -386,43 +595,44 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     // transaction, whatever the program's tile.
     let tile_bytes = burst.unwrap_or(tile_bytes);
     assert!(tile_bytes > 0, "dma with tile_bytes 0");
-    let (sm, dm) = (node.memory(src), node.memory(dst));
-    let (src_port, dst_port) = (sm.port, dm.port);
-    let route =
-        |from: &[crate::topology::AttachId], to: &[crate::topology::AttachId], what: &str| {
-            node.topology
-                .best_path(from, to)
-                .unwrap_or_else(|| panic!("{}: no route {what}", node.pe.name))
+    // The chunk loop is arithmetic (Section 5.3, routing function): the
+    // block and route half of a side are looked up only when its address
+    // leaves the block's run (a block or a slice granule), and a chunk
+    // ends at the first block, grid or tile boundary of either side.
+    let r = node.routes;
+    let side = |a: u64, read: bool| {
+        let b = r
+            .block(a)
+            .unwrap_or_else(|| panic!("address {a:#x} is in no memory block"));
+        let (half, what) = if read {
+            (r.read(node.pe_id, b), "from the source")
+        } else {
+            (r.write(node.pe_id, b), "to the destination")
         };
-    let (inp, out) = (
-        route(&sm.attach, masters, "from the source"),
-        route(masters, &dm.attach, "to the destination"),
-    );
-    let (in_pair, out_pair) = (
-        node.topology.best_pair(&sm.attach, masters),
-        node.topology.best_pair(masters, &dm.attach),
-    );
+        let half = half.unwrap_or_else(|| panic!("{}: no route {what}", node.pe.name));
+        (half.clone(), r.run(b, a))
+    };
+    let (mut rh, mut src_run) = side(src.0, true);
+    let (mut wh, mut dst_run) = side(dst.0, false);
     let mut chunks = Vec::with_capacity(bytes.div_ceil(tile_bytes) as usize);
-    let mut left = bytes;
-    while left > 0 {
-        let n = left.min(tile_bytes);
-        left -= n;
-        // Reads: the source port, the route to the engine and the engine's
-        // links. Writes: the route from the engine and the destination
-        // port. A latency before a route's first rated hop is added to the
-        // hop before it.
-        let hop = |resource, dir, latency| PathHop {
-            resource,
-            amount: n,
-            dir,
-            latency,
-        };
-        let mut path = vec![hop(src_port, Dir::Read, inp.lead)];
-        path.extend(inp.hops.iter().map(|h| hop(h.lane, Dir::Read, h.latency)));
-        path.extend(links.iter().map(|l| hop(*l, Dir::Read, 0)));
-        path.last_mut().expect("source port").latency += out.lead;
-        path.extend(out.hops.iter().map(|h| hop(h.lane, Dir::Write, h.latency)));
-        path.push(hop(dst_port, Dir::Write, 0));
+    let mut done = 0u64;
+    while done < bytes {
+        let (sa, da) = (src.0 + done, dst.0 + done);
+        if src_run == 0 {
+            (rh, src_run) = side(sa, true);
+        }
+        if dst_run == 0 {
+            (wh, dst_run) = side(da, false);
+        }
+        let n = (bytes - done)
+            .min(tile_bytes)
+            .min(src_run)
+            .min(dst_run)
+            .min(grid_run(sa, rh.grid))
+            .min(grid_run(da, wh.grid));
+        done += n;
+        src_run -= n;
+        dst_run -= n;
         let use_of = |p: Option<(AttachId, AttachId)>, dir| {
             p.map(|(from, to)| RouteUse {
                 from,
@@ -433,10 +643,14 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         };
         chunks.push(Chunk {
             demand: Vec::new(),
-            path,
+            routes: [use_of(rh.pair, Dir::Read), use_of(wh.pair, Dir::Write)],
+            transfer: Some(TransferChunk {
+                read: rh.clone(),
+                write: wh.clone(),
+                bytes: n,
+            }),
             rate: Ratio::int(*beat),
             latency: *latency,
-            routes: [use_of(in_pair, Dir::Read), use_of(out_pair, Dir::Write)],
         });
     }
     Profile {
@@ -465,6 +679,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let PeParams::Atlas {
         array,
         smem_port,
+        smem_wport,
         utilization,
         quantize,
         row_panel,
@@ -480,7 +695,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let smem_route = node
         .memories
         .iter()
-        .find(|m| m.range.covers(&desc.dst))
+        .find(|m| m.covers(&desc.dst))
         .map_or((None, None), |m| {
             (
                 node.topology.best_pair(&m.attach, masters),
@@ -558,9 +773,9 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 demand: vec![
                     ops,
                     Demand::read(smem_port, read),
-                    Demand::write(smem_port, write),
+                    Demand::write(smem_wport.unwrap_or(smem_port), write),
                 ],
-                path: Vec::new(),
+                transfer: None,
                 rate: Ratio::ONE,
                 latency: 0,
                 routes: [
@@ -630,14 +845,14 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 bytes,
                 dir,
             });
-        for r in route.resources.iter().chain([&block.port]) {
+        for r in route.resources.iter().chain([&block.port_for(dir)]) {
             demand.push(Demand::new(*r, bytes, dir));
         }
     }
     Profile {
         chunks: vec![Chunk {
             demand,
-            path: Vec::new(),
+            transfer: None,
             rate: Ratio::ONE,
             latency: overhead + latency,
             routes,
@@ -648,4 +863,166 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
 
 fn ratio_cmp(a: &Ratio, b: &Ratio) -> std::cmp::Ordering {
     (a.num as u128 * b.den as u128).cmp(&(b.num as u128 * a.den as u128))
+}
+
+#[cfg(test)]
+mod tests {
+    use nu_model::{Addr, Range};
+
+    use super::{dma_profile, Args, Descriptor, NodeConfig, PathHop, TransferRoutes};
+    use crate::config::{MemBlock, PeConfig, PeParams};
+    use crate::profile::{AccFlags, PeId, ProfileRegistry};
+    use crate::resource::Dir;
+    use crate::topology::{grid_run, Topology};
+
+    /// A root with a sliced HBM (4 x 512 B), two adjacent dram blocks and a
+    /// bus grid of 1 KiB, and one SM whose local bus has a grid of 256 B.
+    const CONFIG: &str = "global:
+  neutrino_granule: 512
+  address: {fields: [{name: sm, bits: 2}], offset_bits: 24}
+device:
+  name: root
+  fabric: [{name: sbus, block_bytes: 1024}, {name: cbus, control: true}]
+  memory:
+    - {name: hbm, type: dram, addr: [[0x0, 0x10000]], slices: 4, interleave: 512, bw_bytes: 64, slave: $this.sbus}
+    - {name: d0, type: dram, addr: [[0x10000, 0x18000]], bw_bytes: 64, slave: $this.sbus}
+    - {name: d1, type: dram, addr: [[0x18000, 0x20000]], bw_bytes: 64, block_bytes: 2048, slave: $this.sbus}
+    - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+  neutrino: {c_base: 0, c_dep: 0, c_word: 0}
+  children:
+    - name: sm0
+      fabric:
+        - {name: smsbus}
+        - {name: smcbus, control: true}
+        - {name: lbus, block_bytes: 256}
+        - {name: smsbus_to_sbus, topology: link, from: $this.smsbus, to: $parent.sbus, bw_bytes: 1024}
+        - {name: smcbus_to_cbus, topology: link, from: $this.smcbus, to: $parent.cbus, bw_bytes: 128, control: true}
+      memory:
+        - {name: smem, type: scratch, addr: [[0x0, 0x10000]], bw_bytes: 1024, slave: [$this.lbus, $this.smsbus]}
+        - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
+      compute:
+        - {name: dma, type: dma, beat_bytes: 1024, master: [$this.lbus, $this.smsbus]}
+      neutrino: {c_invoke: 0, c_base: 0, c_dep: 0, c_word: 0}
+";
+
+    /// The chunks of a DMA by the lookup per chunk that the routing tables
+    /// replace: the block of each address, its run and port grid, and the
+    /// grid of the buses and links of each route half.
+    fn by_lookup(
+        mems: &[MemBlock],
+        topo: &Topology,
+        pe: &PeConfig,
+        (src, dst, bytes, tile): (u64, u64, u64, u64),
+    ) -> Vec<Vec<PathHop>> {
+        let PeParams::Dma { links, masters, .. } = &pe.params else {
+            unreachable!()
+        };
+        let block = |a: u64| mems.iter().find(|m| m.holds(Addr(a))).unwrap();
+        let mut out = Vec::new();
+        let mut done = 0;
+        while done < bytes {
+            let (sa, da) = (src + done, dst + done);
+            let (sm, dm) = (block(sa), block(da));
+            let inp = topo.best_path(&sm.attach, masters).unwrap();
+            let outp = topo.best_path(masters, &dm.attach).unwrap();
+            let n = (bytes - done)
+                .min(tile)
+                .min(sm.chunk_run(sa))
+                .min(dm.chunk_run(da))
+                .min(grid_run(sa, &inp.blocks))
+                .min(grid_run(da, &outp.blocks));
+            let hop = |resource, dir, latency| PathHop {
+                resource,
+                amount: n,
+                dir,
+                latency,
+            };
+            let mut path = vec![hop(sm.port, Dir::Read, inp.lead)];
+            path.extend(inp.hops.iter().map(|h| hop(h.lane, Dir::Read, h.latency)));
+            path.extend(links.iter().map(|l| hop(*l, Dir::Read, 0)));
+            path.last_mut().unwrap().latency += outp.lead;
+            path.extend(outp.hops.iter().map(|h| hop(h.lane, Dir::Write, h.latency)));
+            path.push(hop(dm.port_for(Dir::Write), Dir::Write, 0));
+            out.push(path);
+            done += n;
+        }
+        out
+    }
+
+    #[test]
+    fn the_chunk_loop_matches_the_lookup_per_chunk_on_random_spans() {
+        let mut b = crate::config::build(CONFIG, ProfileRegistry::with_builtins()).unwrap();
+        b.sim.finish_fabric().unwrap();
+        let pe_id = b.pe("root.sm0.dma");
+        let sim = &b.sim;
+        let pes: Vec<&PeConfig> = (0..sim.pe_count())
+            .map(|i| sim.pe_config(PeId(i as u32)))
+            .collect();
+        let routes = TransferRoutes::build(&pes, sim.memories(), sim.topology());
+        let smem = b.memory("root.sm0.smem").base;
+        let node = NodeConfig {
+            pe: sim.pe_config(pe_id),
+            pe_id,
+            routes: &routes,
+            memories: sim.memories(),
+            topology: sim.topology(),
+            acc: AccFlags::default(),
+        };
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: u64| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) % n
+        };
+        let mut buf = Vec::new();
+        for _ in 0..2000 {
+            let bytes = 1 + rnd(9000);
+            let tile = [64, 512, 1500, 4096, 65536][rnd(5) as usize];
+            // From the sliced HBM or across the two dram blocks into SMEM,
+            // or back.
+            let far = if rnd(2) == 0 {
+                rnd(0x10000 - bytes)
+            } else {
+                0x10000 + rnd(0x10000 - bytes)
+            };
+            let near = smem + rnd(0x10000 - bytes);
+            let (src, dst) = if rnd(2) == 0 {
+                (far, near)
+            } else {
+                (near, far)
+            };
+            let desc = Descriptor {
+                opcode: crate::profile::OpcodeId(2),
+                pe: Some(pe_id),
+                dst: Range::from_len(dst, bytes),
+                versioned: false,
+                inferred_version: None,
+                deps: vec![],
+                label: None,
+                args: Args::Dma {
+                    src: Addr(src),
+                    dst: Addr(dst),
+                    bytes,
+                    tile_bytes: tile,
+                },
+            };
+            let p = dma_profile(&desc, &node);
+            let want = by_lookup(
+                sim.memories(),
+                sim.topology(),
+                node.pe,
+                (src, dst, bytes, tile),
+            );
+            let got: Vec<Vec<PathHop>> = p
+                .chunks
+                .iter()
+                .map(|c| {
+                    c.transfer.as_ref().unwrap().hops_into(&mut buf);
+                    buf.clone()
+                })
+                .collect();
+            assert_eq!(got, want, "{src:#x} -> {dst:#x}, {bytes} B, tile {tile}");
+        }
+    }
 }

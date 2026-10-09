@@ -202,7 +202,7 @@ fn the_2p_family_passes_the_loader_check() {
             n += 1;
         }
     }
-    assert_eq!(n, 8, "the 2p*.yaml files");
+    assert_eq!(n, 9, "the 2p*.yaml files");
 }
 
 /// The 2p family's configs/2p.yaml.
@@ -584,13 +584,14 @@ fn small_bursts_interleave_two_transfers_on_a_shared_bridge() {
         two_transfers("beat_bytes: 128, burst_bytes: 512, outstanding: 1"),
         (60, 64)
     );
-    // With two chunks in flight each, a transfer reserves two bursts in a
-    // row: they alternate in pairs and end two bursts apart. The
-    // interleaving grain is outstanding x burst.
+    // Chunks are issued one burst apart at the engine's beat (Section 5.3,
+    // issue-driven chunks), never two at once: with two chunks in flight
+    // allowed, or with no cap, the transfers still alternate bursts.
     assert_eq!(
         two_transfers("beat_bytes: 128, burst_bytes: 512, outstanding: 2"),
-        (56, 64)
+        (60, 64)
     );
+    assert_eq!(two_transfers("beat_bytes: 128, burst_bytes: 512"), (60, 64));
     // With the default 64 B engine beat a transfer moves 64 B/cycle on one
     // of the two bridge lanes: the transfers run side by side, 4096 / 64 =
     // 64 cycles each.

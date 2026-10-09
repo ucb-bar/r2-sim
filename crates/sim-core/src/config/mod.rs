@@ -1,9 +1,9 @@
 //! Static configuration of one simulation: the types that code or the TOML
 //! loader ([`yaml`], architecture Section 8) builds.
 
-use nu_model::{DepConfig, NeutrinoId, Range};
+use nu_model::{Addr, AddressSet, DepConfig, NeutrinoId, Range};
 
-use crate::resource::ResourceId;
+use crate::resource::{Dir, ResourceId};
 use crate::time::{Cycle, Ratio};
 
 /// Cycle costs of the Neutrino instructions (Section 3.2). `complete` is
@@ -161,6 +161,9 @@ pub enum PeParams {
         rates: Vec<(crate::profile::Dtype, Ratio)>,
         /// The SMEM port resource.
         smem_port: ResourceId,
+        /// The SMEM write port (`wr_bytes`), charged by C out and the
+        /// flush instead of `smem_port`.
+        smem_wport: Option<ResourceId>,
         /// Efficiency of the array, in (0, 1].
         utilization: Ratio,
         /// Pad m and n of every chunk to the descriptor's tile shape for
@@ -203,13 +206,16 @@ pub struct PeConfig {
     pub name: String,
     /// Tasks running at once on this PE.
     pub max_inflight: u32,
-    /// Chunks of one task requested ahead (Section 5.3).
+    /// A transfer (chunks with a fabric path): the cap on its chunks
+    /// issued and not ended, `u32::MAX` for none (Section 5.3,
+    /// issue-driven chunks). Another task: its chunks requested ahead.
     pub max_outstanding: u32,
     /// Kind-specific parameters.
     pub params: PeParams,
 }
 
-/// A memory block: its address range and its port bandwidth resource.
+/// A memory block: its address sets and its port bandwidth resources.
+/// A sliced memory is one block per slice (architecture Section 3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemBlock {
     /// Name, `<node path>.<memory name>`.
@@ -222,12 +228,98 @@ pub struct MemBlock {
     /// False in a `null`-fidelity subtree: the Numeric backend drops writes
     /// and rejects reads.
     pub numeric: bool,
-    /// Address range of the block.
+    /// The contiguous range of the memory: the block's own, or for a
+    /// slice the whole sliced memory's (the functional plane keeps one
+    /// store per memory).
     pub range: Range,
-    /// Port bandwidth resource (bytes per cycle).
+    /// The block's addresses: the decomposition of `range`, or one slice.
+    pub sets: Vec<AddressSet>,
+    /// True for a slice of a sliced memory.
+    pub sliced: bool,
+    /// Port bandwidth resource (bytes per cycle); also the write port
+    /// without `wport`.
     pub port: ResourceId,
+    /// Write port (`wr_bytes`), charged by write demands.
+    pub wport: Option<ResourceId>,
+    /// Transaction size of the port(s) (`block_bytes`): a transfer is cut
+    /// at its multiples (architecture Section 5.3).
+    pub block: Option<u64>,
     /// Latency of a Neutrino load or store before its port bandwidth.
     pub load_latency: Cycle,
+}
+
+impl MemBlock {
+    /// A plain block of `range` with one port for both directions.
+    pub fn plain(
+        name: String,
+        owner: NeutrinoId,
+        range: Range,
+        port: ResourceId,
+        load_latency: Cycle,
+    ) -> Self {
+        Self {
+            name,
+            owner,
+            attach: Vec::new(),
+            numeric: true,
+            range,
+            sets: AddressSet::decompose(&range),
+            sliced: false,
+            port,
+            wport: None,
+            block: None,
+            load_latency,
+        }
+    }
+
+    /// The name of the memory: the block's, or for a slice
+    /// (`<memory>.s<i>`) its memory's.
+    pub fn memory_name(&self) -> &str {
+        match self.name.rsplit_once('.') {
+            Some((m, _)) if self.sliced => m,
+            _ => &self.name,
+        }
+    }
+
+    /// True when the block holds `addr`.
+    pub fn holds(&self, addr: Addr) -> bool {
+        self.sets.iter().any(|s| s.contains(addr))
+    }
+
+    /// The contiguous bytes from `addr` in the block (0 when it does not
+    /// hold `addr`), across adjacent sets of a decomposed range.
+    pub fn run(&self, addr: u64) -> u64 {
+        let mut total = 0u64;
+        let mut a = addr;
+        while let Some(r) = self.sets.iter().map(|s| s.run(a)).find(|&r| r > 0) {
+            total = total.saturating_add(r);
+            match a.checked_add(r) {
+                Some(next) => a = next,
+                None => break,
+            }
+        }
+        total
+    }
+
+    /// The most a chunk at `addr` may move in the block: its run, cut at
+    /// the block's `block_bytes` grid.
+    pub fn chunk_run(&self, addr: u64) -> u64 {
+        let grid = self.block.map_or(u64::MAX, |b| b - addr % b);
+        self.run(addr).min(grid)
+    }
+
+    /// True when the block holds every byte of `r` (a nonempty range).
+    pub fn covers(&self, r: &Range) -> bool {
+        !r.is_empty() && self.run(r.base) >= r.len()
+    }
+
+    /// The port that a demand in direction `dir` charges.
+    pub fn port_for(&self, dir: Dir) -> ResourceId {
+        match (dir, self.wport) {
+            (Dir::Write, Some(w)) => w,
+            _ => self.port,
+        }
+    }
 }
 
 /// What the timing plane does with a racy load (Section 4.4): a load of a

@@ -12,13 +12,13 @@
 #   a full 128-row tile (the padding-waste assumption of workload 1).
 # * Muon: 256 lane-op/cycle (a 16 x 16 SIMT core), overhead 50 cycles per
 #   task for launch and the reduction tail.
-# * DMA: latency 100 cycles, 4 chunks outstanding (enough to cover the
-#   latency at a 64 KiB chunk), 4 transfers in flight. The chunk is the
-#   program's tile (64 KiB): `burst_bytes` is not set (measured 2026-10-05,
-#   docs/results.md Section 3: smaller bursts make the forward pass slower
-#   in this model). Rule when it is set: (outstanding - 1) x burst_bytes
-#   >= latency x rate of the slowest hop (the loader warns otherwise; the
-#   worst SM path is 220 cycles x 128 B/cycle = 28160 B).
+# * DMA: latency 100 cycles, 4 transfers in flight. Chunks are issued at
+#   the engine's beat rate (architecture Section 5.3, issue-driven
+#   chunks), so the latency is paid once per transfer; `outstanding` (a cap
+#   on chunks issued and not ended) is not set. The chunk is the program's
+#   tile (64 KiB): `burst_bytes` is not set (measured 2026-10-05,
+#   docs/results.md Section 3: smaller bursts made the forward pass slower
+#   under the earlier completion-driven issue).
 # * Neutrino: the table sizes of architecture Section 3.3
 #   (2026-09-24): scoreboard 128, pending table 256, execution table 256,
 #   inbound ref table 128, inbound invoke table 64, outbound dep table 128,
@@ -46,6 +46,6 @@ compute:
   - {name: muon, type: vector, rate: {lane_op: 256}, overhead: 50, master: [$this.lbus, $this.smsbus]}
   # DMA beat 256 B: sized to the SMEM port it serves (its buses are
   # unlimited), so one transfer can fill the port.
-  - {name: dma, type: dma, latency: 100, inflight: 4, outstanding: 4, beat_bytes: 256, master: [$this.lbus, $this.smsbus]}
+  - {name: dma, type: dma, latency: 100, inflight: 4, beat_bytes: 256, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
            c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}

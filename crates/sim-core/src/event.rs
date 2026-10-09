@@ -21,6 +21,13 @@ pub enum Event {
         nu: NeutrinoId,
         task: TaskId,
     },
+    /// The next chunk of transfer `task` on `pe` is due for issue
+    /// (Section 5.3, issue-driven chunks).
+    ChunkIssue {
+        pe: PeId,
+        nu: NeutrinoId,
+        task: TaskId,
+    },
     /// The completion of `task` reaches the tables (after `c_complete`).
     Complete { nu: NeutrinoId, task: TaskId },
     /// The memory access of the Neutrino's load or store is done.
