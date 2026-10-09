@@ -1,6 +1,6 @@
 //! The raw trace dump for the r2-vis converter (`--trace-raw DIR`).
 //!
-//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.3.
+//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.4.
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -1708,7 +1708,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 }
             }
             let info = lay.links.get(i);
-            json!({
+            let mut row = json!({
                 "id": i, "path": info.map(|x| x.path.clone()),
                 "node": info.map(|x| x.node.0),
                 "control": info.map(|x| x.control),
@@ -1720,12 +1720,21 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 "beat_bytes": info.map(|x| x.beat),
                 "latency": l.latency,
                 "cache": info.and_then(|x| x.cache),
-            })
+            });
+            // A hash link's address rewrite (architecture Section 3.1).
+            if let Some(h) = info.and_then(|x| x.hash.as_ref()) {
+                row["hash"] = json!({
+                    "range": [hex(h.range.base), hex(h.range.bound)],
+                    "to_range": [hex(h.to_range.base), hex(h.to_range.bound)],
+                    "index": h.index.iter().map(|m| hex(*m)).collect::<Vec<_>>(),
+                    "drop": h.drop,
+                    "granule": h.granule(),
+                    "slice_bytes": h.slice_bytes(),
+                });
+            }
+            row
         })
         .collect();
-    // A sliced memory's blocks are not contiguous ranges: with slices, every
-    // memory also gives its address sets (`sets`, [base, mask]).
-    let sliced = lay.memories.iter().any(|m| m.sliced);
     let mem_rows: Vec<Value> = lay
         .memories
         .iter()
@@ -1743,13 +1752,6 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 "bw_bytes": bw(m.port.and_then(|p| res.flow_rate(p))),
                 "latency": m.latency,
             });
-            if sliced {
-                row["sets"] = m
-                    .sets
-                    .iter()
-                    .map(|s| json!([hex(s.base), hex(s.mask)]))
-                    .collect();
-            }
             if let Some(w) = m.wport {
                 row["wport"] = json!(w.0);
                 row["wr_bytes"] = bw(res.flow_rate(w));
@@ -1816,7 +1818,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
     json!({
         "format": "r2raw",
-        "version": [1, 3],
+        "version": [1, 4],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

@@ -43,7 +43,7 @@
 //!   hop stage holds per protocol class, default 1: a pipeline register,
 //!   not a buffer to size).
 //! * buses and links: a bus or link without `bw_bytes` is unlimited.
-//! * buses, links and memories (scratch, dram, cache; per slice too):
+//! * buses, links and memories (scratch, dram, cache; per bank too):
 //!   `block_bytes`, the transaction size (Section 5.3). A DMA chunk, or a
 //!   load or store piece, that passes through it ends at the next
 //!   multiple of it: the source address bounds the read half of the
@@ -66,15 +66,19 @@
 //!   burst_bytes` does not cover latency x rate of the engine's paths).
 //! * memories (scratch and dram): `wr_bytes` (a separate write port
 //!   `<mem>.wport` charged by write demands; without it `<mem>.port`
-//!   serves both directions); `slices` and `interleave` (both powers of
-//!   two; architecture Section 3.1): S blocks `<mem>.s<i>`, slice i
-//!   holding the `interleave`-byte granules whose index modulo S is i,
-//!   each with its own ports, latency and attachments; `bw_bytes`,
-//!   `wr_bytes`, `latency` and `beat_bytes` are per slice, and `slice:
-//!   {s<i>: {...}}` overrides them for one slice (an override PATH
-//!   `<mem>.s<i>.<key>` or `<mem>.s*.<key>` writes there). A sliced
-//!   memory's range is a power-of-two size aligned to its base, and no
-//!   compute PE may use it (Atlas SMEM, Muon source or destination).
+//!   serves both directions); `banks: N` (architecture Section 3.1): N
+//!   equal contiguous blocks `<mem>.b<i>`, each with its own ports,
+//!   latency and attachments; `bw_bytes`, `wr_bytes`, `latency`,
+//!   `beat_bytes` and `block_bytes` are per bank, and `bank: {b<i>:
+//!   {...}}` overrides them for one bank (an override PATH
+//!   `<mem>.b<i>.<key>` or `<mem>.b*.<key>` writes there).
+//! * links: `hash: {range, to_range, index, drop}` (Section 3.1), ranges
+//!   in the node's own space. The node owns `range` (the linear range
+//!   programs address); a transfer to it is rewritten onto `to_range`,
+//!   which memory blocks behind the link cover exactly. The loader checks
+//!   that the rewrite is a bijection. A banked memory whose range is a
+//!   hash's `to_range` is found by name at the linear range
+//!   ([`Built::memory`]). A compute PE does not address a hashed range.
 //!
 //! Addressing: an address is [field 1] .. [field n] [offset]. A child's
 //! field value is its index among its parent's children plus one; value 0
@@ -90,7 +94,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use nu_model::{AddressSet, DepConfig, NeutrinoId, Range};
+use nu_model::{AddressHash, DepConfig, NeutrinoId, Range};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
@@ -294,34 +298,34 @@ fn set_in_map(t: &mut Mapping, segs: &[Seg], v: &Value, insert: bool) -> usize {
     n
 }
 
-/// True when `seg` names slices of a sliced memory: `s<i>` or `s*`.
-fn is_slice_key(seg: &Seg) -> bool {
+/// True when `seg` names banks of a banked memory: `b<i>` or `b*`.
+fn is_bank_key(seg: &Seg) -> bool {
     let k = &seg.key;
     seg.idx.is_empty()
-        && (k == "s*"
-            || k.strip_prefix('s')
+        && (k == "b*"
+            || k.strip_prefix('b')
                 .is_some_and(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_digit())))
 }
 
-/// Sets `v` at `segs[1..]` in the per-slice overrides (`slice: {s<i>:
-/// ...}`) of the sliced memory `mem`, for every slice that `segs[0]`
+/// Sets `v` at `segs[1..]` in the per-bank overrides (`bank: {b<i>:
+/// ...}`) of the banked memory `mem`, for every bank that `segs[0]`
 /// names.
-fn set_in_slices(mem: &mut Value, segs: &[Seg], v: &Value) -> usize {
-    let Some(slices) = mem.get("slices").and_then(Value::as_u64) else {
+fn set_in_banks(mem: &mut Value, segs: &[Seg], v: &Value) -> usize {
+    let Some(banks) = mem.get("banks").and_then(Value::as_u64) else {
         return 0;
     };
     let Some(map) = mem.as_mapping_mut() else {
         return 0;
     };
     let table = map
-        .entry(Value::String("slice".into()))
+        .entry(Value::String("bank".into()))
         .or_insert_with(|| Value::Mapping(Mapping::new()));
     let Some(table) = table.as_mapping_mut() else {
         return 0;
     };
     let mut n = 0;
-    for i in 0..slices {
-        let name = format!("s{i}");
+    for i in 0..banks {
+        let name = format!("b{i}");
         if !glob(&segs[0].key, &name) {
             continue;
         }
@@ -362,8 +366,8 @@ fn set_in_node(node: &mut Value, segs: &[Seg], v: &Value, literal: bool) -> usiz
             let literal = !seg.key.contains('*');
             n += if list == "children" {
                 set_in_node(item, rest, v, literal)
-            } else if list == "memory" && rest.len() > 1 && is_slice_key(&rest[0]) {
-                set_in_slices(item, rest, v)
+            } else if list == "memory" && rest.len() > 1 && is_bank_key(&rest[0]) {
+                set_in_banks(item, rest, v)
             } else {
                 item.as_mapping_mut()
                     .map_or(0, |m| set_in_map(m, rest, v, literal))
@@ -486,6 +490,19 @@ struct BusSec {
     /// A link's two buses (`topology: link` only).
     from: Option<String>,
     to: Option<String>,
+    /// A link's address rewrite (architecture Section 3.1).
+    hash: Option<HashSec>,
+}
+
+/// `hash` of a link: ranges relative to the node's own space, like scratch
+/// and dram ranges.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HashSec {
+    range: [Num; 2],
+    to_range: [Num; 2],
+    index: Vec<Num>,
+    drop: Option<Vec<u32>>,
 }
 
 /// A bus reference or a list of them.
@@ -525,19 +542,17 @@ struct MemSec {
     /// Rate of a separate write port; without it the port serves both
     /// directions.
     wr_bytes: Option<Num>,
-    /// Slices of a sliced memory (a power of two; default 1).
-    slices: Option<u64>,
-    /// Bytes of one slice's granule (a power of two).
-    interleave: Option<Num>,
-    /// Per-slice overrides, by slice name (`s0`, `s1`, ...).
+    /// Equal contiguous blocks of a banked memory (default 1).
+    banks: Option<u64>,
+    /// Per-bank overrides, by bank name (`b0`, `b1`, ...).
     #[serde(default)]
-    slice: HashMap<String, SliceSec>,
+    bank: HashMap<String, BankSec>,
 }
 
-/// The keys of one slice that can differ from the memory's.
+/// The keys of one bank that can differ from the memory's.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-struct SliceSec {
+struct BankSec {
     bw_bytes: Option<Num>,
     wr_bytes: Option<Num>,
     latency: Option<u64>,
@@ -733,6 +748,8 @@ pub struct LinkInfo {
     pub rate: Option<Ratio>,
     pub beat: u64,
     pub latency: u64,
+    /// The link's address rewrite (absolute ranges).
+    pub hash: Option<AddressHash>,
 }
 
 /// One memory of the configuration: a block, a cache or a sync range.
@@ -742,12 +759,8 @@ pub struct MemInfo {
     pub node: NeutrinoId,
     /// "scratch", "dram", "cache" or "sync".
     pub kind: &'static str,
-    /// Global address ranges (of a slice: the whole sliced memory).
+    /// Global address ranges.
     pub ranges: Vec<Range>,
-    /// The block's address sets.
-    pub sets: Vec<AddressSet>,
-    /// True for a slice of a sliced memory.
-    pub sliced: bool,
     pub attachments: Vec<AttachId>,
     pub port: Option<ResourceId>,
     /// The write port (`wr_bytes`).
@@ -936,8 +949,6 @@ struct Builder {
     buses: HashMap<String, BusId>,
     mems: Vec<PendingMem>,
     caches: Vec<PendingCache>,
-    /// Sliced scratch memories by name.
-    sliced_scratch: Vec<String>,
     /// Sync ranges for the layout, in node order.
     syncs: Vec<MemInfo>,
     /// Scratch memories with their slave bus name and port, for the SMEM
@@ -997,7 +1008,6 @@ impl Builder {
             },
             buses: HashMap::new(),
             mems: Vec::new(),
-            sliced_scratch: Vec::new(),
             caches: Vec::new(),
             syncs: Vec::new(),
             scratch_ports: Vec::new(),
@@ -1094,6 +1104,7 @@ impl Builder {
                 rate: res.flow_rate(c.port),
                 beat: res.flow(c.port).beat().unwrap_or(DEFAULT_BEAT),
                 latency: c.latency,
+                hash: None,
             };
             let index = self.built.layout.links.len();
             if let Some(blk) = c.block {
@@ -1111,9 +1122,7 @@ impl Builder {
                 path: c.name,
                 node: c.node,
                 kind: "cache",
-                sets: c.ranges.iter().flat_map(AddressSet::decompose).collect(),
                 ranges: c.ranges,
-                sliced: false,
                 attachments: vec![x, y],
                 port: Some(c.port),
                 wport: None,
@@ -1134,8 +1143,6 @@ impl Builder {
                 node: block.owner,
                 kind: m.kind,
                 ranges: vec![block.range],
-                sets: block.sets.clone(),
-                sliced: block.sliced,
                 attachments: block.attach.clone(),
                 port: Some(block.port),
                 wport: block.wport,
@@ -1148,6 +1155,7 @@ impl Builder {
             self.built.layout.links[l].cache = Some(blocks + c);
         }
         self.built.layout.memories.extend(caches);
+        self.check_hashes()?;
         let syncs = std::mem::take(&mut self.syncs);
         self.built.layout.memories.extend(syncs);
         self.built.sim.finish_fabric().map_err(ConfigError)?;
@@ -1224,6 +1232,42 @@ impl Builder {
                 }
             }
         }
+        // A hash link's linear range is the node's, like a memory range.
+        let mut hashes = Vec::new();
+        for b in sec.fabric.iter() {
+            let Some(h) = &b.hash else {
+                continue;
+            };
+            let lpath = format!("{path}.{}", b.name);
+            if !is_link(b) {
+                return err(format!("{lpath}: hash is a key of a link"));
+            }
+            let abs = |r: &[Num; 2]| -> Result<Range, ConfigError> {
+                let (lo, hi) = (r[0].bytes()?, r[1].bytes()?);
+                if hi <= lo {
+                    return err(format!("{lpath}: empty hash range"));
+                }
+                Ok(Range::new(base + lo, base + hi))
+            };
+            let (range, to_range) = (abs(&h.range)?, abs(&h.to_range)?);
+            if !own.covers(&range) || !own.covers(&to_range) {
+                return err(format!("{lpath}: a hash range is outside its space {own}"));
+            }
+            let index = h
+                .index
+                .iter()
+                .map(Num::bytes)
+                .collect::<Result<Vec<_>, _>>()?;
+            let rule = AddressHash::new(range, to_range, index, h.drop.clone())
+                .map_err(|e| ConfigError(format!("{lpath}: hash: {e}")))?;
+            if let Some(r) = owned.iter().find(|r| r.overlaps(&range)) {
+                return err(format!(
+                    "{lpath}: memory range {r} overlaps the hash's linear range {range}"
+                ));
+            }
+            owned.push(range);
+            hashes.push((b.name.clone(), rule));
+        }
         // Link resources first, in fabric order (data, then control, as
         // the configurations list them).
         let mut links = Vec::new();
@@ -1276,8 +1320,6 @@ impl Builder {
                 node: nu,
                 kind: "sync",
                 ranges: vec![r],
-                sets: AddressSet::decompose(&r),
-                sliced: false,
                 attachments: Vec::new(),
                 port: None,
                 wport: None,
@@ -1369,6 +1411,7 @@ impl Builder {
                     upward[b.control as usize] = true;
                 }
             }
+            let hash = hashes.iter().find(|h| h.0 == b.name).map(|h| h.1.clone());
             let info = LinkInfo {
                 path: lpath.clone(),
                 node: nu,
@@ -1377,6 +1420,7 @@ impl Builder {
                 rate,
                 beat,
                 latency: b.latency,
+                hash: hash.clone(),
             };
             let (fname, tname) = (attach_name(&lpath, &from), attach_name(&lpath, &to));
             let index = self.built.layout.links.len();
@@ -1389,6 +1433,9 @@ impl Builder {
             );
             if let Some(blk) = block_of(&b.block_bytes, &lpath)? {
                 self.built.sim.set_link_block(index, blk);
+            }
+            if let Some(h) = hash {
+                self.built.sim.add_hash(index, nu, numeric, h);
             }
         }
         if parent.is_some() && upward != [true; 2] {
@@ -1412,20 +1459,20 @@ impl Builder {
     ) -> Result<(), ConfigError> {
         for m in &sec.memory {
             let name = format!("{path}.{}", m.name);
-            let sliced = m.slices.is_some() || m.interleave.is_some() || !m.slice.is_empty();
+            let banked = m.banks.is_some() || !m.bank.is_empty();
             if m.kind == "sync" {
-                if sliced || m.wr_bytes.is_some() || m.block_bytes.is_some() {
-                    return err(format!("{name}: a sync range has no slices or ports"));
+                if banked || m.wr_bytes.is_some() || m.block_bytes.is_some() {
+                    return err(format!("{name}: a sync range has no banks or ports"));
                 }
                 continue;
             }
-            if m.kind != "scratch" && m.kind != "dram" && (sliced || m.wr_bytes.is_some()) {
+            if m.kind != "scratch" && m.kind != "dram" && (banked || m.wr_bytes.is_some()) {
                 return err(format!(
-                    "{name}: slices, interleave and wr_bytes are keys of a scratch or dram block"
+                    "{name}: banks and wr_bytes are keys of a scratch or dram block"
                 ));
             }
-            if sliced {
-                self.sliced(m, &name, path, ppath, nu, base, numeric)?;
+            if banked {
+                self.banked(m, &name, path, ppath, nu, base, numeric)?;
                 continue;
             }
             let Some(bw) = &m.bw_bytes else {
@@ -1499,6 +1546,54 @@ impl Builder {
         Ok(())
     }
 
+    /// Every hash link: no memory block overlaps its linear range, and the
+    /// blocks inside its physical range cover it exactly, none crossing
+    /// its edges. A banked memory whose range is a hash's physical range
+    /// is addressed by programs at the linear range (its name maps there).
+    fn check_hashes(&mut self) -> Result<(), ConfigError> {
+        let links = &self.built.layout.links;
+        for l in links.iter() {
+            let Some(h) = &l.hash else {
+                continue;
+            };
+            let blocks = self.built.sim.memories();
+            if let Some(m) = blocks.iter().find(|m| m.range.overlaps(&h.range)) {
+                return err(format!(
+                    "{}: memory {} overlaps the hash's linear range {}",
+                    l.path, m.name, h.range
+                ));
+            }
+            if let Some(m) = blocks
+                .iter()
+                .find(|m| m.range.overlaps(&h.to_range) && !h.to_range.covers(&m.range))
+            {
+                return err(format!(
+                    "{}: memory {} crosses the edge of the hash's physical range {}",
+                    l.path, m.name, h.to_range
+                ));
+            }
+            let covered: u64 = blocks
+                .iter()
+                .filter(|m| h.to_range.covers(&m.range))
+                .map(|m| m.range.len())
+                .sum();
+            if covered != h.to_range.len() {
+                return err(format!(
+                    "{}: the memory blocks cover {covered:#x} of the hash's physical range {} ({:#x} bytes)",
+                    l.path,
+                    h.to_range,
+                    h.to_range.len()
+                ));
+            }
+            for r in self.built.memories.values_mut() {
+                if *r == h.to_range {
+                    *r = h.range;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The port of block `name` at `bw` (`<name>.port`) and, with `wr`, its
     /// write port (`<name>.wport`), with their beat.
     fn ports(
@@ -1523,12 +1618,12 @@ impl Builder {
         Ok((port, wport))
     }
 
-    /// A sliced memory (architecture Section 3.1): one block per slice,
-    /// `<name>.s<i>`, with its own ports, latency and attachments. Slice
-    /// `i` holds the addresses whose bits `log2 G ..< log2 G + log2 S`
-    /// equal `i`.
+    /// A banked memory (architecture Section 3.1): N equal contiguous
+    /// blocks `<name>.b<i>`, each with its own ports, latency and
+    /// attachments. The interleave over them, if any, is a hash link in
+    /// front of their bus.
     #[allow(clippy::too_many_arguments)]
-    fn sliced(
+    fn banked(
         &mut self,
         m: &MemSec,
         name: &str,
@@ -1538,28 +1633,14 @@ impl Builder {
         base: u64,
         numeric: bool,
     ) -> Result<(), ConfigError> {
-        let (Some(slices), Some(g)) = (m.slices, &m.interleave) else {
-            return err(format!(
-                "{name}: a sliced memory needs slices and interleave"
-            ));
-        };
-        let g = g.bytes()?;
-        if !slices.is_power_of_two() || !g.is_power_of_two() {
-            return err(format!("{name}: slices and interleave are powers of two"));
-        }
+        let banks = m.banks.unwrap_or(1);
         let [[a, b]] = m.addr.as_slice() else {
             return err(format!("{name}: needs exactly one addr range"));
         };
         let range = Range::new(base + a.bytes()?, base + b.bytes()?);
-        let size = range.len();
-        if !size.is_power_of_two() || !range.base.is_multiple_of(size) {
+        if banks == 0 || !range.len().is_multiple_of(banks) {
             return err(format!(
-                "{name}: a sliced memory is a power-of-two size aligned to its base, not {range}"
-            ));
-        }
-        if size < slices * g {
-            return err(format!(
-                "{name}: {range} is smaller than slices x interleave"
+                "{name}: {range} does not split into {banks} equal banks"
             ));
         }
         if m.master.is_some() {
@@ -1574,37 +1655,31 @@ impl Builder {
             .map(|b| resolve(b, path, ppath))
             .collect::<Result<_, _>>()?;
         if let Some(k) = m
-            .slice
+            .bank
             .keys()
-            .find(|k| !(0..slices).any(|i| **k == format!("s{i}")))
+            .find(|k| !(0..banks).any(|i| **k == format!("b{i}")))
         {
-            return err(format!("{name}: no slice {k:?}"));
+            return err(format!("{name}: no bank {k:?}"));
         }
-        let shift = g.trailing_zeros();
-        let none = SliceSec::default();
-        for i in 0..slices {
-            let sname = format!("{name}.s{i}");
-            let o = m.slice.get(&format!("s{i}")).unwrap_or(&none);
+        let size = range.len() / banks;
+        let none = BankSec::default();
+        for i in 0..banks {
+            let bname = format!("{name}.b{i}");
+            let o = m.bank.get(&format!("b{i}")).unwrap_or(&none);
             let Some(bw) = o.bw_bytes.as_ref().or(m.bw_bytes.as_ref()) else {
-                return err(format!("{sname}: needs bw_bytes"));
+                return err(format!("{bname}: needs bw_bytes"));
             };
             let wr = o.wr_bytes.as_ref().or(m.wr_bytes.as_ref());
-            let beat = if o.beat_bytes.is_some() {
-                &o.beat_bytes
-            } else {
-                &m.beat_bytes
+            let pick = |own: &Option<Num>, all: &Option<Num>| -> Option<Num> {
+                own.clone().or_else(|| all.clone())
             };
-            let (port, wport) = self.ports(&sname, bw, wr, beat)?;
+            let (port, wport) = self.ports(&bname, bw, wr, &pick(&o.beat_bytes, &m.beat_bytes))?;
             if m.kind == "scratch" {
-                self.sliced_scratch.push(name.to_string());
                 for sl in &slaves {
-                    self.scratch_ports.push((sname.clone(), sl.clone(), port));
+                    self.scratch_ports.push((bname.clone(), sl.clone(), port));
                 }
             }
-            let set = AddressSet::new(
-                range.base | (i << shift),
-                (size - 1) & !((slices - 1) << shift),
-            );
+            let r = Range::from_len(range.base + i * size, size);
             self.mems.push(PendingMem {
                 kind: if m.kind == "scratch" {
                     "scratch"
@@ -1613,18 +1688,10 @@ impl Builder {
                 },
                 block: MemBlock {
                     numeric,
-                    sets: vec![set],
-                    sliced: true,
+                    banked: true,
                     wport,
-                    block: block_of(
-                        if o.block_bytes.is_some() {
-                            &o.block_bytes
-                        } else {
-                            &m.block_bytes
-                        },
-                        &sname,
-                    )?,
-                    ..MemBlock::plain(sname, nu, range, port, o.latency.unwrap_or(m.latency))
+                    block: block_of(&pick(&o.block_bytes, &m.block_bytes), &bname)?,
+                    ..MemBlock::plain(bname, nu, r, port, o.latency.unwrap_or(m.latency))
                 },
                 slaves: slaves.clone(),
             });
@@ -1642,15 +1709,6 @@ impl Builder {
             .filter(|s| buses.contains(&s.1))
             .collect();
         found.dedup_by(|a, b| a.0 == b.0);
-        if let Some(s) = found.iter().find_map(|s| {
-            self.sliced_scratch
-                .iter()
-                .find(|m| s.0.starts_with(&format!("{m}.s")))
-        }) {
-            return err(format!(
-                "{name}: {s} is sliced; a compute PE does not read a sliced memory"
-            ));
-        }
         match found.as_slice() {
             [s] => Ok(s.2),
             [] => err(format!("{name}: no scratch memory is a slave on {buses:?}")),

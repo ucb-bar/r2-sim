@@ -1,0 +1,48 @@
+# The MIG 2g.48gb half of the RTX PRO 6000 Blackwell (rtx6000.yaml): the
+# instance we correlate against. Half the SMs (94 on the card; 6 GPCs x 16
+# here), half the memory controllers (8 channels, 896 GB/s = 343 B/cycle,
+# 43 per channel), half the L2 (64 MB, 32 slices), 48 GB. The slice hash
+# of a MIG instance is unmeasured: the full card's hash with the top index
+# bit (address bit 15) dropped is assumed. Everything else as rtx6000.yaml
+# (hash links, physical slices and channels).
+
+global:
+  neutrino_granule: 512
+  clock_ghz: 2.617
+  msg_bytes: 64
+  flow: readyvalid
+  hop_queue: 1
+  address:
+    fields: [{name: gpc, bits: 4}, {name: sm, bits: 5}]
+    offset_bits: 38
+
+device:
+  name: root
+  fabric:
+    - {name: sbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
+    - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
+    - {name: l2bus, topology: xbar}
+    - {name: mbus, topology: xbar}
+    # The full card's hash without its top index bit (address bit 15).
+    - {name: sbus_to_l2bus, topology: link, from: $this.sbus, to: $this.l2bus, latency: 0,
+       hash: {range: [0x0, 0x4000000], to_range: [0x100000000, 0x104000000],
+              index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000],
+              drop: [8, 10, 11, 12, 13]}}
+    # 8 channels of 6 GiB: linear [32 GiB, 80 GiB) to physical at 128 GiB.
+    - {name: sbus_to_mbus, topology: link, from: $this.sbus, to: $this.mbus, latency: 0,
+       hash: {range: [0x800000000, 0x1400000000], to_range: [0x2000000000, 0x2C00000000],
+              index: [0x100, 0x200, 0x400]}}
+  memory:
+    - {name: l2, type: scratch, addr: [[0x100000000, 0x104000000]], banks: 32,
+       bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, latency: 180, slave: $this.l2bus}
+    - {name: hbm, type: dram, addr: [[0x2000000000, 0x2C00000000]], banks: 8,
+       bw_bytes: 43, beat_bytes: 32, latency: 500, slave: $this.mbus}
+    - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  neutrino: {scoreboard: 1024, pending: 4096, execution: 4096, versions: 16384, inbound_refs: 1024, inbound_invokes: 256, outbound_deps: 256, outbound_invokes: 64}
+  children:
+    - {name: gpc0, config: rtx6000-gpc.yaml}
+    - {name: gpc1, config: rtx6000-gpc.yaml}
+    - {name: gpc2, config: rtx6000-gpc.yaml}
+    - {name: gpc3, config: rtx6000-gpc.yaml}
+    - {name: gpc4, config: rtx6000-gpc.yaml}
+    - {name: gpc5, config: rtx6000-gpc.yaml}

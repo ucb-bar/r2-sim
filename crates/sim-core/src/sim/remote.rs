@@ -1291,6 +1291,7 @@ impl Sim {
         n.state = ProgState::Busy;
         if let Some(t) = self.tracer.as_mut() {
             let gid = self.nus[parent.0 as usize].rec(task).gid;
+            t.entries_clear(child, Table::Versions, self.now);
             t.program_start(child, start.name, Some(gid), self.now);
         }
         self.queue.push(self.now, Event::NuResume(child));

@@ -28,8 +28,7 @@ pub(crate) fn err<T>(msg: String) -> Result<T, FuncError> {
 
 impl Memory {
     pub fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range]) {
-        // One store per memory: the slices of a sliced memory share its
-        // range.
+        // One store per range (a block may be listed twice).
         self.blocks = Vec::new();
         for m in memories {
             if !self.blocks.iter().any(|b| b.range == m.range) {

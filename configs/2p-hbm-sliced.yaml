@@ -1,11 +1,27 @@
-# 2p.yaml with each gpc's HBM as a sliced memory (architecture Section
-# 3.1): 4 slices of 512 B granules, 128 B/cycle each (512 B/cycle in all,
-# as 2p.yaml), and a write port per slice at the same rate. A DMA chunk
-# that touches the HBM is at most one 512 B granule (Section 5.3): this
-# file measures the cost of that chunking.
-base: 2p.yaml
-set:
-  - root.gpc*.hbm.slices=4
-  - root.gpc*.hbm.interleave=512
-  - root.gpc*.hbm.bw_bytes=128
-  - root.gpc*.hbm.wr_bytes=128
+# 2p.yaml with each gpc's HBM as 4 physical banks behind a hash link
+# (gpc-hbm-sliced.yaml): the chunking-cost measurement of docs/results.md
+# Section 8. offset_bits 34 makes room for the physical banks. A full file,
+# not `base: 2p.yaml`: overrides apply after the includes are expanded, so
+# they cannot change a child's file.
+
+global:
+  neutrino_granule: 512
+  clock_ghz: 1.0
+  msg_bytes: 64
+  flow: readyvalid
+  hop_queue: 1
+  address:
+    fields: [{name: gpc, bits: 2}, {name: sm, bits: 3}]
+    offset_bits: 34
+
+device:
+  name: root
+  fabric:
+    - {name: sbus, topology: xbar, bw_bytes: 512}
+    - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
+  memory:
+    - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+  children:
+    - {name: gpc0, config: gpc-hbm-sliced.yaml}
+    - {name: gpc1, config: gpc-hbm-sliced.yaml}

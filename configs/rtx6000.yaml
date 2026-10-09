@@ -1,0 +1,98 @@
+# RTX PRO 6000 Blackwell Workstation Edition (GB202) as a Radiance 2 device:
+# the correlation reference (architecture Section 8.3). Caches are modeled
+# as scratch memories of the same capacity at the same place: the L2 is a
+# 128 MB scratch of 64 contiguous physical slices behind the device
+# crossbar, reached through a link that carries the address hash, and
+# each SM's L1/shared block is its smem. Data is where the programs put it.
+#
+# Measured on the card (2026-10-08) unless marked: 64 L2 slices,
+# 256 B granule, slice chosen by an XOR hash of address bits 8 to 20 (the
+# `hash` of sbus_to_l2bus); 52 B/cycle read and 28 B/cycle write per
+# slice achieved against 64 and 32 nominal; hit latency 339 cycles on
+# average.
+#
+# Clock: 2617 MHz boost (the whitepaper peak rates are quoted at it; the
+# card ran at 2835 under load). All B/cycle values are at that clock.
+#
+# Ownership: the root owns the L2 and the GDDR7 (the GPU has one crossbar
+# and no NUMA), so every dependency on them registers at the root Neutrino;
+# its tables are sized accordingly. Programs address the linear ranges of
+# the hash links; the physical slice and channel ranges are where the
+# blocks sit. Own spaces: offset_bits 38 (256 GiB per node); fields gpc:4,
+# sm:5.
+#   root          L2 linear at 0x0 (128 MiB), physical at 4 GiB; sync at
+#                 0x1F0000000; GDDR7 linear at 32 GiB (96 GiB), physical at 128 GiB
+#   gpc g         (g + 1) << 43: its sync space
+#   gpc g, SM s   ((g + 1) << 43) | ((s + 1) << 38): its smem and sync space
+#
+# Not yet modeled (recorded): DRAM traffic does not pass through the L2
+# slice ports (each slice fronts its channel on the card: 10.7 B/cycle of a
+# slice's 64 when streaming at the full 1.79 TB/s); the GDDR7 channel
+# interleave is a plain 256 B stripe over 16 channels (the card hashes it;
+# unmeasured); MIG is off; 192 SMs stand for 188.
+
+global:
+  neutrino_granule: 512
+  clock_ghz: 2.617
+  msg_bytes: 64
+  flow: readyvalid
+  hop_queue: 1
+  address:
+    fields: [{name: gpc, bits: 4}, {name: sm, bits: 5}]
+    offset_bits: 38
+
+device:
+  name: root
+  fabric:
+    # The device crossbar: GPC links and the two hash links as ports, 512
+    # B/cycle per port (a slice's own port, 64 B/cycle, is the limit on its
+    # side). l2bus and mbus carry the physical traffic to the slices and the
+    # channels; they are unlimited.
+    - {name: sbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
+    - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
+    - {name: l2bus, topology: xbar}
+    - {name: mbus, topology: xbar}
+    # The L2 address hash (architecture Section 3.1): linear [0, 128 MiB)
+    # to the 64 physical slices at 4 GiB. Slice index bit j is the parity
+    # of the address ANDed with index[j] (the measured hash over bits 8 to
+    # 20: index bit 0 = a8 ^ a14 ^ a17 ^ a19 ^ a20, and so on); the offset
+    # inside the slice is the linear address with the `drop` bits removed.
+    # Zero latency: the hash is part of the crossbar's address decode.
+    - {name: sbus_to_l2bus, topology: link, from: $this.sbus, to: $this.l2bus, latency: 0,
+       hash: {range: [0x0, 0x8000000], to_range: [0x100000000, 0x108000000],
+              index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000, 0x1A8000],
+              drop: [8, 10, 11, 12, 13, 15]}}
+    # The GDDR7 channel interleave: linear [32 GiB, 128 GiB) to 16 channels
+    # of 6 GiB at 128 GiB, 256 B per channel in turn (the card hashes the
+    # channel too; unmeasured, so a plain stripe over bits 8 to 11).
+    - {name: sbus_to_mbus, topology: link, from: $this.sbus, to: $this.mbus, latency: 0,
+       hash: {range: [0x800000000, 0x2000000000], to_range: [0x2000000000, 0x3800000000],
+              index: [0x100, 0x200, 0x400, 0x800]}}
+  memory:
+    # L2: 64 contiguous physical slices (banks) of 2 MiB, one port each.
+    # Read 64 and write 32 B/cycle per slice (nominal; achieved 52 / 28),
+    # 32 B beats (one sector), latency 180 cycles at the slice so that an
+    # SM's dependent load sees 40 + 20 + 40 + 180 + 40 + 20 = 340 cycles.
+    - {name: l2, type: scratch, addr: [[0x100000000, 0x108000000]], banks: 64,
+       bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, latency: 180, slave: $this.l2bus}
+    # GDDR7: 96 GiB over sixteen 32-bit channels at 28 Gbps = 1792 GB/s =
+    # 685 B/cycle, 43 per channel, read and write on one port; latency 500
+    # cycles at the channel. Named hbm for the builders; programs use the
+    # linear range of sbus_to_mbus.
+    - {name: hbm, type: dram, addr: [[0x2000000000, 0x3800000000]], banks: 16,
+       bw_bytes: 43, beat_bytes: 32, latency: 500, slave: $this.mbus}
+    - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  neutrino: {scoreboard: 1024, pending: 4096, execution: 4096, versions: 16384, inbound_refs: 1024, inbound_invokes: 256, outbound_deps: 256, outbound_invokes: 64}
+  children:
+    - {name: gpc0, config: rtx6000-gpc.yaml}
+    - {name: gpc1, config: rtx6000-gpc.yaml}
+    - {name: gpc2, config: rtx6000-gpc.yaml}
+    - {name: gpc3, config: rtx6000-gpc.yaml}
+    - {name: gpc4, config: rtx6000-gpc.yaml}
+    - {name: gpc5, config: rtx6000-gpc.yaml}
+    - {name: gpc6, config: rtx6000-gpc.yaml}
+    - {name: gpc7, config: rtx6000-gpc.yaml}
+    - {name: gpc8, config: rtx6000-gpc.yaml}
+    - {name: gpc9, config: rtx6000-gpc.yaml}
+    - {name: gpc10, config: rtx6000-gpc.yaml}
+    - {name: gpc11, config: rtx6000-gpc.yaml}

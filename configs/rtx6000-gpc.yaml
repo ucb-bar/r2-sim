@@ -1,0 +1,38 @@
+# One GPC of the RTX PRO 6000 Blackwell reference configuration: 16 SMs
+# (rtx6000-sm.yaml) behind the GPC's crossbar, with no memory of its own
+# (the L2 and the GDDR7 are the device's, rtx6000.yaml). The real GB202
+# has 192 SMs of which 188 are enabled; the model keeps 16 per GPC (+2 %).
+#
+# * clsbus: the GPC crossbar, 512 B/cycle per port (16 SM links at 32).
+# * Link to the device crossbar: 512 B/cycle per direction (the GPC's share
+#   when every SM pulls at once; the NoC literature finds GPC ports
+#   provisioned near full read bandwidth), latency 40 cycles. The control
+#   link at 64 B/cycle, one message beat per cycle.
+# * No copy engine: SM transfers are the SMs' own (rtx6000-sm.yaml).
+
+fidelity: numeric
+fabric:
+  - {name: clsbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
+  - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 512, beat_bytes: 32, latency: 40}
+  - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 64, latency: 40, control: true}
+memory:
+  - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+children:
+  - {name: sm0, config: rtx6000-sm.yaml}
+  - {name: sm1, config: rtx6000-sm.yaml}
+  - {name: sm2, config: rtx6000-sm.yaml}
+  - {name: sm3, config: rtx6000-sm.yaml}
+  - {name: sm4, config: rtx6000-sm.yaml}
+  - {name: sm5, config: rtx6000-sm.yaml}
+  - {name: sm6, config: rtx6000-sm.yaml}
+  - {name: sm7, config: rtx6000-sm.yaml}
+  - {name: sm8, config: rtx6000-sm.yaml}
+  - {name: sm9, config: rtx6000-sm.yaml}
+  - {name: sm10, config: rtx6000-sm.yaml}
+  - {name: sm11, config: rtx6000-sm.yaml}
+  - {name: sm12, config: rtx6000-sm.yaml}
+  - {name: sm13, config: rtx6000-sm.yaml}
+  - {name: sm14, config: rtx6000-sm.yaml}
+  - {name: sm15, config: rtx6000-sm.yaml}

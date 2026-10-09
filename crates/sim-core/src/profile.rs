@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use nu_model::{Addr, Dep, NeutrinoId, Range};
+use nu_model::{Addr, AddressHash, Dep, NeutrinoId, Range};
 
 use crate::config::{MemBlock, PeConfig, PeParams};
 use crate::resource::{Demand, Dir, PathHop, ResourceId};
@@ -293,25 +293,16 @@ impl TransferChunk {
     }
 }
 
-/// One memory of the block table: its range, and its blocks (one, or the
-/// slices in slice order with the granule's shift).
-#[derive(Debug, Clone)]
-struct MemEntry {
-    range: Range,
-    blocks: Vec<usize>,
-    shift: u32,
-}
-
 /// The routing function of transfers (Section 5.3): memory blocks by
-/// address, and per DMA engine and block the two route halves, in dense
-/// tables built once per run.
+/// address, a hash link's linear range as one entry rewritten onto its
+/// physical block in one step, and per DMA engine and block the two route
+/// halves, in dense tables built once per run.
 #[derive(Debug, Clone, Default)]
 pub struct TransferRoutes {
-    /// Memories sorted by base; a sliced memory is one entry.
-    mems: Vec<MemEntry>,
-    /// Per block: the end of its memory's range, and its slice granule (0
-    /// for a block that is not a slice).
-    runs: Vec<(u64, u64)>,
+    /// Blocks by range, sorted by base.
+    blocks: Vec<(Range, usize)>,
+    /// Hash links' rules by linear range, sorted by base.
+    hashes: Vec<AddressHash>,
     nblocks: usize,
     /// `[pe * nblocks + block]`: the read and write halves; `None` for a
     /// PE that is not a DMA engine, or a block without a route.
@@ -322,35 +313,22 @@ pub struct TransferRoutes {
 type Halves = (Option<Rc<Half>>, Option<Rc<Half>>);
 
 impl TransferRoutes {
-    /// The tables for `pes` (by id) and `memories` (by index).
-    pub fn build(pes: &[&PeConfig], memories: &[MemBlock], topo: &Topology) -> Self {
-        let mut mems: Vec<MemEntry> = Vec::new();
-        let mut runs = Vec::with_capacity(memories.len());
-        for (i, m) in memories.iter().enumerate() {
-            let granule = if m.sliced {
-                m.sets[0].run(m.sets[0].base)
-            } else {
-                0
-            };
-            runs.push((m.range.bound, granule));
-            match mems.iter_mut().find(|e| e.range == m.range) {
-                Some(e) => e.blocks.push(i),
-                None => mems.push(MemEntry {
-                    range: m.range,
-                    blocks: vec![i],
-                    shift: granule.trailing_zeros(),
-                }),
-            }
-        }
-        // Slices in slice order: slice j holds granule bits equal to j.
-        for e in &mut mems {
-            if e.blocks.len() > 1 {
-                let mask = e.blocks.len() as u64 - 1;
-                e.blocks
-                    .sort_by_key(|&b| (memories[b].sets[0].base >> e.shift) & mask);
-            }
-        }
-        mems.sort_by_key(|e| e.range.base);
+    /// The tables for `pes` (by id), `memories` (by index) and the hash
+    /// links' rules.
+    pub fn build(
+        pes: &[&PeConfig],
+        memories: &[MemBlock],
+        hashes: &[&AddressHash],
+        topo: &Topology,
+    ) -> Self {
+        let mut blocks: Vec<(Range, usize)> = memories
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.range, i))
+            .collect();
+        blocks.sort_by_key(|b| b.0.base);
+        let mut hashes: Vec<AddressHash> = hashes.iter().map(|h| (*h).clone()).collect();
+        hashes.sort_by_key(|h| h.range.base);
         let nblocks = memories.len();
         let mut halves = Vec::with_capacity(pes.len() * nblocks);
         for pe in pes {
@@ -402,31 +380,36 @@ impl TransferRoutes {
             }
         }
         Self {
-            mems,
-            runs,
+            blocks,
+            hashes,
             nblocks,
             halves,
         }
     }
 
-    /// The block that holds `a`.
-    pub fn block(&self, a: u64) -> Option<usize> {
-        let i = self.mems.partition_point(|e| e.range.base <= a);
-        let e = self.mems.get(i.checked_sub(1)?)?;
-        if !e.range.contains(Addr(a)) {
-            return None;
-        }
-        let mask = e.blocks.len() as u64 - 1;
-        Some(e.blocks[((a >> e.shift) & mask) as usize])
+    /// The block that holds physical address `a` and the bytes to its end.
+    fn physical(&self, a: u64) -> Option<(usize, u64)> {
+        let i = self.blocks.partition_point(|b| b.0.base <= a);
+        let (r, b) = self.blocks.get(i.checked_sub(1)?)?;
+        r.contains(Addr(a)).then(|| (*b, r.bound - a))
     }
 
-    /// The bytes from `a` to the end of block `b`'s run: the end of its
-    /// range, or of its slice granule.
-    pub fn run(&self, b: usize, a: u64) -> u64 {
-        match self.runs[b] {
-            (bound, 0) => bound - a,
-            (_, g) => g - (a & (g - 1)),
+    /// The block that holds `a` and the bytes from `a` that stay in it: a
+    /// physical address as it is; an address in a hash link's linear range
+    /// rewritten onto its physical block, the bytes then at most to the
+    /// end of the hash granule (a chunk never straddles two slices).
+    pub fn locate(&self, a: u64) -> Option<(usize, u64)> {
+        let i = self.hashes.partition_point(|h| h.range.base <= a);
+        if let Some(h) = i
+            .checked_sub(1)
+            .map(|i| &self.hashes[i])
+            .filter(|h| h.range.contains(Addr(a)))
+        {
+            let (b, run) = self.physical(h.rewrite(a))?;
+            let g = h.granule();
+            return Some((b, run.min(g - (a & (g - 1)))));
         }
+        self.physical(a)
     }
 
     /// The read half from block `b` to DMA engine `pe`.
@@ -597,12 +580,12 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     assert!(tile_bytes > 0, "dma with tile_bytes 0");
     // The chunk loop is arithmetic (Section 5.3, routing function): the
     // block and route half of a side are looked up only when its address
-    // leaves the block's run (a block or a slice granule), and a chunk
+    // leaves the block's run (a block or a hash granule), and a chunk
     // ends at the first block, grid or tile boundary of either side.
     let r = node.routes;
     let side = |a: u64, read: bool| {
-        let b = r
-            .block(a)
+        let (b, run) = r
+            .locate(a)
             .unwrap_or_else(|| panic!("address {a:#x} is in no memory block"));
         let (half, what) = if read {
             (r.read(node.pe_id, b), "from the source")
@@ -610,7 +593,7 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             (r.write(node.pe_id, b), "to the destination")
         };
         let half = half.unwrap_or_else(|| panic!("{}: no route {what}", node.pe.name));
-        (half.clone(), r.run(b, a))
+        (half.clone(), run)
     };
     let (mut rh, mut src_run) = side(src.0, true);
     let (mut wh, mut dst_run) = side(dst.0, false);
@@ -869,22 +852,30 @@ fn ratio_cmp(a: &Ratio, b: &Ratio) -> std::cmp::Ordering {
 mod tests {
     use nu_model::{Addr, Range};
 
+    use nu_model::AddressHash;
+
     use super::{dma_profile, Args, Descriptor, NodeConfig, PathHop, TransferRoutes};
     use crate::config::{MemBlock, PeConfig, PeParams};
     use crate::profile::{AccFlags, PeId, ProfileRegistry};
     use crate::resource::Dir;
     use crate::topology::{grid_run, Topology};
 
-    /// A root with a sliced HBM (4 x 512 B), two adjacent dram blocks and a
-    /// bus grid of 1 KiB, and one SM whose local bus has a grid of 256 B.
+    /// A root with an HBM of 4 banks behind a hash link (512 B granules),
+    /// two adjacent dram blocks and a bus grid of 1 KiB, and one SM whose
+    /// local bus has a grid of 256 B.
     const CONFIG: &str = "global:
   neutrino_granule: 512
   address: {fields: [{name: sm, bits: 2}], offset_bits: 24}
 device:
   name: root
-  fabric: [{name: sbus, block_bytes: 1024}, {name: cbus, control: true}]
+  fabric:
+    - {name: sbus, block_bytes: 1024}
+    - {name: cbus, control: true}
+    - {name: hbmbus}
+    - {name: sbus_to_hbmbus, topology: link, from: $this.sbus, to: $this.hbmbus,
+       hash: {range: [0x0, 0x10000], to_range: [0x40000, 0x50000], index: [0x200, 0x400]}}
   memory:
-    - {name: hbm, type: dram, addr: [[0x0, 0x10000]], slices: 4, interleave: 512, bw_bytes: 64, slave: $this.sbus}
+    - {name: hbm, type: dram, addr: [[0x40000, 0x50000]], banks: 4, bw_bytes: 64, slave: $this.hbmbus}
     - {name: d0, type: dram, addr: [[0x10000, 0x18000]], bw_bytes: 64, slave: $this.sbus}
     - {name: d1, type: dram, addr: [[0x18000, 0x20000]], bw_bytes: 64, block_bytes: 2048, slave: $this.sbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
@@ -906,10 +897,12 @@ device:
 ";
 
     /// The chunks of a DMA by the lookup per chunk that the routing tables
-    /// replace: the block of each address, its run and port grid, and the
-    /// grid of the buses and links of each route half.
+    /// replace: the block of each address (through the hash link's
+    /// rewrite), its run and port grid, the hash granule, and the grid of
+    /// the buses and links of each route half.
     fn by_lookup(
         mems: &[MemBlock],
+        hash: &AddressHash,
         topo: &Topology,
         pe: &PeConfig,
         (src, dst, bytes, tile): (u64, u64, u64, u64),
@@ -917,18 +910,34 @@ device:
         let PeParams::Dma { links, masters, .. } = &pe.params else {
             unreachable!()
         };
-        let block = |a: u64| mems.iter().find(|m| m.holds(Addr(a))).unwrap();
+        // The block and the bytes that stay in it from address `a`.
+        let block = |a: u64| {
+            let (p, cap) = if hash.range.contains(Addr(a)) {
+                let g = hash.granule();
+                (hash.rewrite(a), g - a % g)
+            } else {
+                (a, u64::MAX)
+            };
+            let m = mems.iter().find(|m| m.holds(Addr(p))).unwrap();
+            (
+                m,
+                m.run(p).min(cap),
+                m.block.map_or(u64::MAX, |b| b - a % b),
+            )
+        };
         let mut out = Vec::new();
         let mut done = 0;
         while done < bytes {
             let (sa, da) = (src + done, dst + done);
-            let (sm, dm) = (block(sa), block(da));
+            let ((sm, srun, sgrid), (dm, drun, dgrid)) = (block(sa), block(da));
             let inp = topo.best_path(&sm.attach, masters).unwrap();
             let outp = topo.best_path(masters, &dm.attach).unwrap();
             let n = (bytes - done)
                 .min(tile)
-                .min(sm.chunk_run(sa))
-                .min(dm.chunk_run(da))
+                .min(srun)
+                .min(drun)
+                .min(sgrid)
+                .min(dgrid)
                 .min(grid_run(sa, &inp.blocks))
                 .min(grid_run(da, &outp.blocks));
             let hop = |resource, dir, latency| PathHop {
@@ -958,7 +967,8 @@ device:
         let pes: Vec<&PeConfig> = (0..sim.pe_count())
             .map(|i| sim.pe_config(PeId(i as u32)))
             .collect();
-        let routes = TransferRoutes::build(&pes, sim.memories(), sim.topology());
+        let hashes: Vec<&AddressHash> = sim.hashes().collect();
+        let routes = TransferRoutes::build(&pes, sim.memories(), &hashes, sim.topology());
         let smem = b.memory("root.sm0.smem").base;
         let node = NodeConfig {
             pe: sim.pe_config(pe_id),
@@ -979,7 +989,7 @@ device:
         for _ in 0..2000 {
             let bytes = 1 + rnd(9000);
             let tile = [64, 512, 1500, 4096, 65536][rnd(5) as usize];
-            // From the sliced HBM or across the two dram blocks into SMEM,
+            // From the hashed HBM or across the two dram blocks into SMEM,
             // or back.
             let far = if rnd(2) == 0 {
                 rnd(0x10000 - bytes)
@@ -1010,6 +1020,7 @@ device:
             let p = dma_profile(&desc, &node);
             let want = by_lookup(
                 sim.memories(),
+                hashes[0],
                 sim.topology(),
                 node.pe,
                 (src, dst, bytes, tile),

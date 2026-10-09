@@ -1,4 +1,4 @@
-use nu_model::{Addr, AddressSet, NeutrinoId, OwnerMap, Range};
+use nu_model::{Addr, AddressHash, AddressSet, NeutrinoId, OwnerMap, Range};
 
 #[test]
 fn overlap_is_half_open() {
@@ -119,4 +119,63 @@ fn an_owner_range_across_its_decomposed_sets_has_one_owner() {
         Some(NeutrinoId(0))
     );
     assert_eq!(m.owner_of_range(&Range::new(0x400, 0x601)), None);
+}
+
+#[test]
+fn a_hash_rewrite_is_checked_to_be_a_bijection() {
+    // A plain stripe: 4 B over four banks.
+    let h = AddressHash::new(
+        Range::new(0x1000, 0x2000),
+        Range::new(0x10000, 0x11000),
+        vec![0x4, 0x8],
+        None,
+    )
+    .unwrap();
+    assert_eq!((h.granule(), h.slice_bytes()), (4, 0x400));
+    assert_eq!(h.rewrite(0x1000), 0x10000);
+    assert_eq!(h.rewrite(0x1004), 0x10400);
+    assert_eq!(h.rewrite(0x100c), 0x10c00);
+    assert_eq!(h.rewrite(0x1013), 0x10007);
+    // Every linear address maps to a distinct physical one inside to_range.
+    let mut seen: Vec<u64> = (0x1000..0x2000).map(|a| h.rewrite(a)).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 0x1000);
+    assert!(seen[0] == 0x10000 && seen[0xfff] == 0x10fff);
+    // An XOR hash with explicit drop bits.
+    let h = AddressHash::new(
+        Range::new(0, 0x10000),
+        Range::new(0x100000, 0x110000),
+        vec![0x100 | 0x4000, 0x400 | 0x4000],
+        Some(vec![8, 10]),
+    )
+    .unwrap();
+    let mut seen: Vec<u64> = (0..0x10000).map(|a| h.rewrite(a)).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 0x10000);
+    // Not invertible on the drop bits: both masks see only bit 8 there.
+    let e = AddressHash::new(
+        Range::new(0, 0x10000),
+        Range::new(0x100000, 0x110000),
+        vec![0x100 | 0x4000, 0x100 | 0x8000],
+        Some(vec![8, 10]),
+    )
+    .unwrap_err();
+    assert!(e.contains("not invertible"), "{e}");
+    // Multi-bit masks need drop; sizes must agree.
+    assert!(AddressHash::new(
+        Range::new(0, 0x1000),
+        Range::new(0x2000, 0x3000),
+        vec![0x300],
+        None
+    )
+    .is_err());
+    assert!(AddressHash::new(
+        Range::new(0, 0x1000),
+        Range::new(0x2000, 0x2800),
+        vec![0x100],
+        None
+    )
+    .is_err());
 }

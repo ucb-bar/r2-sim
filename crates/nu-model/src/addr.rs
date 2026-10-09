@@ -190,6 +190,135 @@ impl fmt::Display for AddressSet {
     }
 }
 
+/// The address rewrite of a hash link (architecture Section 3.1): a
+/// linear range onto a physical one. Slice index bit j is the parity of
+/// the linear address ANDed with `index[j]`; the offset inside the slice
+/// is the address relative to `range` with the `drop` bits removed;
+/// `physical = to_range.base + index x slice_bytes + offset`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressHash {
+    pub range: Range,
+    pub to_range: Range,
+    pub index: Vec<u64>,
+    /// Bit positions, ascending.
+    pub drop: Vec<u32>,
+}
+
+impl AddressHash {
+    /// Builds the rule; `drop` `None` takes the index bits when each mask
+    /// has one bit. Errors when the rewrite is not a bijection from
+    /// `range` onto `to_range`.
+    pub fn new(
+        range: Range,
+        to_range: Range,
+        index: Vec<u64>,
+        drop: Option<Vec<u32>>,
+    ) -> Result<Self, String> {
+        let k = index.len();
+        if k == 0 || k > 32 {
+            return Err(format!("{} index masks (1 to 32)", k));
+        }
+        if index.contains(&0) {
+            return Err("an index mask of 0".into());
+        }
+        let mut drop = match drop {
+            Some(d) => d,
+            None if index.iter().all(|m| m.is_power_of_two()) => {
+                index.iter().map(|m| m.trailing_zeros()).collect()
+            }
+            None => return Err("drop is needed when an index mask has more than one bit".into()),
+        };
+        drop.sort_unstable();
+        if drop.len() != k || drop.windows(2).any(|w| w[0] == w[1]) || drop.iter().any(|&d| d > 62)
+        {
+            return Err(format!(
+                "drop needs {k} distinct bits below 63, one per index mask"
+            ));
+        }
+        let len = range.len();
+        if len == 0 || to_range.len() != len {
+            return Err(format!(
+                "range {range} and to_range {to_range} differ in size"
+            ));
+        }
+        let slices = 1u64 << k;
+        if !len.is_multiple_of(slices) {
+            return Err(format!("{range} does not split into {slices} slices"));
+        }
+        // Removing the drop bits maps the range onto [0, len / 2^k) only
+        // when every drop bit lies below an aligned period of the range.
+        let period = 1u64 << (drop[k - 1] + 1);
+        if !len.is_multiple_of(period) || !range.base.is_multiple_of(period) {
+            return Err(format!(
+                "{range} is not a multiple of {period:#x}, the period of the drop bits"
+            ));
+        }
+        // The index restricted to the drop bits must be invertible over
+        // GF(2): then the drop bits follow from the index and the offset.
+        let mut rows: Vec<u64> = index
+            .iter()
+            .map(|m| {
+                drop.iter()
+                    .enumerate()
+                    .fold(0, |r, (i, &d)| r | ((m >> d) & 1) << i)
+            })
+            .collect();
+        for col in 0..k {
+            let Some(p) = (col..k).find(|&r| rows[r] >> col & 1 == 1) else {
+                return Err(format!(
+                    "the index masks restricted to the drop bits {drop:?} are not invertible"
+                ));
+            };
+            rows.swap(col, p);
+            for r in 0..k {
+                if r != col && rows[r] >> col & 1 == 1 {
+                    rows[r] ^= rows[col];
+                }
+            }
+        }
+        Ok(Self {
+            range,
+            to_range,
+            index,
+            drop,
+        })
+    }
+
+    /// Bytes of one slice of `to_range`.
+    pub fn slice_bytes(&self) -> u64 {
+        self.range.len() >> self.index.len()
+    }
+
+    /// The slice granule: the lowest bit of any mask. A chunk inside one
+    /// granule stays in one slice.
+    pub fn granule(&self) -> u64 {
+        1 << self
+            .index
+            .iter()
+            .map(|m| m.trailing_zeros())
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The slice index of linear address `a`.
+    pub fn slice(&self, a: u64) -> u64 {
+        self.index
+            .iter()
+            .enumerate()
+            .fold(0, |s, (j, m)| s | (((a & m).count_ones() & 1) as u64) << j)
+    }
+
+    /// The physical address of linear address `a` (in `range`).
+    pub fn rewrite(&self, a: u64) -> u64 {
+        let mut off = a - self.range.base;
+        for &d in self.drop.iter().rev() {
+            off = (off & ((1u64 << d) - 1)) | ((off >> (d + 1)) << d);
+        }
+        self.to_range.base + self.slice(a) * self.slice_bytes() + off
+    }
+}
+
 /// Maps addresses to their owning Neutrino by address set.
 ///
 /// Sets are disjoint. Contiguous sets (every prefix and plain block) are

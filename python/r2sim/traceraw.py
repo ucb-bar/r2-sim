@@ -1,6 +1,6 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.3). The checks are the
+The format is r2-vis's `trace-raw.md` (version 1.4). The checks are the
 ones of its Section 8, plus the file layout:
 
 * the manifest's record layouts have the record sizes of the format, every
@@ -17,6 +17,10 @@ ones of its Section 8, plus the file layout:
   left has the gid of its adopting task, an inbound invoke entry ends at
   its task's invoke and an outbound one (not a VersionReset) starts at
   its task's `queued`;
+* hash links (version 1.4): the rule's fields are consistent (equal
+  range sizes, granule = the lowest bit of any mask, slice_bytes = size /
+  2^masks, one drop bit per mask), and every write port (`wport`) has
+  the role mem_port with "write" true;
 * every resource id in the records is in the manifest, every link of the
   topology tables has a resource, and records on unlimited links have
   span = cycles >= 1;
@@ -180,7 +184,9 @@ def check_charges(r: Report, manifest: dict, recs: dict, stats: dict | None) -> 
     if n:
         i = int(np.flatnonzero(over)[0])
         print(f"      first: resource {rr[i]} at {t[i]}: {level[i]:.2f} of {lanes[rr[i]]:.0f} lanes")
-    if stats is not None:
+    if stats is not None and manifest["filters"]["partial"]:
+        print("skip  per-resource cycles against busy_cycles (partial dump)")
+    elif stats is not None:
         busy = {x["name"]: x["busy_cycles"] for x in stats["resources"]}
         sums = np.bincount(c["resource"], weights=c["cycles"].astype(np.float64),
                            minlength=len(res))
@@ -244,6 +250,37 @@ def check_entries(r: Report, manifest: dict, recs: dict) -> None:
     o = (e["table"] == 5) & (e["flags"] & VRESET == 0) & named & found
     r.check(bool((e["start"][o] == task["queued"][o]).all()),
             f"outbound_invokes: {int(np.count_nonzero(o))} start at their task's queued")
+
+
+def check_hashes(r: Report, manifest: dict) -> None:
+    hashes = [l for l in manifest.get("links", []) if l.get("hash")]
+    wports = [m for m in manifest["memories"] if m.get("wport") is not None]
+    if not hashes and not wports:
+        print("skip  hash links and write ports (none)")
+        return
+    bad = []
+    for l in hashes:
+        h = l["hash"]
+        (lo, hi), (tlo, thi) = [[int(x, 16) for x in p] for p in (h["range"], h["to_range"])]
+        masks = [int(x, 16) for x in h["index"]]
+        lowest = min((m & -m) for m in masks)
+        k = len(masks)
+        if hi - lo != thi - tlo:
+            bad.append(f"{l['path']}: range and to_range sizes differ")
+        if h["granule"] != lowest:
+            bad.append(f"{l['path']}: granule {h['granule']}, lowest mask bit {lowest}")
+        if h["slice_bytes"] * 2**k != hi - lo:
+            bad.append(f"{l['path']}: slice_bytes {h['slice_bytes']} x 2^{k} != {hi - lo:#x}")
+        if len(h["drop"]) != k:
+            bad.append(f"{l['path']}: {len(h['drop'])} drop bits for {k} masks")
+    roles = {x["id"]: x["role"] for x in manifest["resources"]}
+    for m in wports:
+        role = roles.get(m["wport"], {})
+        if not (role.get("type") == "mem_port" and role.get("memory") == m["id"] and role.get("write")):
+            bad.append(f"{m['path']}: wport {m['wport']} has role {role}")
+    r.check(not bad, f"{len(hashes)} hash links, {len(wports)} write ports consistent")
+    for b in bad[:5]:
+        print(f"      {b}")
 
 
 def check_links(r: Report, manifest: dict) -> None:
@@ -363,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
     check_gids(r, manifest, recs)
     check_charges(r, manifest, recs, stats)
     check_entries(r, manifest, recs)
+    check_hashes(r, manifest)
     check_links(r, manifest)
     if a.reference:
         check_reference(r, a.dump, manifest, recs, a.reference)

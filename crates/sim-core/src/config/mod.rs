@@ -215,7 +215,7 @@ pub struct PeConfig {
 }
 
 /// A memory block: its address sets and its port bandwidth resources.
-/// A sliced memory is one block per slice (architecture Section 3.1).
+/// A banked memory is one block per bank (architecture Section 3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemBlock {
     /// Name, `<node path>.<memory name>`.
@@ -228,14 +228,12 @@ pub struct MemBlock {
     /// False in a `null`-fidelity subtree: the Numeric backend drops writes
     /// and rejects reads.
     pub numeric: bool,
-    /// The contiguous range of the memory: the block's own, or for a
-    /// slice the whole sliced memory's (the functional plane keeps one
-    /// store per memory).
+    /// The block's contiguous range.
     pub range: Range,
-    /// The block's addresses: the decomposition of `range`, or one slice.
+    /// The block's addresses: the decomposition of `range`.
     pub sets: Vec<AddressSet>,
-    /// True for a slice of a sliced memory.
-    pub sliced: bool,
+    /// True for a bank of a banked memory (`<memory>.b<i>`).
+    pub banked: bool,
     /// Port bandwidth resource (bytes per cycle); also the write port
     /// without `wport`.
     pub port: ResourceId,
@@ -264,7 +262,7 @@ impl MemBlock {
             numeric: true,
             range,
             sets: AddressSet::decompose(&range),
-            sliced: false,
+            banked: false,
             port,
             wport: None,
             block: None,
@@ -272,11 +270,11 @@ impl MemBlock {
         }
     }
 
-    /// The name of the memory: the block's, or for a slice
-    /// (`<memory>.s<i>`) its memory's.
+    /// The name of the memory: the block's, or for a bank
+    /// (`<memory>.b<i>`) its memory's.
     pub fn memory_name(&self) -> &str {
         match self.name.rsplit_once('.') {
-            Some((m, _)) if self.sliced => m,
+            Some((m, _)) if self.banked => m,
             _ => &self.name,
         }
     }

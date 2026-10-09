@@ -20,8 +20,8 @@ use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use nu_model::{
-    Addr, Dep, DepError, DepTables, Effects, NeutrinoId, OutboundDeps, OwnerMap, Phase, Purpose,
-    Range, TaskId, TaskSpec, WaitId, WaitStatus,
+    Addr, AddressHash, Dep, DepError, DepTables, Effects, NeutrinoId, OutboundDeps, OwnerMap,
+    Phase, Purpose, Range, TaskId, TaskSpec, WaitId, WaitStatus,
 };
 
 use crate::config::{MemBlock, NeutrinoConfig, PeConfig, RaceCheck};
@@ -220,6 +220,16 @@ impl Neutrino {
     }
 }
 
+/// The address rewrite of a hash link.
+#[derive(Debug, Clone)]
+struct HashLink {
+    #[allow(dead_code)]
+    link: usize,
+    owner: NeutrinoId,
+    numeric: bool,
+    hash: AddressHash,
+}
+
 struct Running {
     /// The Neutrino that tracks the task (the PE's own).
     nu: NeutrinoId,
@@ -279,8 +289,10 @@ pub struct Sim {
     routes: crate::profile::TransferRoutes,
     /// The hops of the transfer chunk being reserved (kept across chunks).
     hop_buf: Vec<PathHop>,
-    /// Some memory block is a slice.
-    any_sliced: bool,
+
+    /// Hash links (architecture Section 3.1): fabric link index, owner,
+    /// fidelity, rule.
+    hashes: Vec<HashLink>,
     profiles: ProfileRegistry,
     /// The backend before the run; it moves into `plane` at the start.
     backend: Option<Box<dyn FunctionalBackend>>,
@@ -346,7 +358,7 @@ impl Sim {
             memories: Vec::new(),
             routes: Default::default(),
             hop_buf: Vec::new(),
-            any_sliced: false,
+            hashes: Vec::new(),
             profiles,
             backend: Some(Box::new(NullBackend)),
             plane: None,
@@ -815,16 +827,30 @@ impl Sim {
 
     /// Adds a memory block.
     pub fn add_memory(&mut self, mem: MemBlock) {
-        self.any_sliced |= mem.sliced;
         self.memories.push(mem);
     }
 
-    /// A compute task on `pe` whose `dst` or source lies in a slice of a
-    /// sliced memory: the error. A compute PE charges one block per
-    /// operand, so it does not read or write a sliced memory (the rule
-    /// for spreading its demand over the slices is open).
-    fn sliced_compute(&self, pe: PeId, desc: &Descriptor) -> Option<String> {
-        if !self.any_sliced {
+    /// Adds the address rewrite of fabric link `link` (Section 3.1), whose
+    /// node `owner` owns its linear range.
+    pub fn add_hash(&mut self, link: usize, owner: NeutrinoId, numeric: bool, hash: AddressHash) {
+        self.hashes.push(HashLink {
+            link,
+            owner,
+            numeric,
+            hash,
+        });
+    }
+
+    /// The hash links' rules.
+    pub fn hashes(&self) -> impl Iterator<Item = &AddressHash> {
+        self.hashes.iter().map(|h| &h.hash)
+    }
+
+    /// A compute task on `pe` whose `dst` or source lies in a hash link's
+    /// linear range: the error. A compute PE charges one block per
+    /// operand and is not routed through a hash link.
+    fn hashed_compute(&self, pe: PeId, desc: &Descriptor) -> Option<String> {
+        if self.hashes.is_empty() {
             return None;
         }
         let p = &self.pes[pe.0 as usize].cfg;
@@ -837,14 +863,14 @@ impl Sim {
         };
         let addrs = [Some(Addr(desc.dst.base)), src];
         addrs.into_iter().flatten().find_map(|a| {
-            self.memories
+            self.hashes
                 .iter()
-                .find(|m| m.sliced && m.holds(a))
-                .map(|m| {
+                .find(|h| h.hash.range.contains(a))
+                .map(|h| {
                     format!(
-                        "address {:#x} of the task is in {}, a slice of a sliced memory; \
-                         a compute PE ({}) does not read or write a sliced memory",
-                        a.0, m.name, p.name
+                        "address {:#x} of the task is in the linear range {} of a hash link; \
+                         a compute PE ({}) does not address a hashed range",
+                        a.0, h.hash.range, p.name
                     )
                 })
         })
@@ -897,13 +923,24 @@ impl Sim {
             panic!("fabric: {e}");
         }
         let pes: Vec<&PeConfig> = self.pes.iter().map(|p| &p.cfg).collect();
-        self.routes = crate::profile::TransferRoutes::build(&pes, &self.memories, &self.topo);
+        let hashes: Vec<&AddressHash> = self.hashes.iter().map(|h| &h.hash).collect();
+        self.routes =
+            crate::profile::TransferRoutes::build(&pes, &self.memories, &hashes, &self.topo);
         self.livelock = self.livelock_cycles.unwrap_or_else(|| {
             let t_retry = self.nus.iter().map(|n| n.cfg.t_retry).max().unwrap_or(0);
             10 * t_retry + self.topo.max_latency()
         });
         let mut backend = self.backend.take().expect("backend");
-        backend.configure(&self.memories, &self.sync_only);
+        // The functional plane sees linear addresses: a store per hash
+        // link's linear range beside the blocks.
+        let mut stores = self.memories.clone();
+        for h in &self.hashes {
+            stores.push(MemBlock {
+                numeric: h.numeric,
+                ..MemBlock::plain(String::new(), h.owner, h.hash.range, ResourceId(0), 0)
+            });
+        }
+        backend.configure(&stores, &self.sync_only);
         for (addr, bytes) in std::mem::take(&mut self.init) {
             if let Err(e) = backend.write(addr, &bytes) {
                 panic!("init_memory at {:#x}: {}", addr.0, e.0);
@@ -1356,10 +1393,10 @@ impl Sim {
         // is.
         let (mut a, stop, mut done) = (addr.0, addr.0 + len, self.now);
         loop {
-            let Some(i) = self.memories.iter().position(|m| m.holds(Addr(a))) else {
+            let Some((i, run)) = self.routes.locate(a) else {
                 return self.fatal(nu, None, FatalError::Unowned(Range::from_len(addr.0, len)));
             };
-            let n = self.memories[i].run(a).min(stop - a);
+            let n = run.min(stop - a);
             let n = n.min(self.mem_grid(nu, i, a, load));
             match self.mem_piece(nu, i, n, load) {
                 Ok(end) => done = done.max(end),
@@ -1985,7 +2022,7 @@ impl Sim {
                 return;
             }
             if n.rec(t).profile.is_none() {
-                if let Some(msg) = self.sliced_compute(pe, &n.rec(t).desc) {
+                if let Some(msg) = self.hashed_compute(pe, &n.rec(t).desc) {
                     let gid = n.rec(t).gid;
                     return self.fatal(nu, Some(gid), FatalError::Invalid(msg));
                 }

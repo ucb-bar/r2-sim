@@ -1,0 +1,30 @@
+# gpc.yaml with its HBM slice as 4 contiguous physical banks of 128 B/cycle
+# (512 in all, as gpc.yaml) behind a hash link that stripes the linear range
+# over them in 512 B granules (architecture Section 3.1); a write port per
+# bank at the same rate. A DMA chunk that touches the HBM is at most one
+# granule (Section 5.3): this file measures the cost of that chunking.
+# Linear HBM at [0, 4 GiB), physical banks at [8 GiB, 12 GiB): the device
+# file sets offset_bits 34 (16 GiB per node) to make room; sync stays at
+# 0x1F0000000.
+
+fidelity: numeric
+fabric:
+  - {name: clsbus, topology: xbar, bw_bytes: 512}
+  - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
+  - {name: hbmbus, topology: xbar}
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, latency: 20}
+  - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 256, latency: 20, control: true}
+  - {name: clsbus_to_hbmbus, topology: link, from: $this.clsbus, to: $this.hbmbus, latency: 0,
+     hash: {range: [0x0, 0x100000000], to_range: [0x200000000, 0x300000000], index: [0x200, 0x400]}}
+memory:
+  - {name: hbm, type: dram, addr: [[0x200000000, 0x300000000]], banks: 4, bw_bytes: 128, wr_bytes: 128, latency: 200,
+     slave: $this.hbmbus}
+  - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+compute:
+  - {name: dma, type: dma, latency: 100, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
+neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+children:
+  - {name: sm0, config: sm.yaml}
+  - {name: sm1, config: sm.yaml}
+  - {name: sm2, config: sm.yaml}
+  - {name: sm3, config: sm.yaml}

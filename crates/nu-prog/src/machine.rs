@@ -167,13 +167,13 @@ impl Machine {
         let mut sms = Vec::new();
         let mut hbm = Vec::new();
         let mut cmem_nodes = Vec::new();
-        // The port rate of the memory of range `r`: the sum over the
-        // slices of a sliced memory.
-        let rate_of = |r: Range| -> f64 {
+        // The port rate of the memory named `name`: the sum over the
+        // banks of a banked memory.
+        let rate_of = |name: &str| -> f64 {
             b.sim
                 .memories()
                 .iter()
-                .filter(|m| m.range == r)
+                .filter(|m| m.memory_name() == name)
                 .map(|m| res.flow(m.port).rate().to_f64())
                 .sum()
         };
@@ -184,12 +184,12 @@ impl Machine {
         for i in 0..topo.len() {
             let nu = NeutrinoId(i as u32);
             let prefix = topo.path_name(nu);
-            let mem_node = |mem: Range| -> Option<MemNode> {
+            let mem_node = |mem: Range, name: &str| -> Option<MemNode> {
                 Some(MemNode {
                     grant: Some(u64::from(b.sim.scoreboard_room(nu))),
                     nu,
                     mem,
-                    rate: rate_of(mem),
+                    rate: rate_of(name),
                     own: b.own_space(nu),
                     sync: b.sync_only(nu)?,
                     dma: b.try_pe(&format!("{prefix}.dma")),
@@ -197,12 +197,12 @@ impl Machine {
             };
             if let Some(h) = b.try_memory(&format!("{prefix}.hbm")) {
                 hbm.push(
-                    mem_node(h)
+                    mem_node(h, &format!("{prefix}.hbm"))
                         .ok_or_else(|| format!("{prefix} owns hbm but has no sync space"))?,
                 );
             }
             if let Some(c) = b.try_memory(&format!("{prefix}.cmem")) {
-                cmem_nodes.extend(mem_node(c));
+                cmem_nodes.extend(mem_node(c, &format!("{prefix}.cmem")));
             }
             let pe = |n: &str| b.try_pe(&format!("{prefix}.{n}"));
             let (Some(atlas), Some(muon), Some(dma), Some(smem)) = (

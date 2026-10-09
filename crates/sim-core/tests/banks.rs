@@ -1,24 +1,35 @@
-//! Address sets of memory blocks (architecture Section 3.1): sliced
-//! memories, the chunk clamp at a block boundary (Section 5.3) and the
-//! write port (Section 8.2).
+//! Address sets of memory blocks and hash links (architecture Section
+//! 3.1): banked memories, the address rewrite of a link, the chunk clamp at
+//! a block boundary and at the hash granule (Section 5.3), and the write
+//! port (Section 8.2).
 
 use nu_model::{Addr, AddressSet, Range};
 use sim_core::{build_config, Args, Built, Descriptor, NuCtx, ProfileRegistry, Ratio, Stats};
 
-/// A root with the memories `mems` (YAML list items) on `sbus` and one SM
-/// with a 64 KiB SMEM, a DMA engine and the compute items `compute`.
+/// A root with the memories `mems` (YAML list items), the buses `sbus`
+/// and `hbmbus` and the fabric items `fabric`, and one SM with a 64 KiB
+/// SMEM, a DMA engine and the compute items `compute`.
 fn node(mems: &str, sets: &[&str]) -> Result<Built, sim_core::ConfigError> {
-    node_with(mems, "", sets)
+    node_with("", mems, "", sets)
 }
 
-fn node_with(mems: &str, compute: &str, sets: &[&str]) -> Result<Built, sim_core::ConfigError> {
+fn node_with(
+    fabric: &str,
+    mems: &str,
+    compute: &str,
+    sets: &[&str],
+) -> Result<Built, sim_core::ConfigError> {
     let mut text = format!(
         "global:
   neutrino_granule: 512
   address: {{fields: [{{name: sm, bits: 2}}], offset_bits: 24}}
 device:
   name: root
-  fabric: [{{name: sbus}}, {{name: cbus, control: true}}]
+  fabric:
+    - {{name: sbus}}
+    - {{name: cbus, control: true}}
+    - {{name: hbmbus}}
+{fabric}
   memory:
 {mems}
     - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
@@ -51,9 +62,19 @@ device:
     build_config(&text, ProfileRegistry::with_builtins())
 }
 
-const SLICED: &str =
-    "    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], slices: 4, interleave: 512,
-       bw_bytes: 64, wr_bytes: 32, latency: 5, slave: $this.sbus, slice: {s2: {bw_bytes: 128}}}";
+/// A hash link from `sbus` to `hbmbus`: the linear range [0, 1 MiB) in
+/// 512 B granules over four banks of 256 KiB at 4 MiB.
+const LINK: &str =
+    "    - {name: sbus_to_hbmbus, topology: link, from: $this.sbus, to: $this.hbmbus,
+       hash: {range: [0x0, 0x100000], to_range: [0x400000, 0x500000], index: [0x200, 0x400]}}";
+
+/// The four banks behind `LINK`.
+const BANKS: &str = "    - {name: hbm, type: dram, addr: [[0x400000, 0x500000]], banks: 4,
+       bw_bytes: 64, wr_bytes: 32, latency: 5, slave: $this.hbmbus, bank: {b2: {bw_bytes: 128}}}";
+
+fn hashed(sets: &[&str]) -> Built {
+    node_with(LINK, BANKS, "", sets).unwrap()
+}
 
 /// Busy lane-cycles of the resource `name`.
 fn busy(s: &Stats, name: &str) -> u64 {
@@ -95,8 +116,8 @@ fn dma(b: Built, nu: &str, src: u64, dst: u64, bytes: u64) -> Stats {
 }
 
 #[test]
-fn a_sliced_memory_is_one_block_per_slice() {
-    let b = node(SLICED, &["root.hbm.s3.latency=7"]).unwrap();
+fn a_banked_memory_is_one_block_per_bank() {
+    let b = hashed(&["root.hbm.b3.latency=7"]);
     let blocks: Vec<_> = b
         .sim
         .memories()
@@ -106,16 +127,15 @@ fn a_sliced_memory_is_one_block_per_slice() {
     let names: Vec<&str> = blocks.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(
         names,
-        ["root.hbm.s0", "root.hbm.s1", "root.hbm.s2", "root.hbm.s3"]
+        ["root.hbm.b0", "root.hbm.b1", "root.hbm.b2", "root.hbm.b3"]
     );
-    // Slice i holds the 512 B granules whose bits 9..11 equal i.
-    assert_eq!(blocks[1].sets, [AddressSet::new(0x200, 0xf_ffff & !0x600)]);
-    assert!(blocks[1].holds(Addr(0xa00)) && !blocks[1].holds(Addr(0xc00)));
-    assert_eq!(blocks[1].run(0x2f0), 0x110);
+    // Equal contiguous blocks.
+    assert_eq!(blocks[1].range, Range::new(0x44_0000, 0x48_0000));
+    assert_eq!(blocks[1].sets, [AddressSet::block(0x44_0000, 0x4_0000)]);
     assert!(blocks
         .iter()
-        .all(|m| m.sliced && m.range == Range::new(0, 0x10_0000)));
-    // Per-slice keys: the slice table of the file and a --set.
+        .all(|m| m.banked && m.memory_name() == "root.hbm"));
+    // Per-bank keys: the bank table of the file and a --set.
     let res = b.sim.resources();
     let rate = |m: &sim_core::MemBlock| res.flow(m.port).rate();
     assert_eq!(rate(blocks[0]), Ratio::int(64));
@@ -123,29 +143,54 @@ fn a_sliced_memory_is_one_block_per_slice() {
     assert_eq!(res.flow(blocks[0].wport.unwrap()).rate(), Ratio::int(32));
     assert_eq!(
         b.sim_resource_name(blocks[0].wport.unwrap()),
-        "root.hbm.s0.wport"
+        "root.hbm.b0.wport"
     );
     assert_eq!((blocks[0].load_latency, blocks[3].load_latency), (5, 7));
-    // The memory keeps its name for its whole range.
+    // Behind a hash link the memory's name is its linear range.
     assert_eq!(b.memory("root.hbm"), Range::new(0, 0x10_0000));
-    // Errors: a slice that does not exist, a size that is not a power of
-    // two, a granule that is not one.
+    let h = b.sim.hashes().next().unwrap();
+    assert_eq!((h.granule(), h.slice_bytes()), (512, 0x4_0000));
+    assert_eq!(h.rewrite(0x0a00), 0x44_0000 + 0x200);
+    // Without the link the banks are plain blocks at their range.
+    let b = node(&BANKS.replace("hbmbus", "sbus"), &[]).unwrap();
+    assert_eq!(b.memory("root.hbm"), Range::new(0x40_0000, 0x50_0000));
+    // Errors: a bank that does not exist, banks that do not divide.
     let bad = |m: &str| node(m, &[]).err().unwrap().0;
     let e = bad(
-        "    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], slices: 4, interleave: 512,
-       bw_bytes: 64, slave: $this.sbus, slice: {s4: {bw_bytes: 1}}}",
+        "    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], banks: 4,
+       bw_bytes: 64, slave: $this.sbus, bank: {b4: {bw_bytes: 1}}}",
     );
-    assert!(e.contains("no slice \"s4\""), "{e}");
+    assert!(e.contains("no bank \"b4\""), "{e}");
     let e = bad(
-        "    - {name: hbm, type: dram, addr: [[0x0, 0xC0000]], slices: 4, interleave: 512,
+        "    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], banks: 3,
        bw_bytes: 64, slave: $this.sbus}",
     );
-    assert!(e.contains("power-of-two size"), "{e}");
-    let e = bad(
-        "    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], slices: 4, interleave: 500,
-       bw_bytes: 64, slave: $this.sbus}",
+    assert!(e.contains("3 equal banks"), "{e}");
+}
+
+#[test]
+fn the_loader_checks_a_hash_link() {
+    let bad = |fabric: &str, mems: &str| node_with(fabric, mems, "", &[]).err().unwrap().0;
+    // Not a bijection: two masks that see only bit 9 among the drop bits.
+    let link = LINK.replace(
+        "index: [0x200, 0x400]",
+        "index: [0x200, 0x8200], drop: [9, 10]",
     );
-    assert!(e.contains("powers of two"), "{e}");
+    let e = bad(&link, BANKS);
+    assert!(e.contains("not invertible"), "{e}");
+    // A memory in the linear range.
+    let mems = format!("{BANKS}\n    - {{name: x, type: dram, addr: [[0x80000, 0x90000]], bw_bytes: 64, slave: $this.sbus}}");
+    let e = bad(LINK, &mems);
+    assert!(e.contains("overlaps the hash's linear range"), "{e}");
+    // Banks that do not cover the physical range.
+    let e = bad(LINK, &BANKS.replace("0x500000", "0x480000"));
+    assert!(e.contains("cover"), "{e}");
+    // A hash on a bus.
+    let e = bad(
+        "    - {name: x, hash: {range: [0, 0x1000], to_range: [0x1000, 0x2000], index: [0x100]}}",
+        BANKS,
+    );
+    assert!(e.contains("hash is a key of a link"), "{e}");
 }
 
 #[test]
@@ -192,31 +237,36 @@ fn a_dma_chunk_stops_at_a_block_boundary() {
 }
 
 #[test]
-fn a_dma_into_a_sliced_memory_writes_one_granule_per_chunk() {
-    // 4 KiB into 4 slices of 512 B: 8 chunks, two per slice, each on the
-    // slice's write port (32 B/cycle: 2 x 16 cycles); the read ports stay
-    // idle.
-    let b = node(SLICED, &[]).unwrap();
+fn a_dma_through_a_hash_link_moves_one_granule_per_chunk() {
+    // 4 KiB into the linear range: 8 chunks of 512 B, two per bank, each on
+    // the bank's write port (32 B/cycle: 2 x 16 cycles); the read ports
+    // stay idle.
+    let b = hashed(&[]);
     let smem = b.memory("root.sm0.smem").base;
     let s = dma(b, "root", smem, 0x1000, 4096);
     assert_eq!(s.tasks[0].chunks.len(), 8);
     for i in 0..4 {
-        assert_eq!(busy(&s, &format!("root.hbm.s{i}.wport")), 32);
-        assert_eq!(busy(&s, &format!("root.hbm.s{i}.port")), 0);
+        assert_eq!(busy(&s, &format!("root.hbm.b{i}.wport")), 32);
+        assert_eq!(busy(&s, &format!("root.hbm.b{i}.port")), 0);
     }
-    // Reads use the read ports: 1 KiB per slice at 64 B/cycle, 16 cycles;
-    // on s2 at 128 B/cycle in two 64 B lanes, 8 cycles x 2 lanes.
-    let b = node(SLICED, &[]).unwrap();
+    // Reads use the read ports: 1 KiB per bank at 64 B/cycle, 16 cycles;
+    // on b2 at 128 B/cycle in two 64 B lanes, 8 cycles x 2 lanes.
+    let b = hashed(&[]);
     let smem = b.memory("root.sm0.smem").base;
     let s = dma(b, "root.sm0", 0x1000, smem, 4096);
-    assert_eq!(busy(&s, "root.hbm.s0.port"), 16);
-    assert_eq!(busy(&s, "root.hbm.s2.port"), 16);
-    assert_eq!(busy(&s, "root.hbm.s0.wport"), 0);
+    assert_eq!(busy(&s, "root.hbm.b0.port"), 16);
+    assert_eq!(busy(&s, "root.hbm.b2.port"), 16);
+    assert_eq!(busy(&s, "root.hbm.b0.wport"), 0);
+    // An unaligned start: 256 B to the first granule's end, then 512 B.
+    let b = hashed(&[]);
+    let smem = b.memory("root.sm0.smem").base;
+    let s = dma(b, "root.sm0", 0x1100, smem, 1024);
+    assert_eq!(s.tasks[0].chunks.len(), 3);
 }
 
 #[test]
-fn a_store_across_slices_is_one_piece_per_slice() {
-    let b = node(SLICED, &[]).unwrap();
+fn a_store_through_a_hash_link_is_one_piece_per_granule() {
+    let b = hashed(&[]);
     let sm0 = b.nu("root.sm0");
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
@@ -225,21 +275,23 @@ fn a_store_across_slices_is_one_piece_per_slice() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     for i in 0..4 {
-        assert_eq!(busy(&s, &format!("root.hbm.s{i}.wport")), 16);
+        assert_eq!(busy(&s, &format!("root.hbm.b{i}.wport")), 16);
     }
 }
 
 #[test]
-fn a_compute_pe_does_not_use_a_sliced_memory() {
-    // An Atlas reads the one SMEM on its bus: a sliced SMEM is a build
-    // error.
+fn a_compute_pe_does_not_use_a_hashed_range() {
+    // An Atlas reads the one SMEM on its bus: a banked SMEM is two
+    // scratch blocks there, an error.
     let atlas = "        - {name: atlas, type: tensor, rate: {bf16: 4096}, quantize: none, master: [$this.lbus]}";
-    let slice_smem = ["root.sm0.smem.slices=4", "root.sm0.smem.interleave=512"];
-    let e = node_with(SLICED, atlas, &slice_smem).err().unwrap().0;
-    assert!(e.contains("root.sm0.smem is sliced"), "{e}");
-    // A Muon task whose source is in a slice stops the run.
+    let e = node_with(LINK, BANKS, atlas, &["root.sm0.smem.banks=4"])
+        .err()
+        .unwrap()
+        .0;
+    assert!(e.contains("are slaves on"), "{e}");
+    // A Muon task whose source is in the linear range stops the run.
     let muon = "        - {name: muon, type: vector, rate: {lane_op: 64}, master: [$this.lbus, $this.smsbus]}";
-    let b = node_with(SLICED, muon, &[]).unwrap();
+    let b = node_with(LINK, BANKS, muon, &[]).unwrap();
     let sm0 = b.nu("root.sm0");
     let smem = b.memory("root.sm0.smem").base;
     let d = Descriptor {
@@ -264,7 +316,7 @@ fn a_compute_pe_does_not_use_a_sliced_memory() {
     });
     let s = sim.run();
     let f = format!("{:?}", s.fatal.expect("fatal"));
-    assert!(f.contains("root.hbm.s0, a slice of a sliced memory"), "{f}");
+    assert!(f.contains("linear range"), "{f}");
 }
 
 #[test]
