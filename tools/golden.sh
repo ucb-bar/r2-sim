@@ -10,7 +10,8 @@
 # every run (for example GOLDEN_ARGS="--set global.endpoint_charging=false").
 # The rows run the default hierarchical program (configs/forward.toml);
 # GOLDEN_ARGS="--param drivers=single" runs the single driver. References:
-# scratch/fwd15 (hierarchical), scratch/fwd15-single.
+# scratch/fwd16 (hierarchical), scratch/fwd16-single (SMEM read and write
+# ports, 2026-10-09; fwd15 has one SMEM port).
 # "check" exits with 1 when a summary line or a JSON file differs; the
 # comparison leaves out the wall time and the functional worker's progress
 # at each load (thread timing).

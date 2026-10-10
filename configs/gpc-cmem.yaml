@@ -3,18 +3,19 @@
 
 fidelity: numeric
 fabric:
-  - {name: clsbus, topology: xbar, bw_bytes: 512}
+  - {name: clsbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
   - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
   # Links to the device: data and control, 256 B/cycle per direction (the
   # control link at the data rate, as the bridge before it), latency 20.
-  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, latency: 20}
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, wr_bytes: 256, latency: 20}
   - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 256, latency: 20, control: true}
 memory:
   - {name: hbm, type: dram, addr: [[0x0, 0x100000000]], bw_bytes: 512, latency: 200,
      slave: $this.clsbus}
-  # cmem is L2-class SRAM: port 1024 B/cycle (2x the 512 B/cycle of the four
-  # SM links), latency 30 cycles, 64 MiB, above the HBM slice.
-  - {name: cmem, type: scratch, addr: [[0x100000000, 0x104000000]], bw_bytes: 1024, latency: 30,
+  # cmem is L2-class SRAM: one read port and one write port, independent, at
+  # 1024 B/cycle each (2x the 512 B/cycle of the four SM links;
+  # 2026-10-09, as the SMEM), latency 30 cycles, 64 MiB, above the HBM slice.
+  - {name: cmem, type: scratch, addr: [[0x100000000, 0x104000000]], bw_bytes: 1024, wr_bytes: 1024, latency: 30,
      slave: $this.clsbus}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 compute:

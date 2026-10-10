@@ -17,7 +17,7 @@ global:
 device:
   name: root
   fabric:
-    - {name: sbus, topology: xbar, bw_bytes: 512}
+    - {name: sbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
     - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
   memory:
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}

@@ -31,8 +31,9 @@ global:
 device:
   name: root
   fabric:
-    # Data between the gpcs: 512 B/cycle per port.
-    - {name: sbus, topology: xbar, bw_bytes: 512}
+    # Data between the gpcs: 512 B/cycle per port, with separate read and
+    # write channels at that rate (architecture Section 3.5).
+    - {name: sbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
     # Control between the gpcs: 64 B/cycle per port, one beat per cycle.
     - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
   memory:

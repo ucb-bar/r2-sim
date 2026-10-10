@@ -9,10 +9,10 @@
 
 fidelity: numeric
 fabric:
-  - {name: clsbus, topology: xbar, bw_bytes: 512}
+  - {name: clsbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
   - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
   - {name: hbmbus, topology: xbar}
-  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, latency: 20}
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, wr_bytes: 256, latency: 20}
   - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 256, latency: 20, control: true}
   - {name: clsbus_to_hbmbus, topology: link, from: $this.clsbus, to: $this.hbmbus, latency: 0,
      hash: {range: [0x0, 0x100000000], to_range: [0x200000000, 0x300000000], index: [0x200, 0x400]}}

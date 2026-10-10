@@ -32,7 +32,7 @@ device:
   name: root
   fabric:
     # Data between the gpcs: 512 B/cycle per port.
-    - {name: sbus, topology: xbar, bw_bytes: 512}
+    - {name: sbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
     # Control between the gpcs: 64 B/cycle per port, one beat per cycle.
     - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
   memory:

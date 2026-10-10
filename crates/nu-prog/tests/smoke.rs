@@ -206,8 +206,10 @@ fn cmem_moves_weight_traffic_off_hbm() {
     assert!(r3.cmem_bytes > 0 && r3.hbm_bytes > r1.hbm_bytes);
     // Under the data-path rule (Section 5.4) HBM is not the bottleneck of
     // these two layers: a DMA's HBM hop does not wait for the slower SM
-    // bridge, and the SMEM ports and SM bridges bind (HBM 0.29 to 0.32
-    // busy). cmem takes traffic off HBM without slowing the run: mxfp4 is
-    // slightly faster, bf16 ends at the same cycle.
-    assert!(s1.end_time < s0.end_time && s3.end_time <= s2.end_time);
+    // bridge, and the SMEM ports and SM bridges bind. cmem takes traffic
+    // off HBM without slowing the run. With one SMEM port (before
+    // 2026-10-09) mxfp4 ended slightly earlier and bf16 at about the same
+    // cycle; with separate SMEM read and write ports mxfp4 ends at the
+    // same cycle and bf16 slightly earlier.
+    assert!(s1.end_time <= s0.end_time && s3.end_time <= s2.end_time);
 }

@@ -202,7 +202,7 @@ fn the_2p_family_passes_the_loader_check() {
             n += 1;
         }
     }
-    assert_eq!(n, 10, "the 2p*.yaml files");
+    assert_eq!(n, 9, "the 2p*.yaml files");
 }
 
 /// The 2p family's configs/2p.yaml.

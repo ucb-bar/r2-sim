@@ -3,10 +3,13 @@
 # * Bridge to the gpc: 128 B/cycle each way (half the SMEM port, so one SM
 #   cannot saturate the gpc crossbar alone), latency 10 cycles.
 # * smsbus: the SM's data bus to the gpc (unlimited); smcbus: its control
-#   bus (unlimited); lbus: local scratch (unlimited). The SMEM port is the
+#   bus (unlimited); lbus: local scratch (unlimited). The SMEM ports are the
 #   only limit on SMEM traffic. SMEM is a slave on lbus and smsbus: local
 #   units reach it over lbus, other nodes over smsbus.
-# * SMEM: 1 MiB at 256 B/cycle, latency 10 cycles.
+# * SMEM: 1 MiB with one read port and one write port, independent, at
+#   256 B/cycle each (2026-10-09; the Radiance 1 SMEM is 1R1W),
+#   latency 10 cycles. The data link to the gpc has separate read and
+#   write channels at 128 B/cycle each (architecture Section 3.5).
 # * Atlas: 16384 MAC/cycle = one 128 x 128 output tile per cycle of K, the
 #   same rate for every data type; quantize = tile charges a 51-token row as
 #   a full 128-row tile (the padding-waste assumption of workload 1).
@@ -34,10 +37,10 @@ fabric:
   # Links to the gpc (architecture Section 8.2): data and control, each
   # 128 B/cycle per direction (the control link at the data rate, as the
   # bridge before it), latency 10 cycles.
-  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 128, latency: 10}
+  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 128, wr_bytes: 128, latency: 10}
   - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 128, latency: 10, control: true}
 memory:
-  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 256, latency: 10,
+  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 256, wr_bytes: 256, latency: 10,
      slave: [$this.lbus, $this.smsbus]}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 compute:
