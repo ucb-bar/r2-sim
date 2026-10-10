@@ -1,6 +1,6 @@
 //! The raw trace dump for the r2-vis converter (`--trace-raw DIR`).
 //!
-//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.4.
+//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.5.
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -1639,6 +1639,8 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     }
 
     let mut bus_rate: Vec<Option<sim_core::Ratio>> = vec![None; topo.bus_count()];
+    // The write channel rate of each bus (version 1.5).
+    let mut bus_wr: Vec<Option<sim_core::Ratio>> = vec![None; topo.bus_count()];
     let att_rows: Vec<Value> = (0..topo.attachment_count())
         .map(|a| {
             let id = AttachId(a as u32);
@@ -1649,6 +1651,16 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 if let Some(r) = lane {
                     set_role(r, json!({"type": "port", "attachment": a, "dir": dir}));
                     bus_rate[att.bus.0 as usize] = res.flow_rate(r);
+                }
+            }
+            // The write channel (version 1.5).
+            for (lane, dir) in [(att.ingress_wr, "in"), (att.egress_wr, "out")] {
+                if let Some(r) = lane {
+                    set_role(
+                        r,
+                        json!({"type": "port", "attachment": a, "dir": dir, "write": true}),
+                    );
+                    bus_wr[att.bus.0 as usize] = res.flow_rate(r);
                 }
             }
             let info = lay.attachments.get(a);
@@ -1664,7 +1676,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             } else {
                 (Value::Null, Value::Null)
             };
-            json!({
+            let mut row = json!({
                 "id": a, "bus": att.bus.0, "name": short,
                 "component": info.map(|i| i.component.clone()),
                 "component_type": info.map(|i| match i.kind {
@@ -1679,7 +1691,12 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                     Role::Both => "both",
                 }),
                 "in": inp, "out": out,
-            })
+            });
+            if att.ingress_wr.is_some() || att.egress_wr.is_some() {
+                row["in_wr"] = json!(att.ingress_wr.map(|r| r.0));
+                row["out_wr"] = json!(att.egress_wr.map(|r| r.0));
+            }
+            row
         })
         .collect();
     let bus_rows: Vec<Value> = (0..topo.bus_count())
@@ -1690,11 +1707,19 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 set_role(r, json!({"type": "bus", "bus": i}));
                 bus_rate[i] = res.flow_rate(r);
             }
-            json!({
+            if let Some(r) = bus.lane_wr {
+                set_role(r, json!({"type": "bus", "bus": i, "write": true}));
+                bus_wr[i] = res.flow_rate(r);
+            }
+            let mut row = json!({
                 "id": i, "path": bus.name, "node": owner_of(&bus.name, &nodes),
                 "topology": if bus.topology == BusTopology::Xbar { "xbar" } else { "bus" },
                 "control": bus.control, "bw_bytes": bw(bus_rate[i]), "latency": bus.latency,
-            })
+            });
+            if bus_wr[i].is_some() {
+                row["wr_bytes"] = bw(bus_wr[i]);
+            }
+            row
         })
         .collect();
     let link_rows: Vec<Value> = topo
@@ -1705,6 +1730,14 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             for (lane, dir) in [(l.ab, "ab"), (l.ba, "ba")] {
                 if let Some(r) = lane {
                     set_role(r, json!({"type": "link", "link": i, "dir": dir}));
+                }
+            }
+            for (lane, dir) in [(l.ab_wr, "ab"), (l.ba_wr, "ba")] {
+                if let Some(r) = lane {
+                    set_role(
+                        r,
+                        json!({"type": "link", "link": i, "dir": dir, "write": true}),
+                    );
                 }
             }
             let info = lay.links.get(i);
@@ -1721,6 +1754,12 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 "latency": l.latency,
                 "cache": info.and_then(|x| x.cache),
             });
+            // The write channel (version 1.5).
+            if let Some(w) = l.ab_wr {
+                row["wr_bytes"] = bw(res.flow_rate(w));
+                row["ab_wr"] = json!(w.0);
+                row["ba_wr"] = json!(l.ba_wr.map(|r| r.0));
+            }
             // A hash link's address rewrite (architecture Section 3.1).
             if let Some(h) = info.and_then(|x| x.hash.as_ref()) {
                 row["hash"] = json!({
@@ -1818,7 +1857,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
     json!({
         "format": "r2raw",
-        "version": [1, 4],
+        "version": [1, 5],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

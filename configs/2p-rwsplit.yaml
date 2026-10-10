@@ -1,0 +1,10 @@
+# 2p.yaml with separate read and write channels on every rated data bus
+# and link (architecture Section 3.5): `wr_bytes` equal to `bw_bytes`, so
+# a read and a write moving data in the same direction no longer share a
+# channel. The memory ports keep one channel (no `wr_bytes` there).
+base: 2p.yaml
+set:
+  - root.sbus.wr_bytes=512
+  - root.gpc*.clsbus.wr_bytes=512
+  - root.gpc*.clsbus_to_sbus.wr_bytes=256
+  - root.gpc*.sm*.smsbus_to_clsbus.wr_bytes=128

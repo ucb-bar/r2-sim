@@ -323,6 +323,8 @@ pub struct Sim {
     msg_latency: u64,
     /// Port rate of each bus; `None`: unlimited.
     bus_rates: Vec<Option<crate::time::Ratio>>,
+    /// The write channel's rate of each bus (`wr_bytes`).
+    bus_wr_rates: Vec<Option<crate::time::Ratio>>,
     /// Beat of each bus's resources; `None`: one lane.
     bus_beats: Vec<Option<u64>>,
     /// Cycle of the last task issue or completion.
@@ -379,6 +381,7 @@ impl Sim {
             msg_bytes: 64,
             msg_latency: 0,
             bus_rates: Vec::new(),
+            bus_wr_rates: Vec::new(),
             bus_beats: Vec::new(),
             last_progress: 0,
             livelock_cycles: None,
@@ -557,12 +560,14 @@ impl Sim {
             BusTopology::Xbar => None,
         };
         self.bus_rates.push(rate);
+        self.bus_wr_rates.push(None);
         self.bus_beats.push(None);
         self.topo.add_bus(Bus {
             name: name.to_string(),
             topology,
             lane,
             latency,
+            lane_wr: None,
             control,
             block: None,
         })
@@ -576,6 +581,43 @@ impl Sim {
 
     /// Splits the resources of `bus` into lanes of `beat` bytes: its shared
     /// lane, and the ports of the attachments made from now on.
+    /// Gives a bus a write channel at `rate` (`wr_bytes`, Section 3.5): a
+    /// write lane for a `Shared` bus, write ports for the attachments of an
+    /// `Xbar`. Call it after [`Sim::set_bus_beat`] and before any
+    /// attachment on the bus.
+    ///
+    /// # Panics
+    ///
+    /// When the bus already has an attachment: it would have no write
+    /// ports, and its writes would fall back to the read channel.
+    pub fn set_bus_wr(&mut self, bus: BusId, rate: crate::time::Ratio) {
+        let b = self.topo.bus(bus);
+        if let Some(a) = (0..self.topo.attachment_count())
+            .map(|i| self.topo.attachment(AttachId(i as u32)))
+            .find(|a| a.bus == bus)
+        {
+            panic!(
+                "set_bus_wr on {} after its attachment {}: give the bus its write channel before attaching to it",
+                b.name, a.name
+            );
+        }
+        self.bus_wr_rates[bus.0 as usize] = Some(rate);
+        let b = self.topo.bus(bus);
+        if b.topology == BusTopology::Shared {
+            let name = format!("{}.wr", b.name);
+            let lane = self.lane(&name, Some(rate));
+            if let (Some(r), Some(beat)) = (lane, self.bus_beats[bus.0 as usize]) {
+                self.res.set_beat(r, beat);
+            }
+            self.topo.set_bus_wr(bus, lane);
+        }
+    }
+
+    /// Gives fabric link `link` a write channel per direction.
+    pub fn set_link_wr(&mut self, link: usize, ab: Lane, ba: Lane) {
+        self.topo.set_link_wr(link, ab, ba);
+    }
+
     pub fn set_bus_beat(&mut self, bus: BusId, beat: u64) {
         self.bus_beats[bus.0 as usize] = Some(beat);
         if let Some(r) = self.topo.bus(bus).lane {
@@ -608,11 +650,27 @@ impl Sim {
                 self.res.set_beat(r, beat);
             }
         }
+        // The write channel (`wr_bytes`), after the read channel.
+        let wr_rate = self.bus_wr_rates[bus.0 as usize].filter(|_| port);
+        let (ingress_wr, egress_wr) = match (self.topo.bus(bus).topology, wr_rate) {
+            (BusTopology::Xbar, Some(r)) => (
+                self.lane(&format!("{full}.in.wr"), Some(r)),
+                self.lane(&format!("{full}.out.wr"), Some(r)),
+            ),
+            _ => (None, None),
+        };
+        if let Some(beat) = self.bus_beats[bus.0 as usize] {
+            for r in [ingress_wr, egress_wr].into_iter().flatten() {
+                self.res.set_beat(r, beat);
+            }
+        }
         self.topo.add_attachment(Attachment {
             bus,
             name: full,
             ingress,
             egress,
+            ingress_wr,
+            egress_wr,
         })
     }
 
@@ -1457,7 +1515,7 @@ impl Sim {
             (p, to_block.latency + block_latency, 0)
         } else {
             let mut p: Vec<PathHop> = to_block
-                .hops
+                .hops_for(Dir::Write)
                 .iter()
                 .map(|h| hop(h.lane, h.latency))
                 .collect();

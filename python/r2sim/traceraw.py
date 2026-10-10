@@ -1,6 +1,6 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.4). The checks are the
+The format is r2-vis's `trace-raw.md` (version 1.5). The checks are the
 ones of its Section 8, plus the file layout:
 
 * the manifest's record layouts have the record sizes of the format, every
@@ -21,6 +21,12 @@ ones of its Section 8, plus the file layout:
   range sizes, granule = the lowest bit of any mask, slice_bytes = size /
   2^masks, one drop bit per mask), and every write port (`wport`) has
   the role mem_port with "write" true;
+* write channels (version 1.5): every write channel resource (links
+  `ab_wr`/`ba_wr`, attachments `in_wr`/`out_wr`, a bus's resource with a
+  write role) has the role of its element with "write" true and lanes =
+  ceil(wr_bytes / beat_bytes); charges on it are writes, and no write
+  charge lands on the read channel of an element that has a write
+  channel;
 * every resource id in the records is in the manifest, every link of the
   topology tables has a resource, and records on unlimited links have
   span = cycles >= 1;
@@ -283,6 +289,51 @@ def check_hashes(r: Report, manifest: dict) -> None:
         print(f"      {b}")
 
 
+def check_channels(r: Report, manifest: dict, recs: dict) -> None:
+    res = manifest["resources"]
+    pairs = []  # (read id, write id)
+    for l in manifest.get("links", []):
+        for d in ("ab", "ba"):
+            if l.get(f"{d}_wr") is not None:
+                pairs.append((l[d], l[f"{d}_wr"]))
+    for a in manifest["attachments"]:
+        for d in ("in", "out"):
+            if a.get(f"{d}_wr") is not None:
+                pairs.append((a[d], a[f"{d}_wr"]))
+    bus_wr = {x["role"]["bus"]: x["id"] for x in res
+              if x["role"]["type"] == "bus" and x["role"].get("write")}
+    for x in res:
+        if x["role"]["type"] == "bus" and not x["role"].get("write") and x["role"]["bus"] in bus_wr:
+            pairs.append((x["id"], bus_wr[x["role"]["bus"]]))
+    if not pairs:
+        print("skip  write channels (none)")
+        return
+    bad = []
+    for rd, wr in pairs:
+        w, rr = res[wr], res[rd]
+        if not w["role"].get("write") or w["role"]["type"] != rr["role"]["type"]:
+            bad.append(f"{w['name']}: role {w['role']}")
+        num, den = w["rate"]
+        want = -(-num // (den * w["beat_bytes"])) if w["beat_bytes"] else 1
+        if w["lanes"] != max(want, 1) or w["beat_bytes"] != rr["beat_bytes"]:
+            bad.append(f"{w['name']}: lanes {w['lanes']} beat {w['beat_bytes']}")
+    r.check(not bad, f"{len(pairs)} write channels: roles and lanes")
+    for b in bad[:5]:
+        print(f"      {b}")
+    c = recs.get("charges")
+    if c is None:
+        return
+    reads = np.array(sorted(p[0] for p in pairs), dtype=np.int64)
+    writes = np.array(sorted(p[1] for p in pairs), dtype=np.int64)
+    on_wr = np.isin(c["resource"], writes)
+    on_rd = np.isin(c["resource"], reads)
+    n1 = int(np.count_nonzero(on_wr & (c["dir"] != 1)))
+    n2 = int(np.count_nonzero(on_rd & (c["dir"] == 1)))
+    r.check(n1 == 0 and n2 == 0,
+            f"{int(on_wr.sum())} charges on write channels: {n1} not writes, "
+            f"{n2} writes on a split element's read channel")
+
+
 def check_links(r: Report, manifest: dict) -> None:
     n = len(manifest["resources"])
     buses = manifest["buses"]
@@ -401,6 +452,7 @@ def main(argv: list[str] | None = None) -> int:
     check_charges(r, manifest, recs, stats)
     check_entries(r, manifest, recs)
     check_hashes(r, manifest)
+    check_channels(r, manifest, recs)
     check_links(r, manifest)
     if a.reference:
         check_reference(r, a.dump, manifest, recs, a.reference)

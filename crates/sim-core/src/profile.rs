@@ -362,9 +362,10 @@ impl TransferRoutes {
                         grid: grid(&p.blocks),
                     })
                 });
+                // The write half on the write channels (Section 3.5).
                 let write = topo.best_path(masters, &m.attach).map(|p| {
                     let mut hops: Vec<PathHop> = p
-                        .hops
+                        .hops_for(Dir::Write)
                         .iter()
                         .map(|h| hop(h.lane, Dir::Write, h.latency))
                         .collect();
@@ -828,7 +829,11 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 bytes,
                 dir,
             });
-        for r in route.resources.iter().chain([&block.port_for(dir)]) {
+        for r in route
+            .resources_for(dir)
+            .iter()
+            .chain([&block.port_for(dir)])
+        {
             demand.push(Demand::new(*r, bytes, dir));
         }
     }
@@ -950,7 +955,11 @@ device:
             path.extend(inp.hops.iter().map(|h| hop(h.lane, Dir::Read, h.latency)));
             path.extend(links.iter().map(|l| hop(*l, Dir::Read, 0)));
             path.last_mut().unwrap().latency += outp.lead;
-            path.extend(outp.hops.iter().map(|h| hop(h.lane, Dir::Write, h.latency)));
+            path.extend(
+                outp.hops_for(Dir::Write)
+                    .iter()
+                    .map(|h| hop(h.lane, Dir::Write, h.latency)),
+            );
             path.push(hop(dm.port_for(Dir::Write), Dir::Write, 0));
             out.push(path);
             done += n;

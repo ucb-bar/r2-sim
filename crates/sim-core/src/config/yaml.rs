@@ -43,6 +43,12 @@
 //!   hop stage holds per protocol class, default 1: a pipeline register,
 //!   not a buffer to size).
 //! * buses and links: a bus or link without `bw_bytes` is unlimited.
+//!   A data bus or data link with `bw_bytes` may have `wr_bytes`: a
+//!   separate write channel at that rate (Section 3.5): `<link>.ab.wr`
+//!   and `.ba.wr`, `<bus>.<attachment>.in.wr` and `.out.wr` on an
+//!   `xbar`, `<bus>.wr` on a `bus`. Writes (a DMA's destination half,
+//!   stores, result writes) use it, reads the read channel; without it
+//!   one channel carries both.
 //! * buses, links and memories (scratch, dram, cache; per bank too):
 //!   `block_bytes`, the transaction size (Section 5.3). A DMA chunk, or a
 //!   load or store piece, that passes through it ends at the next
@@ -487,6 +493,9 @@ struct BusSec {
     beat_bytes: Option<Num>,
     /// Transaction size: transfers through it are cut at its multiples.
     block_bytes: Option<Num>,
+    /// The rate of a separate write channel (data buses and links with
+    /// `bw_bytes`; Section 3.5).
+    wr_bytes: Option<Num>,
     /// A link's two buses (`topology: link` only).
     from: Option<String>,
     to: Option<String>,
@@ -558,6 +567,23 @@ struct BankSec {
     latency: Option<u64>,
     beat_bytes: Option<Num>,
     block_bytes: Option<Num>,
+}
+
+/// The write channel's rate (`wr_bytes`) of bus or link `name`: only on a
+/// data bus or link with `bw_bytes` (Section 3.5).
+fn wr_of(b: &BusSec, name: &str) -> Result<Option<Ratio>, ConfigError> {
+    let Some(w) = &b.wr_bytes else {
+        return Ok(None);
+    };
+    if b.control {
+        return err(format!("{name}: wr_bytes on a control bus or link"));
+    }
+    if b.bw_bytes.is_none() {
+        return err(format!(
+            "{name}: wr_bytes needs bw_bytes (an unlimited bus or link has one channel)"
+        ));
+    }
+    Ok(Some(w.rate()?))
 }
 
 /// `block_bytes` of `name`, if set: a power of two (Section 5.3: one grid
@@ -1278,14 +1304,18 @@ impl Builder {
             };
             let rate = opt_rate(&b.bw_bytes)?;
             let beat = beat_of(&b.beat_bytes, &lpath)?;
+            let wr = wr_of(b, &lpath)?;
             let r = &mut self.built.sim;
             let ab = r.lane(&format!("{lpath}.ab"), rate);
             let ba = r.lane(&format!("{lpath}.ba"), rate);
-            for l in [ab, ba].into_iter().flatten() {
+            // The write channel of each direction, after the read channel.
+            let ab_wr = r.lane(&format!("{lpath}.ab.wr"), wr);
+            let ba_wr = r.lane(&format!("{lpath}.ba.wr"), wr);
+            for l in [ab, ba, ab_wr, ba_wr].into_iter().flatten() {
                 r.resources_mut().set_beat(l, beat);
             }
             let ends = (resolve(from, &path, ppath)?, resolve(to, &path, ppath)?);
-            links.push((b, lpath, ends, (ab, ba), rate, beat));
+            links.push((b, lpath, ends, (ab, ba), (ab_wr, ba_wr), rate, beat));
         }
         let Some(nsec) = &sec.neutrino else {
             return err(format!(
@@ -1348,6 +1378,9 @@ impl Builder {
             );
             let beat = beat_of(&b.beat_bytes, &name)?;
             self.built.sim.set_bus_beat(id, beat);
+            if let Some(wr) = wr_of(b, &name)? {
+                self.built.sim.set_bus_wr(id, wr);
+            }
             if let Some(blk) = block_of(&b.block_bytes, &name)? {
                 self.built.sim.set_bus_block(id, blk);
             }
@@ -1399,7 +1432,7 @@ impl Builder {
         // The links, after the Neutrino's attachments. A child needs a data
         // link and a control link to its parent's buses.
         let mut upward = [false; 2];
-        for (b, lpath, (from, to), lanes, rate, beat) in links {
+        for (b, lpath, (from, to), lanes, (ab_wr, ba_wr), rate, beat) in links {
             let (fb, tb) = (self.bus(&from, &lpath)?, self.bus(&to, &lpath)?);
             let topo = self.built.sim.topology();
             if topo.bus(fb).control != b.control || topo.bus(tb).control != b.control {
@@ -1433,6 +1466,9 @@ impl Builder {
             );
             if let Some(blk) = block_of(&b.block_bytes, &lpath)? {
                 self.built.sim.set_link_block(index, blk);
+            }
+            if ab_wr.is_some() {
+                self.built.sim.set_link_wr(index, ab_wr, ba_wr);
             }
             if let Some(h) = hash {
                 self.built.sim.add_hash(index, nu, numeric, h);

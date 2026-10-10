@@ -15,7 +15,11 @@
 //! an `xbar` has per attachment an ingress and an egress resource, and a
 //! transfer from attachment s to attachment d charges s's ingress and d's
 //! egress; a `bus` has one shared resource. A bus without a rate is
-//! unlimited. A link keeps one resource per direction (full duplex).
+//! unlimited. A link keeps one resource per direction (full duplex). A
+//! bus or link with `wr_bytes` has a second, write channel beside each of
+//! these (Section 3.5): a write moves its data over the write channel, a
+//! read over the read channel, and a route has a resource list per
+//! channel ([`Path::hops_for`]).
 //!
 //! A route is the path with the fewest links, found when the fabric is
 //! finished. Its latency is the sum of the latencies of every bus and
@@ -27,7 +31,7 @@ use std::collections::VecDeque;
 
 use nu_model::NeutrinoId;
 
-use crate::resource::ResourceId;
+use crate::resource::{Dir, ResourceId};
 use crate::time::Cycle;
 
 /// One node of the hardware tree: one Neutrino.
@@ -75,6 +79,8 @@ pub struct Bus {
     pub lane: Lane,
     /// Hop latency in cycles.
     pub latency: Cycle,
+    /// The shared write lane (`Shared` with `wr_bytes`).
+    pub lane_wr: Lane,
     /// A control bus (protocol messages); otherwise a data bus.
     pub control: bool,
     /// Transaction size: a transfer through the bus is cut at multiples
@@ -93,6 +99,9 @@ pub struct Attachment {
     pub ingress: Lane,
     /// Out of the bus to this attachment (`Xbar` only).
     pub egress: Lane,
+    /// The write channel's ingress and egress (`wr_bytes`).
+    pub ingress_wr: Lane,
+    pub egress_wr: Lane,
 }
 
 /// A link between buses `a` (its `from`) and `b` (its `to`), attached to
@@ -106,6 +115,9 @@ pub struct FabricLink {
     /// Lanes from `a` to `b`, and from `b` to `a`.
     pub ab: Lane,
     pub ba: Lane,
+    /// The write channel of each direction (`wr_bytes`).
+    pub ab_wr: Lane,
+    pub ba_wr: Lane,
     pub latency: Cycle,
     /// Transaction size, as [`Bus::block`].
     pub block: Option<u64>,
@@ -151,6 +163,9 @@ pub struct Path {
     pub links: u32,
     /// The distinct `block_bytes` of the buses and links on the route.
     pub blocks: Vec<u64>,
+    /// The write channel's resources and hops, when a bus or link of the
+    /// route has one; `None`: the read channel's.
+    pub write: Option<Box<(Vec<ResourceId>, Vec<Hop>)>>,
 }
 
 /// The bytes from address `a` to the next multiple of each of `blocks`:
@@ -166,6 +181,25 @@ impl Path {
             (Some(lane), _) => self.hops.push(Hop { lane, latency }),
             (None, Some(h)) => h.latency += latency,
             (None, None) => self.lead += latency,
+        }
+    }
+
+    /// The resources the route charges for data moving in direction
+    /// `dir`: a write on the write channels.
+    pub fn resources_for(&self, dir: Dir) -> &[ResourceId] {
+        match (&self.write, dir) {
+            (Some(w), Dir::Write) => &w.0,
+            _ => &self.resources,
+        }
+    }
+
+    /// The hops of the route for data moving in direction `dir` (a hop
+    /// rated on one channel is rated on the other, so the latencies and
+    /// `lead` are the same).
+    pub fn hops_for(&self, dir: Dir) -> &[Hop] {
+        match (&self.write, dir) {
+            (Some(w), Dir::Write) => &w.1,
+            _ => &self.hops,
         }
     }
 }
@@ -197,6 +231,7 @@ static EMPTY: Path = Path {
     lead: 0,
     links: 0,
     blocks: Vec::new(),
+    write: None,
 };
 
 /// One bus of a bus-level route and the link (index, direction a to b)
@@ -254,9 +289,22 @@ impl Topology {
             att_b,
             ab,
             ba,
+            ab_wr: None,
+            ba_wr: None,
             latency,
             block: None,
         });
+    }
+
+    pub(crate) fn set_link_wr(&mut self, link: usize, ab: Lane, ba: Lane) {
+        self.finished = false;
+        let l = &mut self.links[link];
+        (l.ab_wr, l.ba_wr) = (ab, ba);
+    }
+
+    pub(crate) fn set_bus_wr(&mut self, bus: BusId, lane: Lane) {
+        self.finished = false;
+        self.buses[bus.0 as usize].lane_wr = lane;
     }
 
     pub(crate) fn set_bus_block(&mut self, bus: BusId, block: u64) {
@@ -348,20 +396,22 @@ impl Topology {
     }
 
     /// Calls `f` for every link of the route from attachment `s` to `d`
-    /// over the bus-level `route`, in route order, with its lane and the
-    /// latency after it.
-    fn walk(&self, s: usize, d: usize, route: &[Step], mut f: impl FnMut(Link, Lane, Cycle)) {
+    /// over the bus-level `route`, in route order, with its lane, its
+    /// write lane (the lane without a write channel) and the latency after
+    /// it.
+    fn walk(&self, s: usize, d: usize, route: &[Step], mut f: impl FnMut(Link, Lane, Lane, Cycle)) {
         for (i, &(bus, via)) in route.iter().enumerate() {
             // Where the transfer enters and leaves this bus.
             let entry = match via {
                 None => s,
                 Some((br, fwd)) => {
                     let b = &self.links[br];
-                    f(
-                        Link::Fabric(br as u32, fwd),
-                        if fwd { b.ab } else { b.ba },
-                        b.latency,
-                    );
+                    let (lane, wr) = if fwd {
+                        (b.ab, b.ab_wr)
+                    } else {
+                        (b.ba, b.ba_wr)
+                    };
+                    f(Link::Fabric(br as u32, fwd), lane, wr.or(lane), b.latency);
                     (if fwd { b.att_b } else { b.att_a }).0 as usize
                 }
             };
@@ -376,18 +426,26 @@ impl Topology {
             let b = &self.buses[bus];
             match b.topology {
                 BusTopology::Xbar => {
+                    let (i, o) = (&self.attachments[entry], &self.attachments[exit]);
                     f(
                         Link::In(AttachId(entry as u32)),
-                        self.attachments[entry].ingress,
+                        i.ingress,
+                        i.ingress_wr.or(i.ingress),
                         0,
                     );
                     f(
                         Link::Out(AttachId(exit as u32)),
-                        self.attachments[exit].egress,
+                        o.egress,
+                        o.egress_wr.or(o.egress),
                         b.latency,
                     );
                 }
-                BusTopology::Shared => f(Link::Bus(BusId(bus as u32)), b.lane, b.latency),
+                BusTopology::Shared => f(
+                    Link::Bus(BusId(bus as u32)),
+                    b.lane,
+                    b.lane_wr.or(b.lane),
+                    b.latency,
+                ),
             }
         }
     }
@@ -400,7 +458,7 @@ impl Topology {
         let nb = self.buses.len();
         let mut out = Vec::new();
         if let Some(route) = &self.steps[sb as usize * nb + db as usize] {
-            self.walk(a.0 as usize, b.0 as usize, route, |l, lane, _| {
+            self.walk(a.0 as usize, b.0 as usize, route, |l, lane, _, _| {
                 out.push((l, lane))
             });
         }
@@ -414,11 +472,17 @@ impl Topology {
             links: route.len() as u32 - 1,
             ..Path::default()
         };
-        self.walk(s, d, route, |_, lane, latency| {
+        let mut wr = Path::default();
+        self.walk(s, d, route, |_, lane, lane_wr, latency| {
             p.resources.extend(lane);
             p.push_hop(lane, latency);
             p.latency += latency;
+            wr.resources.extend(lane_wr);
+            wr.push_hop(lane_wr, latency);
         });
+        if wr.resources != p.resources {
+            p.write = Some(Box::new((wr.resources, wr.hops)));
+        }
         for &(bus, via) in route {
             let link = via.and_then(|(l, _)| self.links[l].block);
             for b in [link, self.buses[bus].block].into_iter().flatten() {

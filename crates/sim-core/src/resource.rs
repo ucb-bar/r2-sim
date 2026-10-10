@@ -42,8 +42,10 @@ impl Kind {
 }
 
 /// What a demand's amount is: bytes read, bytes written, or work (MACs,
-/// lane-ops, instructions). Reads and writes are charged alike; the
-/// direction is recorded in the statistics.
+/// lane-ops, instructions). Every hop is charged in the direction the
+/// data moves; a write uses the write channel of a hop that has one
+/// (`wr_bytes`, architecture Section 3.5), a read the read channel. The
+/// direction is also recorded in the statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Dir {
     /// Bytes read: toward the reader (a memory read, a DMA's source side).
