@@ -1,6 +1,6 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.5). The checks are the
+The format is r2-vis's `trace-raw.md` (version 1.6). The checks are the
 ones of its Section 8, plus the file layout:
 
 * the manifest's record layouts have the record sizes of the format, every
@@ -27,6 +27,14 @@ ones of its Section 8, plus the file layout:
   ceil(wr_bytes / beat_bytes); charges on it are writes, and no write
   charge lands on the read channel of an element that has a write
   channel;
+* charge owners (version 1.6): every non-null `gid` is a task gid (with a
+  task record, in a complete dump) or a program reference (bit 31 set:
+  the root program 0xFFFFFFFE, or 0x80000000 | a spawn gid of
+  programs.bin); a message's owner fits its kind (Invoke: a task;
+  InvokeAck, RetryAck, Reject: their request's owner, a task or the
+  program of a VersionReset; Await, AwaitAck, Resolve: a task or a
+  program; Start, Return: a spawn task; the others: a program). Null
+  owners are counted by message kind or resource role;
 * every resource id in the records is in the manifest, every link of the
   topology tables has a resource, and records on unlimited links have
   span = cycles >= 1;
@@ -140,7 +148,9 @@ def check_gids(r: Report, manifest: dict, recs: dict) -> None:
     known = np.sort(tasks)
 
     def missing(gids: np.ndarray) -> int:
-        gids = gids[gids != NULL32]
+        # Program references (version 1.6, bit 31 set) are checked with
+        # the owners.
+        gids = gids[gids < 0x80000000]
         pos = np.searchsorted(known, gids)
         pos = np.minimum(pos, len(known) - 1)
         return int(np.count_nonzero(known[pos] != gids)) if len(known) else len(gids)
@@ -334,6 +344,67 @@ def check_channels(r: Report, manifest: dict, recs: dict) -> None:
             f"{n2} writes on a split element's read channel")
 
 
+PROGRAM = 0x80000000
+ROOT_PROGRAM = 0xFFFFFFFE
+
+
+def check_owners(r: Report, manifest: dict, recs: dict) -> None:
+    c = recs.get("charges")
+    if c is None or manifest["version"] < [1, 6]:
+        print("skip  charge owners (not recorded, or before version 1.6)")
+        return
+    gid = c["gid"].astype(np.int64)
+    null = gid == NULL32
+    prog = ~null & (gid >= PROGRAM)
+    spawns = set()
+    if "programs" in recs:
+        spawns = {int(x) for x in recs["programs"]["spawn"] if x != NULL32}
+    p_ok = (gid == ROOT_PROGRAM) | np.isin(gid & 0x7FFFFFFF, list(spawns))
+    bad_prog = int(np.count_nonzero(prog & ~p_ok))
+    r.check(bad_prog == 0, f"program owners: {int(prog.sum())} records, {bad_prog} "
+            "not the root program or a program of programs.bin")
+    task = ~null & ~prog
+    if not manifest["filters"]["partial"]:
+        known = np.sort(recs["tasks"]["gid"].astype(np.int64))
+        g = gid[task]
+        pos = np.minimum(np.searchsorted(known, g), len(known) - 1)
+        miss = int(np.count_nonzero(known[pos] != g)) if len(known) else len(g)
+        r.check(miss == 0, f"task owners: {int(task.sum())} records, {miss} without a task record")
+    kinds = manifest["message_kinds"]
+    msg = c["msg"].astype(np.int64)
+    is_msg = msg != 0xFF
+    # Allowed owners per kind: t task, p program, s spawn task.
+    allowed = {"Invoke": "t", "InvokeAck": "tp", "RetryAck": "tp", "Reject": "tp",
+               "Await": "tp", "AwaitAck": "tp", "Resolve": "tp", "Start": "s", "Return": "s"}
+    bad = []
+    for k, name in enumerate(kinds):
+        sel = is_msg & (msg == k) & ~null
+        if not sel.any():
+            continue
+        a = allowed.get(name, "p")
+        ok = np.zeros(int(sel.sum()), bool)
+        if "t" in a or "s" in a:
+            t = task[sel]
+            if "s" in a:
+                t &= np.isin(gid[sel], list(spawns))
+            ok |= t
+        if "p" in a:
+            ok |= prog[sel]
+        n = int(np.count_nonzero(~ok))
+        if n:
+            bad.append(f"{name}: {n} of {int(sel.sum())}")
+    r.check(not bad, "message owners fit their kind")
+    for b in bad[:5]:
+        print(f"      {b}")
+    roles = [x["role"]["type"] for x in manifest["resources"]]
+    counts = {}
+    for i in np.flatnonzero(null):
+        key = kinds[msg[i]] if is_msg[i] else roles[c["resource"][i]] if c["resource"][i] < len(roles) else "?"
+        counts[key] = counts.get(key, 0) + 1
+    print(f"info  null owners: {int(null.sum())} of {len(c)} records"
+          + (": " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else ""))
+
+
 def check_links(r: Report, manifest: dict) -> None:
     n = len(manifest["resources"])
     buses = manifest["buses"]
@@ -453,6 +524,7 @@ def main(argv: list[str] | None = None) -> int:
     check_entries(r, manifest, recs)
     check_hashes(r, manifest)
     check_channels(r, manifest, recs)
+    check_owners(r, manifest, recs)
     check_links(r, manifest)
     if a.reference:
         check_reference(r, a.dump, manifest, recs, a.reference)

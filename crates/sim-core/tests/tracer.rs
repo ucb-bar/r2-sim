@@ -170,6 +170,7 @@ fn a_traced_two_sm_run_ends_at_the_untraced_cycle() {
         queued,
         sent,
         seq,
+        n: seq + 1,
     };
     assert_eq!(seen.invokes[0], (0, sm0, call(0, None, None, 0), 8));
     assert_eq!(

@@ -161,6 +161,9 @@ struct Neutrino {
     op: Option<Request>,
     /// The cycle the program made the request in `op`.
     op_call: Cycle,
+    /// Invoke and spawn calls of the program so far (their numbers,
+    /// [`TaskCall::n`]).
+    calls: u64,
     /// The name of the program (for a tracer).
     prog_name: &'static str,
     state: ProgState,
@@ -770,6 +773,7 @@ impl Sim {
             mb: Rc::new(RefCell::new(Mailbox::default())),
             op: None,
             op_call: 0,
+            calls: 0,
             prog_name: "",
             state: ProgState::Idle,
             tasks: Vec::new(),
@@ -1232,20 +1236,26 @@ impl Sim {
             Request::Spawn { .. } => c.spawn,
             Request::Mark(_) => 0,
         };
+        // An invoke's cost is its task's (trace-raw 1.6), named by the
+        // call's number until the task has a gid.
+        let who = match &req {
+            Request::Invoke(_) | Request::Spawn { .. } => {
+                let n = &mut self.nus[nu.0 as usize];
+                n.calls += 1;
+                Who::Invoke { nu, n: n.calls }
+            }
+            _ => Who::Program(nu),
+        };
+        let r = self.nus[nu.0 as usize].scalar;
         if desc > 0 {
-            self.charge_scalar(nu, desc);
+            self.charge(r, desc, who);
         }
-        let end = self.charge_scalar(nu, cost);
+        let end = self.charge(r, cost, who);
         let n = &mut self.nus[nu.0 as usize];
         n.op = Some(req);
         n.op_call = self.now;
         n.state = ProgState::Busy;
         self.queue.push(end, Event::NuExec(nu));
-    }
-
-    fn charge_scalar(&mut self, nu: NeutrinoId, cost: u64) -> Cycle {
-        let r = self.nus[nu.0 as usize].scalar;
-        self.charge(r, cost, Who::Program(nu))
     }
 
     /// Charges `c_complete` on `nu`'s completion port; the completion of
@@ -1679,6 +1689,7 @@ impl Sim {
                 queued: None,
                 sent: None,
                 seq: 0,
+                n: self.nus[nu.0 as usize].calls,
             },
             Entry::Inbound(call) => call,
         };

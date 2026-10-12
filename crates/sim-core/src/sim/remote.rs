@@ -47,7 +47,7 @@ use crate::program::{NuCtx, Response, StartFn};
 use crate::program::{Request, TaskHandle};
 use crate::stats::{FatalError, Stall};
 use crate::time::Cycle;
-use crate::tracer::{self as tr, Table, TableEntry, TaskCall, Who};
+use crate::tracer::{self as tr, Owner, Table, TableEntry, TaskCall, Who};
 
 /// The id of the inbound ref of request `request` of `requester`.
 pub(super) fn ref_id(requester: NeutrinoId, request: RequestId) -> u64 {
@@ -250,6 +250,8 @@ pub(crate) struct Msg {
     seq: u64,
     /// An invoke: when the owner reserved its inbound invoke entry.
     reserved: Option<Cycle>,
+    /// What the message is for, for a tracer.
+    owner: Owner,
 }
 
 /// One stage of a channel.
@@ -301,12 +303,74 @@ impl Sim {
     }
 
     fn send_msg(&mut self, from: NeutrinoId, to: NeutrinoId, kind: MsgKind, retry: bool) {
-        let Some((id, class)) = self.make_msg(from, to, kind, retry) else {
+        let owner = self.msg_owner(from, to, &kind);
+        self.send_owned(from, to, kind, retry, owner);
+    }
+
+    /// [`Sim::send`] with the message's owner for a tracer (trace-raw 1.6).
+    fn send_owned(
+        &mut self,
+        from: NeutrinoId,
+        to: NeutrinoId,
+        kind: MsgKind,
+        retry: bool,
+        owner: Owner,
+    ) {
+        let Some((id, class)) = self.make_msg(from, to, kind, retry, owner) else {
             return;
         };
         let src = Stage::Source(from.0, class);
         self.enqueue(src, id);
         self.advance(src);
+    }
+
+    /// What message `kind` from `from` to `to` is for (trace-raw 1.6): an
+    /// invoke's task, the consumer of a remote dependency (or the waiting
+    /// program), a spawn's task, or the sending program.
+    fn msg_owner(&self, from: NeutrinoId, to: NeutrinoId, kind: &MsgKind) -> Owner {
+        if self.tracer.is_none() {
+            return Owner::None;
+        }
+        let spawn = |nu: NeutrinoId, t: TaskId| Owner::Task(self.nus[nu.0 as usize].rec(t).gid);
+        match kind {
+            MsgKind::Invoke { call, .. } => Owner::Invoke {
+                src: call.src,
+                n: call.n,
+            },
+            MsgKind::Await { msg } => self.request_owner(msg.from, msg.request),
+            MsgKind::AwaitAck { req, .. } | MsgKind::Resolve { req } => {
+                self.request_owner(to, *req)
+            }
+            MsgKind::Start { task, .. } => spawn(from, *task),
+            MsgKind::Return { task } => spawn(to, *task),
+            _ => self.program_owner(from),
+        }
+    }
+
+    /// The program running on `nu`, by its spawn task (`Owner::None` when
+    /// `nu` runs none). Resolved when a message is made, so that its hops
+    /// keep the owner after the program returns.
+    fn program_owner(&self, nu: NeutrinoId) -> Owner {
+        let n = &self.nus[nu.0 as usize];
+        if n.program.is_none() {
+            return Owner::None;
+        }
+        Owner::Program {
+            spawn: n
+                .parent_task
+                .map(|(p, t)| self.nus[p.0 as usize].rec(t).gid),
+        }
+    }
+
+    /// The owner of remote request `req` of `nu`: its consumer task, or
+    /// `nu`'s program for a program wait.
+    fn request_owner(&self, nu: NeutrinoId, req: RequestId) -> Owner {
+        let n = &self.nus[nu.0 as usize];
+        match n.reqs.purpose(req) {
+            Some(Purpose::TaskDep(t)) => Owner::Task(n.rec(t).gid),
+            Some(Purpose::Wait(_)) => self.program_owner(nu),
+            None => Owner::None,
+        }
     }
 
     /// The child of the root that `nu` is in (`None`: the root).
@@ -329,6 +393,7 @@ impl Sim {
         to: NeutrinoId,
         kind: MsgKind,
         retry: bool,
+        owner: Owner,
     ) -> Option<(u32, u8)> {
         let beats = kind.bytes().div_ceil(self.msg_bytes).max(1);
         if beats > MAX_BEATS {
@@ -391,6 +456,7 @@ impl Sim {
             ticketed: false,
             seq: 0,
             reserved: None,
+            owner,
         };
         let id = match self.msg_free.pop() {
             Some(i) => {
@@ -445,7 +511,7 @@ impl Sim {
                 }
             }
             let (to, class, next, retry) = (m.to, m.class, m.next, m.retry);
-            let (from, kind) = (m.from, m.kind.index());
+            let (from, kind, owner) = (m.from, m.kind.index(), m.owner);
             if let Some(&hop) = m.hops.get(next) {
                 let t = Stage::Hop(hop.lane, class);
                 if self.stage_occ(t) >= self.stage_cap(t) {
@@ -463,6 +529,7 @@ impl Sim {
                     to,
                     hop: next,
                     bytes,
+                    owner,
                 };
                 // A message is a write toward its receiver.
                 let rate = self.msgs[id as usize].as_ref().expect("message").rate;
@@ -489,6 +556,7 @@ impl Sim {
                     to,
                     hop: 0,
                     bytes: m.beats * self.msg_bytes,
+                    owner: m.owner,
                 });
                 if is_invoke && self.flow == Flow::ReadyValid {
                     let n = &self.nus[to.0 as usize];
@@ -629,10 +697,15 @@ impl Sim {
                 MsgKind::Invoke { .. } | MsgKind::VersionReset { .. }
             );
             if accept {
+                // An answer is for its request (trace-raw 1.6): the invoked
+                // task, or the program that sent a VersionReset.
+                let owner = msg.owner;
                 match self.ticket_answer(from, to, &mut msg) {
-                    MsgKind::InvokeAck => self.send(to, from, MsgKind::InvokeAck),
+                    MsgKind::InvokeAck => {
+                        self.send_owned(to, from, MsgKind::InvokeAck, false, owner)
+                    }
                     answer => {
-                        self.send(to, from, answer);
+                        self.send_owned(to, from, answer, false, owner);
                         return self.grant(to);
                     }
                 }
@@ -782,7 +855,9 @@ impl Sim {
             n.tickets.granted.insert(r, self.now);
             n.tickets.last = r;
             n.inbound_reserved += 1;
-            self.send(owner, NeutrinoId(r), MsgKind::PCrdGrant);
+            // For the requester's replays: its program (trace-raw 1.6).
+            let who = self.program_owner(NeutrinoId(r));
+            self.send_owned(owner, NeutrinoId(r), MsgKind::PCrdGrant, false, who);
         }
     }
 
@@ -924,7 +999,8 @@ impl Sim {
             HeldKind::VersionReset(addr) => MsgKind::VersionReset { addr },
         };
         self.stats.resends += 1;
-        let Some((id, _)) = self.make_msg(nu, owner, kind, false) else {
+        let who = self.msg_owner(nu, owner, &kind);
+        let Some((id, _)) = self.make_msg(nu, owner, kind, false, who) else {
             return;
         };
         let m = self.msgs[id as usize].as_mut().expect("message");
@@ -946,7 +1022,8 @@ impl Sim {
             MsgKind::VersionReset { addr } => HeldKind::VersionReset(*addr),
             _ => unreachable!("only requests are held"),
         };
-        let Some((id, _)) = self.make_msg(nu, owner, kind, false) else {
+        let who = self.msg_owner(nu, owner, &kind);
+        let Some((id, _)) = self.make_msg(nu, owner, kind, false, who) else {
             return;
         };
         let n = &mut self.nus[nu.0 as usize];
@@ -999,7 +1076,8 @@ impl Sim {
         if self.flow == Flow::Ticket {
             self.send_held(nu, owner, kind, seq);
         } else {
-            let Some((id, class)) = self.make_msg(nu, owner, kind, false) else {
+            let who = self.msg_owner(nu, owner, &kind);
+            let Some((id, class)) = self.make_msg(nu, owner, kind, false, who) else {
                 return;
             };
             self.msgs[id as usize].as_mut().expect("message").seq = seq;
@@ -1048,6 +1126,7 @@ impl Sim {
             sent: None,
             // Set by `send_request`.
             seq: 0,
+            n: self.nus[nu.0 as usize].calls,
         };
         self.send_request(nu, owner, MsgKind::Invoke { desc, call });
         self.respond(

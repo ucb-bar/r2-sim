@@ -51,6 +51,6 @@ pub use topology::{
     Topology,
 };
 pub use tracer::{
-    Charge, ChunkGrant, Collector, CollectorConfig, RouteUse, Table, TableEntry, TaskCall,
+    Charge, ChunkGrant, Collector, CollectorConfig, Owner, RouteUse, Table, TableEntry, TaskCall,
     TaskEntered, Tee, Tracer, Who,
 };

@@ -1,6 +1,6 @@
 //! The raw trace dump for the r2-vis converter (`--trace-raw DIR`).
 //!
-//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.5.
+//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.6.
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -40,7 +40,7 @@ use nu_model::{Dep, NeutrinoId};
 use serde_json::{json, Value};
 use sim_core::tracer as tr;
 use sim_core::{
-    AttachId, Built, BusTopology, Charge, ChunkGrant, Component, Cycle, Dir, Link, PeParams,
+    AttachId, Built, BusTopology, Charge, ChunkGrant, Component, Cycle, Dir, Link, Owner, PeParams,
     ResourceId, Role, RouteUse, Sim, Stats, Table, TableEntry, TaskEntered, Topology, Tracer, Who,
     MESSAGE_KINDS,
 };
@@ -465,6 +465,9 @@ struct OpenTask {
     sent: Option<Cycle>,
     /// Resolved deps kept until the task's retire decides the window.
     parked: u32,
+    /// Its invoke call (source Neutrino, number), when it has one: the key
+    /// of its owner name in `named`.
+    call_key: Option<(u32, u64)>,
 }
 
 /// An open dependency record, in a slab with linked lists.
@@ -488,6 +491,19 @@ struct OpenDep {
 
 const REMOTE: u8 = 1;
 const VERSIONED: u8 = 2;
+
+/// A program as a charge's owner: this bit and its spawn task's gid; the
+/// root program (no spawn task) is `ROOT_PROGRAM` (trace-raw 1.6).
+const PROGRAM: u32 = 0x8000_0000;
+const ROOT_PROGRAM: u32 = 0xFFFF_FFFE;
+
+/// A charge's owner: a gid (task or program reference; `None`: nothing),
+/// or an invoke call whose task has no gid yet.
+#[derive(Debug, Clone, Copy)]
+enum Own {
+    Gid(Option<u32>),
+    Held((u32, u64)),
+}
 
 /// An open table entry (written when it leaves or at the end).
 #[derive(Debug, Clone, Copy)]
@@ -542,6 +558,13 @@ pub struct RawTracer {
     last_remote: Vec<u32>,
     /// Running programs by Neutrino: (name, spawn, start).
     programs: IdMap<u32, Program>,
+    /// Owners (trace-raw 1.6): the gid of an invoke call (source, number)
+    /// from its task's invoke to its retire, and the charge records of an
+    /// invoke call held until its task has a gid.
+    named: IdMap<(u32, u64), u32>,
+    held: IdMap<(u32, u64), Vec<[u8; 32]>>,
+    held_now: usize,
+    held_peak: usize,
     /// Open table entries.
     entries: IdMap<EntryKey, OpenEntry>,
     /// Outbound invoke entries that left before their task's invoke at
@@ -702,6 +725,10 @@ impl RawTracer {
             remote: IdMap::default(),
             last_remote: Vec::new(),
             programs: IdMap::default(),
+            named: IdMap::default(),
+            held: IdMap::default(),
+            held_now: 0,
+            held_peak: 0,
             entries: IdMap::default(),
             unnamed: IdMap::default(),
             entries_on: f.keeps("entries"),
@@ -791,7 +818,7 @@ impl RawTracer {
         amount: u64,
         span: Cycle,
         cycles: Cycle,
-        gid: Option<u64>,
+        owner: Own,
         resource: u16,
         dir: Dir,
         msg: Option<u8>,
@@ -799,16 +826,59 @@ impl RawTracer {
         if !(self.keep_res[resource as usize] && self.in_window(start, start + span)) {
             return;
         }
+        let gid = match owner {
+            Own::Gid(g) => g,
+            Own::Held(_) => None,
+        };
         let mut r = Rec::<32>::new();
         r.u64(start)
             .u64(amount)
             .u32(c32(span))
             .u32(c32(cycles))
-            .u32(o32(gid.map(|g| g as u32)))
+            .u32(o32(gid))
             .u16(resource)
             .u8(dir as u8)
             .u8(msg.unwrap_or(u8::MAX));
-        self.emit(T_CHARGES, r.done());
+        match owner {
+            Own::Gid(_) => self.emit(T_CHARGES, r.done()),
+            Own::Held(k) => {
+                if self.files[T_CHARGES].is_some() {
+                    self.held.entry(k).or_default().push(*r.done());
+                    self.held_now += 1;
+                    self.held_peak = self.held_peak.max(self.held_now);
+                }
+            }
+        }
+    }
+
+    /// The owner of a charge (trace-raw 1.6): a task gid, a program
+    /// reference, or an invoke whose task has no gid yet (its records are
+    /// held until the task's invoke).
+    fn owner(&self, who: Who) -> Own {
+        let program = |nu: NeutrinoId| {
+            Own::Gid(self.programs.get(&nu.0).map(|p| match p.1 {
+                Some(spawn) => PROGRAM | spawn as u32,
+                None => ROOT_PROGRAM,
+            }))
+        };
+        let invoke = |src: NeutrinoId, n: u64| match self.named.get(&(src.0, n)) {
+            Some(&g) => Own::Gid(Some(g)),
+            None => Own::Held((src.0, n)),
+        };
+        match who {
+            Who::Task(g) => Own::Gid(Some(g as u32)),
+            Who::Program(nu) => program(nu),
+            Who::Invoke { nu, n } => invoke(nu, n),
+            Who::Message { owner, .. } => match owner {
+                Owner::None => Own::Gid(None),
+                Owner::Task(g) => Own::Gid(Some(g as u32)),
+                Owner::Program { spawn } => Own::Gid(Some(match spawn {
+                    Some(g) => PROGRAM | g as u32,
+                    None => ROOT_PROGRAM,
+                })),
+                Owner::Invoke { src, n } => invoke(src, n),
+            },
+        }
     }
 
     /// Records on the unlimited links `ids` over `[start, end)` (at least
@@ -820,14 +890,14 @@ impl RawTracer {
         start: Cycle,
         end: Cycle,
         amount: u64,
-        gid: Option<u64>,
+        owner: Own,
         dir: Dir,
         msg: Option<u8>,
     ) {
         let span = end.saturating_sub(start).max(1);
         for k in ids.0..ids.0 + ids.1 {
             let id = self.links[k as usize];
-            self.write_charge(start, amount, span, span, gid, id, dir, msg);
+            self.write_charge(start, amount, span, span, owner, id, dir, msg);
         }
     }
 
@@ -1083,8 +1153,33 @@ impl Tracer for RawTracer {
             queued: e.call.queued,
             sent: e.call.sent,
             parked: NONE,
+            call_key: None,
         };
-        self.tasks.insert(e.gid, open);
+        assert!(
+            e.gid < 0x7FFF_FFFE,
+            "task gid {} collides with program references",
+            e.gid
+        );
+        let key = (e.call.n != 0).then_some((e.call.src.0, e.call.n));
+        self.tasks.insert(
+            e.gid,
+            OpenTask {
+                call_key: key,
+                ..open
+            },
+        );
+        // The invoke's held charges (its cost and messages) get its gid.
+        if let Some(k) = key {
+            self.named.insert(k, e.gid as u32);
+            if let Some(recs) = self.held.remove(&k) {
+                self.held_now -= recs.len();
+                let gid = (e.gid as u32).to_le_bytes();
+                for mut r in recs {
+                    r[24..28].copy_from_slice(&gid);
+                    self.emit(T_CHARGES, &r);
+                }
+            }
+        }
         if self.entries_on && e.call.seq != 0 {
             let k = (e.call.src.0, Table::OutboundInvokes as u8, e.call.seq);
             if let Some(o) = self.entries.get_mut(&k) {
@@ -1182,6 +1277,9 @@ impl Tracer for RawTracer {
 
     fn task_retire(&mut self, gid: u64, time: Cycle) {
         if let Some(t) = self.tasks.remove(&gid) {
+            if let Some(k) = t.call_key {
+                self.named.remove(&k);
+            }
             self.write_task(gid, &t, Some(time));
             if t.parked != NONE {
                 let keep = self.task_kept(&t, Some(time));
@@ -1225,17 +1323,17 @@ impl Tracer for RawTracer {
         }) {
             return;
         }
-        let (gid, msg) = match who {
-            Who::Task(g) => (Some(g), None),
-            Who::Program(_) => (None, None),
-            Who::Message { kind, .. } => (None, Some(kind)),
+        let msg = match who {
+            Who::Message { kind, .. } => Some(kind),
+            _ => None,
         };
+        let owner = self.owner(who);
         self.write_charge(
             c.start,
             c.amount,
             c.span,
             c.cycles,
-            gid,
+            owner,
             c.resource.0 as u16,
             c.dir,
             msg,
@@ -1252,7 +1350,15 @@ impl Tracer for RawTracer {
                 Some(&h) if h.1 > 0 => h,
                 _ => return,
             };
-            self.write_unlimited(ids, c.start, c.start + c.span, bytes, None, Dir::Write, msg);
+            self.write_unlimited(
+                ids,
+                c.start,
+                c.start + c.span,
+                bytes,
+                owner,
+                Dir::Write,
+                msg,
+            );
         }
     }
 
@@ -1264,11 +1370,8 @@ impl Tracer for RawTracer {
         if ids.1 == 0 {
             return;
         }
-        let gid = match who {
-            Who::Task(g) => Some(g),
-            _ => None,
-        };
-        self.write_unlimited(ids, start, end, r.bytes, gid, r.dir, None);
+        let owner = self.owner(who);
+        self.write_unlimited(ids, start, end, r.bytes, owner, r.dir, None);
     }
 
     fn message_free(&mut self, who: Who, start: Cycle, end: Cycle) {
@@ -1286,8 +1389,9 @@ impl Tracer for RawTracer {
             return;
         }
         let msg = Some(kind);
+        let owner = self.owner(who);
         let ids = self.fold(from, to).all;
-        self.write_unlimited(ids, start, end, bytes, None, Dir::Write, msg);
+        self.write_unlimited(ids, start, end, bytes, owner, Dir::Write, msg);
     }
 
     fn dep_remote_open(&mut self, nu: NeutrinoId, req: u32, gid: u64, key: Dep) {
@@ -1455,6 +1559,20 @@ impl Tracer for RawTracer {
         unnamed.sort_by_key(|u| u.0);
         for ((nu, seq), (o, end)) in unnamed {
             self.write_entry((nu, Table::OutboundInvokes as u8, seq), &o, Some(end));
+        }
+        // Held charges whose invoke never reached its owner: no owner.
+        let mut held: Vec<_> = self.held.drain().collect();
+        held.sort_by_key(|h| h.0);
+        for (_, recs) in held {
+            for r in recs {
+                self.emit(T_CHARGES, &r);
+            }
+        }
+        if self.held_peak > 0 {
+            eprintln!(
+                "raw trace: at most {} charge records held for their owner",
+                self.held_peak
+            );
         }
         let mut err = self.error.take();
         if let Err(e) = self.strings.flush() {
@@ -1857,7 +1975,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
     json!({
         "format": "r2raw",
-        "version": [1, 5],
+        "version": [1, 6],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

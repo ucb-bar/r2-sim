@@ -34,6 +34,10 @@ pub struct TaskCall {
     /// [`TableEntry::id`] of its [`Table::OutboundInvokes`] entry); 0 for
     /// a local invoke.
     pub seq: u64,
+    /// The invoke's number among the invoke and spawn calls of `src`
+    /// (from 1; 0: none). With `src` it names the invoke before its task
+    /// has a gid ([`Owner::Invoke`]).
+    pub n: u64,
 }
 
 /// A Neutrino table whose entries a tracer can follow. The scoreboard and
@@ -146,9 +150,31 @@ pub enum Who {
         to: NeutrinoId,
         hop: usize,
         bytes: u64,
+        /// What the message is for.
+        owner: Owner,
     },
     /// Program work of a Neutrino: a NuCtx call's cost, a load or a store.
     Program(NeutrinoId),
+    /// The scalar cost of invoke (or spawn) call `n` of `nu`
+    /// (`c_desc` and `c_invoke`): the task it invokes, whose gid exists
+    /// only from its invoke at the owner.
+    Invoke { nu: NeutrinoId, n: u64 },
+}
+
+/// What a protocol message is for (trace-raw 1.6, the owner of its
+/// charges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    /// Nothing.
+    None,
+    /// Task `gid`.
+    Task(u64),
+    /// The program that sent or waits for the message, by its spawn task
+    /// (`None`: a program started with no spawn task, the root program).
+    Program { spawn: Option<u64> },
+    /// The task of invoke call `n` of `src` ([`TaskCall::n`]), before its
+    /// gid exists.
+    Invoke { src: NeutrinoId, n: u64 },
 }
 
 /// One direction of one calendar charge of a flow resource.
