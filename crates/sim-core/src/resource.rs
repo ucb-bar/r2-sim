@@ -457,6 +457,9 @@ pub struct Resources {
     own: Vec<Own>,
     /// Scratch buffer of `reserve_path`.
     plan: Vec<Placed>,
+    /// The (lanes, length) of a compute chunk's narrow option (kept
+    /// across chunks).
+    narrow_plan: Vec<(u32, u64)>,
 }
 
 /// One hop of a transfer chunk, in route order.
@@ -512,6 +515,7 @@ impl Resources {
             merged_dir: Vec::new(),
             own: Vec::new(),
             plan: Vec::new(),
+            narrow_plan: Vec::new(),
         }
     }
 
@@ -681,6 +685,22 @@ impl Resources {
             }
             t = next;
         }
+        // Starting on the free lanes (Section 5.4, decided 2026-10-12): a
+        // chunk that the full lanes delay may start at `earliest` on the
+        // lanes free there and run longer, if it then ends sooner.
+        let mut end = t + big_d;
+        if own_mode && t > earliest {
+            let mut plan = std::mem::take(&mut self.narrow_plan);
+            if let Some((t2, d2)) = self.narrow(merged, own, earliest, &mut plan) {
+                if t2 + d2 < end {
+                    (t, end) = (t2, t2 + d2);
+                    for (o, &(k, c)) in own.iter_mut().zip(&plan) {
+                        (o.lanes, o.charged) = (k, c);
+                    }
+                }
+            }
+            self.narrow_plan = plan;
+        }
         // Step 4.
         for (i, o) in own.iter().enumerate() {
             let f = self.flow_mut(o.resource);
@@ -699,7 +719,7 @@ impl Resources {
             })
             .expect("nonempty")
             .resource;
-        self.flow_mut(culprit).culprit_total += big_d;
+        self.flow_mut(culprit).culprit_total += end - t;
         let queue_culprit = (t > earliest).then(|| {
             let queued = own
                 .iter()
@@ -711,10 +731,72 @@ impl Resources {
         });
         Some(Grant {
             start: t,
-            end: t + big_d,
+            end,
             culprit,
             queue_culprit,
         })
+    }
+
+    /// The narrow option of a compute chunk (Section 5.4, starting on the
+    /// free lanes): on each laned resource k' = the lanes free at
+    /// `earliest` (at least one, at most its full-lane count in `own`); D'
+    /// = the longest of the one-lane resources' own durations and
+    /// `ceil(amount / (k' x lane rate))` on each laned resource; each laned
+    /// resource holds `ceil(amount / (D' x lane rate))` lanes for D', a
+    /// one-lane resource its own duration. Returns the start found by the
+    /// same fixpoint and D', with the (lanes, length) of each resource in
+    /// `plan`; `None` without a laned resource.
+    fn narrow(
+        &self,
+        merged: &[Demand],
+        own: &[Own],
+        earliest: Cycle,
+        plan: &mut Vec<(u32, u64)>,
+    ) -> Option<(Cycle, u64)> {
+        let mut d2 = 0u64;
+        let mut laned = false;
+        for (o, d) in own.iter().zip(merged) {
+            let f = self.flow(o.resource);
+            if f.lanes > 1 {
+                laned = true;
+                let free = f.lanes.saturating_sub(f.used_at(earliest));
+                let k = free.clamp(1, o.lanes.max(1));
+                let lr = f.lane_rate;
+                d2 = d2.max(
+                    (d.amount as u128 * lr.den as u128).div_ceil(k as u128 * lr.num as u128) as u64,
+                );
+            } else {
+                d2 = d2.max(o.dur);
+            }
+        }
+        if !laned || d2 == 0 {
+            return None;
+        }
+        plan.clear();
+        plan.extend(own.iter().zip(merged).map(|(o, d)| {
+            let f = self.flow(o.resource);
+            if f.lanes > 1 {
+                let lr = f.lane_rate;
+                let k = (d.amount as u128 * lr.den as u128).div_ceil(d2 as u128 * lr.num as u128);
+                (k.clamp(1, f.lanes as u128) as u32, d2)
+            } else {
+                (o.lanes, o.charged)
+            }
+        }));
+        let mut t = earliest;
+        loop {
+            let next = own
+                .iter()
+                .zip(plan.iter())
+                .map(|(o, &(k, c))| self.flow(o.resource).earliest(t, c, k))
+                .max()
+                .expect("nonempty");
+            if next == t {
+                break;
+            }
+            t = next;
+        }
+        Some((t, d2))
     }
 
     /// Records one charge per direction with a nonzero amount, when

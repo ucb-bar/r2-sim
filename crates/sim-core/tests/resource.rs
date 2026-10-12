@@ -256,3 +256,61 @@ fn an_array_bound_chunk_leaves_port_lanes_to_a_dma() {
         .unwrap();
     assert_eq!((mm.start, mm.end, mm.culprit), (100, 300, port));
 }
+
+/// An SMEM port of 256 B/cycle in 4 lanes of 64 B, an array of 1 op per
+/// cycle, and a DMA chunk holding `dma_lanes` lanes (64 B/cycle each) of
+/// the port for `dma_cycles` from cycle 0.
+fn port_with_dma(dma_lanes: u64, dma_cycles: u64) -> (Resources, ResourceId, ResourceId) {
+    let mut r = Resources::new();
+    let port = r.add_flow("smem.port", Kind::Bandwidth, Ratio::int(256));
+    r.set_beat(port, 64);
+    let array = r.add_flow("array", Kind::TensorOps, Ratio::ONE);
+    if dma_lanes > 0 {
+        let bytes = dma_lanes * 64 * dma_cycles;
+        let g = r
+            .reserve_path(&[hop(port, bytes, 0)], Ratio::int(dma_lanes * 64), 0)
+            .unwrap();
+        assert_eq!((g.start, g.end), (0, dma_cycles));
+    }
+    (r, port, array)
+}
+
+#[test]
+fn a_delayed_compute_chunk_starts_on_the_free_lanes() {
+    // A port-bound Atlas tile: 41,472 B in 128 array cycles. With every
+    // lane it takes 41472 / 256 = 162 cycles; beside a DMA that holds 2 of
+    // the 4 lanes for 256 cycles it would wait: [256, 418). On the 2 free
+    // lanes it runs at 128 B/cycle, 324 cycles, from 0: it ends sooner.
+    let tile = |array| [Demand::work(array, 128), Demand::read(ResourceId(0), 41472)];
+    let (mut r, port, array) = port_with_dma(2, 256);
+    let mut d = tile(array);
+    d[1].resource = port;
+    let g = r.reserve(&d, 0).unwrap();
+    assert_eq!((g.start, g.end), (0, 324));
+    // It holds the 2 free lanes for 324 cycles: 2 x 256 for the DMA plus 2
+    // x 324.
+    assert_eq!(r.stats()[port.0 as usize].busy_cycles, 2 * 256 + 2 * 324);
+    assert_eq!(g.queue_culprit, None);
+}
+
+#[test]
+fn a_chunk_that_does_not_wait_keeps_every_lane() {
+    let (mut r, port, array) = port_with_dma(0, 0);
+    let g = r
+        .reserve(&[Demand::work(array, 128), Demand::read(port, 41472)], 0)
+        .unwrap();
+    assert_eq!((g.start, g.end, g.culprit), (0, 162, port));
+    assert_eq!(r.stats()[port.0 as usize].busy_cycles, 4 * 162);
+}
+
+#[test]
+fn the_free_lanes_are_refused_when_they_end_later() {
+    // A DMA holds 3 of the 4 lanes for 50 cycles. Full lanes: [50, 212).
+    // On the one free lane: 41472 / 64 = 648 cycles, ending at 648: refused.
+    let (mut r, port, array) = port_with_dma(3, 50);
+    let g = r
+        .reserve(&[Demand::work(array, 128), Demand::read(port, 41472)], 0)
+        .unwrap();
+    assert_eq!((g.start, g.end), (50, 212));
+    assert_eq!(r.stats()[port.0 as usize].busy_cycles, 3 * 50 + 4 * 162);
+}

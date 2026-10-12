@@ -152,17 +152,19 @@ fn one_moe_dispatch() {
     // 1024 cycles each: expert 0's gate [527, 1551) and up [1551, 2575),
     // expert 1's gate [2575, 3599) and up [3599, 4623). Expert 1 on sm2 (2
     // tokens): its gate weight reaches SMEM at 4633; the gate matmul needs
-    // both SMEM lanes and waits for the up weight's DMA, which holds one
-    // lane at 32 B/cycle until 6681: [6681, 7205); up matmul [7205, 7729);
-    // down weight from 7259 (latency 50 after the gate matmul's
-    // completion; its SMEM hop after the up matmul, [7729, 9777)), done
-    // 9781. The vector op is bound by its Muon, so its SMEM demand takes
-    // one of the two lanes and runs beside that DMA, [7743, 7775). Down
-    // matmul (it reads the down weight) 2 x 264 cycles [9781, 10309), done
-    // 10313. Home depends on the down matmul's output directly (a pin, no
-    // end join): Resolve reaches home at 10381; pull [10431, 10483); add
-    // [10497, 10521), done 10525; the driver resumes at 10525.
-    assert_eq!(r.step_end[0], 10525);
+    // both SMEM lanes, but the up weight's DMA holds one lane at 32 B/cycle
+    // until 6681, so the matmul starts on the free lane (Section 5.4,
+    // starting on the free lanes) and takes 2 x 524 cycles: [4637, 5685).
+    // Down weight from 5739 (latency 50 after the gate matmul's
+    // completion), [5739, 8729). The up matmul (after the up weight, 6685)
+    // also runs on one lane beside the down weight's DMA: [6685, 7733).
+    // The vector op is bound by its Muon, so its SMEM demand takes one
+    // lane, [7747, 7779). Down matmul (it reads the down weight) 2 x 264
+    // cycles [8733, 9261), done 9265. Home depends on the down matmul's
+    // output directly (a pin, no end join): Resolve reaches home at 9333;
+    // pull [9383, 9435); add [9449, 9473), done 9477; the driver resumes
+    // at 9477.
+    assert_eq!(r.step_end[0], 9477);
     // 16 Invoke, 2 Await, 2 AwaitAck, 2 Resolve.
     assert_eq!(s.messages, 22);
 }
