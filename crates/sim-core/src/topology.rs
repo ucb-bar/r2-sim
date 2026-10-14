@@ -31,6 +31,7 @@ use std::collections::VecDeque;
 
 use nu_model::NeutrinoId;
 
+use crate::resource::PoolMark;
 use crate::resource::{Dir, ResourceId};
 use crate::time::Cycle;
 
@@ -121,6 +122,9 @@ pub struct FabricLink {
     pub latency: Cycle,
     /// Transaction size, as [`Bus::block`].
     pub block: Option<u64>,
+    /// The in-flight pool of each direction (`ab`, `ba`; Section 5.4,
+    /// rule 7).
+    pub pool: [Option<u32>; 2],
 }
 
 /// One link of a route, rated or unlimited.
@@ -144,6 +148,9 @@ pub struct Hop {
     pub lane: ResourceId,
     /// Cycles from the end of the transmission to the next stage.
     pub latency: Cycle,
+    /// The in-flight pool whose hold ends with this hop: the route crossed
+    /// the pool's link into its node before it (Section 5.4, rule 7).
+    pub pool: Option<PoolMark>,
 }
 
 /// The resources and latency of one route.
@@ -163,6 +170,10 @@ pub struct Path {
     pub links: u32,
     /// The distinct `block_bytes` of the buses and links on the route.
     pub blocks: Vec<u64>,
+    /// A pool whose link the route crosses after its last hop (Section
+    /// 5.4, rule 7): its hold ends with the next hop of the chunk, or the
+    /// chunk's end. `skip` counts the latency after the link.
+    pub pool_after: Option<PoolMark>,
     /// The write channel's resources and hops, when a bus or link of the
     /// route has one; `None`: the read channel's.
     pub write: Option<Box<(Vec<ResourceId>, Vec<Hop>)>>,
@@ -175,12 +186,33 @@ pub fn grid_run(a: u64, blocks: &[u64]) -> u64 {
 }
 
 impl Path {
-    /// Appends a hop of `lane` (none: unlimited) and `latency`.
-    fn push_hop(&mut self, lane: Option<ResourceId>, latency: Cycle) {
-        match (lane, self.hops.last_mut()) {
-            (Some(lane), _) => self.hops.push(Hop { lane, latency }),
-            (None, Some(h)) => h.latency += latency,
-            (None, None) => self.lead += latency,
+    /// Appends a hop of `lane` (none: unlimited) and `latency`. `pool`:
+    /// the hop is a link that enters the node of that pool. A pool crossed
+    /// on an unlimited hop marks the next hop with a lane (`pool_after`
+    /// until then).
+    fn push_hop(&mut self, lane: Option<ResourceId>, latency: Cycle, pool: Option<u32>) {
+        let mark = pool.map(|p| PoolMark { pool: p, skip: 0 });
+        match lane {
+            Some(lane) => {
+                let pool = mark.or(self.pool_after.take());
+                self.hops.push(Hop {
+                    lane,
+                    latency,
+                    pool,
+                });
+            }
+            None => {
+                if let Some(m) = &mut self.pool_after {
+                    m.skip += latency;
+                }
+                if let Some(m) = mark {
+                    self.pool_after = Some(PoolMark { skip: latency, ..m });
+                }
+                match self.hops.last_mut() {
+                    Some(h) => h.latency += latency,
+                    None => self.lead += latency,
+                }
+            }
         }
     }
 
@@ -231,6 +263,7 @@ static EMPTY: Path = Path {
     lead: 0,
     links: 0,
     blocks: Vec::new(),
+    pool_after: None,
     write: None,
 };
 
@@ -293,7 +326,15 @@ impl Topology {
             ba_wr: None,
             latency,
             block: None,
+            pool: [None, None],
         });
+    }
+
+    /// Gives link `link` the in-flight pool `pool` for data moving from
+    /// `a` to `b` (`ab`) or from `b` to `a`.
+    pub(crate) fn set_link_pool(&mut self, link: usize, ab: bool, pool: u32) {
+        self.finished = false;
+        self.links[link].pool[usize::from(!ab)] = Some(pool);
     }
 
     pub(crate) fn set_link_wr(&mut self, link: usize, ab: Lane, ba: Lane) {
@@ -399,7 +440,13 @@ impl Topology {
     /// over the bus-level `route`, in route order, with its lane, its
     /// write lane (the lane without a write channel) and the latency after
     /// it.
-    fn walk(&self, s: usize, d: usize, route: &[Step], mut f: impl FnMut(Link, Lane, Lane, Cycle)) {
+    fn walk(
+        &self,
+        s: usize,
+        d: usize,
+        route: &[Step],
+        mut f: impl FnMut(Link, Lane, Lane, Cycle, Option<u32>),
+    ) {
         for (i, &(bus, via)) in route.iter().enumerate() {
             // Where the transfer enters and leaves this bus.
             let entry = match via {
@@ -411,7 +458,14 @@ impl Topology {
                     } else {
                         (b.ba, b.ba_wr)
                     };
-                    f(Link::Fabric(br as u32, fwd), lane, wr.or(lane), b.latency);
+                    let pool = b.pool[usize::from(!fwd)];
+                    f(
+                        Link::Fabric(br as u32, fwd),
+                        lane,
+                        wr.or(lane),
+                        b.latency,
+                        pool,
+                    );
                     (if fwd { b.att_b } else { b.att_a }).0 as usize
                 }
             };
@@ -432,12 +486,14 @@ impl Topology {
                         i.ingress,
                         i.ingress_wr.or(i.ingress),
                         0,
+                        None,
                     );
                     f(
                         Link::Out(AttachId(exit as u32)),
                         o.egress,
                         o.egress_wr.or(o.egress),
                         b.latency,
+                        None,
                     );
                 }
                 BusTopology::Shared => f(
@@ -445,6 +501,7 @@ impl Topology {
                     b.lane,
                     b.lane_wr.or(b.lane),
                     b.latency,
+                    None,
                 ),
             }
         }
@@ -458,7 +515,7 @@ impl Topology {
         let nb = self.buses.len();
         let mut out = Vec::new();
         if let Some(route) = &self.steps[sb as usize * nb + db as usize] {
-            self.walk(a.0 as usize, b.0 as usize, route, |l, lane, _, _| {
+            self.walk(a.0 as usize, b.0 as usize, route, |l, lane, _, _, _| {
                 out.push((l, lane))
             });
         }
@@ -473,12 +530,12 @@ impl Topology {
             ..Path::default()
         };
         let mut wr = Path::default();
-        self.walk(s, d, route, |_, lane, lane_wr, latency| {
+        self.walk(s, d, route, |_, lane, lane_wr, latency, pool| {
             p.resources.extend(lane);
-            p.push_hop(lane, latency);
+            p.push_hop(lane, latency, pool);
             p.latency += latency;
             wr.resources.extend(lane_wr);
-            wr.push_hop(lane_wr, latency);
+            wr.push_hop(lane_wr, latency, pool);
         });
         if wr.resources != p.resources {
             p.write = Some(Box::new((wr.resources, wr.hops)));

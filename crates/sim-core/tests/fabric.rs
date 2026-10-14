@@ -575,9 +575,9 @@ fn two_transfers(dma: &str) -> (u64, u64) {
 
 #[test]
 fn small_bursts_interleave_two_transfers_on_a_shared_bridge() {
-    // The bridge is the slow hop: 128 B/cycle in two 64 B lanes; HBM and
+    // The bridge is the slow hop: 128 B/cycle in two 64 B slots; HBM and
     // SMEM (1024 B/cycle) are not. With a 128 B engine beat a transfer
-    // holds both bridge lanes, and 4 KiB takes 32 cycles on it. As one 4
+    // holds both bridge slots, and 4 KiB takes 32 cycles on it. As one 4
     // KiB chunk each, the two transfers hold the bridge back to back: [0,
     // 32) and [32, 64).
     assert_eq!(two_transfers("beat_bytes: 128, outstanding: 1"), (32, 64));
@@ -597,7 +597,7 @@ fn small_bursts_interleave_two_transfers_on_a_shared_bridge() {
     );
     assert_eq!(two_transfers("beat_bytes: 128, burst_bytes: 512"), (60, 64));
     // With the default 64 B engine beat a transfer moves 64 B/cycle on one
-    // of the two bridge lanes: the transfers run side by side, 4096 / 64 =
+    // of the two bridge slots: the transfers run side by side, 4096 / 64 =
     // 64 cycles each.
     assert_eq!(two_transfers("outstanding: 1"), (64, 64));
 }
@@ -742,4 +742,58 @@ device:
         ),
         None
     );
+}
+
+#[test]
+fn a_clock_key_scales_the_slots_of_its_element() {
+    // configs/2p.yaml with clocks on an SMEM, a crossbar, a link and an
+    // Atlas (architecture Section 8.2): slots per core cycle are
+    // `bw_bytes / beat_bytes x clock`, and `clock` for a compute unit.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
+    let build = |sets: &[&str]| build_config_file(&path, sets, ProfileRegistry::with_builtins());
+    let b = build(&[
+        "root.gpc0.sm1.smem.clock=7/8",
+        "root.gpc0.clsbus.clock=2",
+        "root.gpc0.sm1.smsbus_to_clsbus.clock=1/2",
+        "root.gpc0.sm1.atlas.clock=3",
+    ])
+    .expect("clocks");
+    let res = b.sim.resources();
+    let cap = |name: &str| {
+        res.flow(res.by_name(name).unwrap_or_else(|| panic!("{name}")))
+            .capacity()
+    };
+    // Bank 0: 128 B/cycle in 64 B beats at 7/8.
+    assert_eq!(
+        cap("root.gpc0.sm1.smem.b0.port"),
+        sim_core::Ratio::new(7, 4)
+    );
+    assert_eq!(
+        cap("root.gpc0.sm1.smem.b0.wport"),
+        sim_core::Ratio::new(7, 4)
+    );
+    assert_eq!(cap("root.gpc0.sm0.smem.b0.port"), sim_core::Ratio::int(2));
+    // The gpc crossbar's ports (512 B/cycle in 64 B beats) at 2.
+    assert_eq!(
+        cap("root.gpc0.clsbus.sm1.smsbus_to_clsbus.in"),
+        sim_core::Ratio::int(16)
+    );
+    // sm1's data link (128 B/cycle) at 1/2, both directions.
+    assert_eq!(
+        cap("root.gpc0.sm1.smsbus_to_clsbus.ab"),
+        sim_core::Ratio::int(1)
+    );
+    assert_eq!(
+        cap("root.gpc0.sm1.smsbus_to_clsbus.ba"),
+        sim_core::Ratio::int(1)
+    );
+    // An Atlas at 3: three slots, its rate per own cycle unchanged.
+    assert_eq!(cap("root.gpc0.sm1.atlas.array"), sim_core::Ratio::int(3));
+    assert_eq!(cap("root.gpc0.sm0.atlas.array"), sim_core::Ratio::int(1));
+    // A clock is a positive integer or "p/q".
+    for bad in ["0", "1.5", "a/b", "0/3", "3/0", "-1"] {
+        let set = format!("root.gpc0.sm1.smem.clock={bad}");
+        let e = build(&[set.as_str()]).err().expect(bad).0;
+        assert!(e.contains("clock must be a positive integer"), "{bad}: {e}");
+    }
 }

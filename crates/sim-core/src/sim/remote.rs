@@ -536,13 +536,15 @@ impl Sim {
                 };
                 // A message is a write toward its receiver.
                 let rate = self.msgs[id as usize].as_ref().expect("message").rate;
-                let hop_path = [crate::resource::PathHop {
+                let hop_path = crate::resource::PathHop {
                     resource: hop.lane,
                     amount: bytes,
                     dir: crate::resource::Dir::Write,
                     latency: 0,
-                }];
-                let end = self.reserve_path(&hop_path, rate, earliest, who).end;
+                    pool: None,
+                };
+                let beat = rate.num / rate.den;
+                let end = self.reserve_message(hop_path, beat, earliest, who).end;
                 self.close_outbound(s, id, end);
                 self.msgs[id as usize].as_mut().expect("message").next += 1;
                 self.queue.push(end, Event::StageFree { stage: s });

@@ -96,6 +96,7 @@ fn main() {
                     burst: None,
                     // Wide enough not to narrow the paths.
                     beat: 1024,
+                    clock: sim_core::Ratio::ONE,
                 },
             },
         );
@@ -106,6 +107,8 @@ fn main() {
                 max_inflight: 1,
                 max_outstanding: 1,
                 params: PeParams::Atlas {
+                    // Wide enough not to narrow the ports.
+                    beat: 1024,
                     masters: Vec::new(),
                     rates: Vec::new(),
                     row_panel: false,

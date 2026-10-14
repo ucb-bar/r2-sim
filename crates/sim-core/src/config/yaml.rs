@@ -491,6 +491,11 @@ struct BusSec {
     /// Beat of the bus's ports or shared lane, or of a link's two
     /// directions (default 64).
     beat_bytes: Option<Num>,
+    /// Clock ratio to the core clock: an integer or "p/q" (default 1).
+    clock: Option<Num>,
+    /// A data link's pool for the data in flight into its node (Section
+    /// 5.4, data-path rule 7), in bytes.
+    inflight_bytes: Option<Num>,
     /// Transaction size: transfers through it are cut at its multiples.
     block_bytes: Option<Num>,
     /// The rate of a separate write channel (data buses and links with
@@ -546,6 +551,8 @@ struct MemSec {
     master: Option<String>,
     /// Beat of the port (default 64).
     beat_bytes: Option<Num>,
+    /// Clock ratio of the ports to the core clock (default 1).
+    clock: Option<Num>,
     /// Transaction size of the port: transfers are cut at its multiples.
     block_bytes: Option<Num>,
     /// Rate of a separate write port; without it the port serves both
@@ -566,6 +573,7 @@ struct BankSec {
     wr_bytes: Option<Num>,
     latency: Option<u64>,
     beat_bytes: Option<Num>,
+    clock: Option<Num>,
     block_bytes: Option<Num>,
 }
 
@@ -646,8 +654,11 @@ struct CompSec {
     /// tile).
     burst_bytes: Option<Num>,
     /// Data width as a master (default 64): a DMA engine moves at most
-    /// one beat per cycle.
+    /// one beat per cycle, an Atlas or a Muon reads its local memory in
+    /// beats of this size (or of the port's, if smaller).
     beat_bytes: Option<Num>,
+    /// Clock ratio to the core clock (default 1).
+    clock: Option<Num>,
     overhead: Option<u64>,
     utilization: Option<Num>,
     latency: Option<u64>,
@@ -1311,8 +1322,10 @@ impl Builder {
             // The write channel of each direction, after the read channel.
             let ab_wr = r.lane(&format!("{lpath}.ab.wr"), wr);
             let ba_wr = r.lane(&format!("{lpath}.ba.wr"), wr);
+            let clock = clock_of(&b.clock, &lpath)?;
             for l in [ab, ba, ab_wr, ba_wr].into_iter().flatten() {
                 r.resources_mut().set_beat(l, beat);
+                r.resources_mut().set_clock(l, clock);
             }
             let ends = (resolve(from, &path, ppath)?, resolve(to, &path, ppath)?);
             links.push((b, lpath, ends, (ab, ba), (ab_wr, ba_wr), rate, beat));
@@ -1363,6 +1376,9 @@ impl Builder {
             if b.from.is_some() || b.to.is_some() {
                 return err(format!("{name}: from and to are link keys"));
             }
+            if b.inflight_bytes.is_some() {
+                return err(format!("{name}: inflight_bytes is a key of a data link"));
+            }
             let topology = match b.topology.as_deref().unwrap_or("xbar") {
                 "xbar" => BusTopology::Xbar,
                 "bus" => BusTopology::Shared,
@@ -1378,6 +1394,7 @@ impl Builder {
             );
             let beat = beat_of(&b.beat_bytes, &name)?;
             self.built.sim.set_bus_beat(id, beat);
+            self.built.sim.set_bus_clock(id, clock_of(&b.clock, &name)?);
             if let Some(wr) = wr_of(b, &name)? {
                 self.built.sim.set_bus_wr(id, wr);
             }
@@ -1467,6 +1484,33 @@ impl Builder {
             if let Some(blk) = block_of(&b.block_bytes, &lpath)? {
                 self.built.sim.set_link_block(index, blk);
             }
+            if let Some(n) = &b.inflight_bytes {
+                let bytes = match n {
+                    Num::Int(k) if *k > 0 => *k,
+                    _ => {
+                        return err(format!(
+                            "{lpath}: inflight_bytes must be a positive integer"
+                        ))
+                    }
+                };
+                if b.control {
+                    return err(format!("{lpath}: inflight_bytes on a control link"));
+                }
+                // The direction into the declaring node: toward the end on
+                // one of its own buses (`from` is the link's `a` bus).
+                let ab = match (bus_node(&from) == path, bus_node(&to) == path) {
+                    (true, false) => false,
+                    (false, true) => true,
+                    _ => {
+                        return err(format!(
+                            "{lpath}: inflight_bytes needs a link with one end in its node"
+                        ))
+                    }
+                };
+                self.built
+                    .sim
+                    .set_link_pool(index, ab, &format!("{lpath}.inflight"), bytes);
+            }
             if ab_wr.is_some() {
                 self.built.sim.set_link_wr(index, ab_wr, ba_wr);
             }
@@ -1514,7 +1558,8 @@ impl Builder {
             let Some(bw) = &m.bw_bytes else {
                 return err(format!("{name}: needs bw_bytes"));
             };
-            let (port, wport) = self.ports(&name, bw, m.wr_bytes.as_ref(), &m.beat_bytes)?;
+            let (port, wport) =
+                self.ports(&name, bw, m.wr_bytes.as_ref(), &m.beat_bytes, &m.clock)?;
             let Some(slave) = &m.slave else {
                 return err(format!("{name}: needs slave"));
             };
@@ -1638,15 +1683,19 @@ impl Builder {
         bw: &Num,
         wr: Option<&Num>,
         beat: &Option<Num>,
+        clock: &Option<Num>,
     ) -> Result<(ResourceId, Option<ResourceId>), ConfigError> {
         let beat = beat_of(beat, name)?;
+        let clock = clock_of(clock, name)?;
         let r = self.built.sim.resources_mut();
         let port = r.add_flow(&format!("{name}.port"), Kind::Bandwidth, bw.rate()?);
         r.set_beat(port, beat);
+        r.set_clock(port, clock);
         let wport = match wr {
             Some(w) => {
                 let id = r.add_flow(&format!("{name}.wport"), Kind::Bandwidth, w.rate()?);
                 r.set_beat(id, beat);
+                r.set_clock(id, clock);
                 Some(id)
             }
             None => None,
@@ -1709,7 +1758,13 @@ impl Builder {
             let pick = |own: &Option<Num>, all: &Option<Num>| -> Option<Num> {
                 own.clone().or_else(|| all.clone())
             };
-            let (port, wport) = self.ports(&bname, bw, wr, &pick(&o.beat_bytes, &m.beat_bytes))?;
+            let (port, wport) = self.ports(
+                &bname,
+                bw,
+                wr,
+                &pick(&o.beat_bytes, &m.beat_bytes),
+                &pick(&o.clock, &m.clock),
+            )?;
             if m.kind == "scratch" {
                 for sl in &slaves {
                     self.scratch_ports.push((bname.clone(), sl.clone(), port));
@@ -1794,6 +1849,7 @@ impl Builder {
                 atts.push(id);
             }
             let utilization = || opt_rate(&c.utilization).map(|u| u.unwrap_or(Ratio::ONE));
+            let clock = clock_of(&c.clock, &name)?;
             if c.burst_bytes.is_some() && c.kind != "dma" {
                 return err(format!("{name}: burst_bytes is a dma key"));
             }
@@ -1823,6 +1879,7 @@ impl Builder {
                         Kind::TensorOps,
                         max,
                     );
+                    self.built.sim.resources_mut().set_clock(array, clock);
                     let smem_port = self.smem_port(&name, &masters)?;
                     let smem_wport = self
                         .mems
@@ -1840,6 +1897,7 @@ impl Builder {
                         r => return err(format!("{name}: operand_reuse {r:?}")),
                     };
                     PeParams::Atlas {
+                        beat: beat_of(&c.beat_bytes, &name)?,
                         quantize,
                         row_panel,
                         acc_buffer: c
@@ -1865,7 +1923,9 @@ impl Builder {
                         Kind::VectorOps,
                         ops.rate()?,
                     );
+                    self.built.sim.resources_mut().set_clock(vector, clock);
                     PeParams::Muon {
+                        beat: beat_of(&c.beat_bytes, &name)?,
                         vector,
                         masters: atts,
                         utilization: utilization()?,
@@ -1877,6 +1937,7 @@ impl Builder {
                     latency: c.latency.unwrap_or(0),
                     masters: atts,
                     beat: beat_of(&c.beat_bytes, &name)?,
+                    clock,
                     burst: match &c.burst_bytes {
                         None => None,
                         Some(b) => match b.bytes()? {
@@ -1933,6 +1994,30 @@ fn attach_name(link: &str, bus: &str) -> String {
 /// The default beat of a bus, link, memory port, compute element or
 /// Neutrino (Section 5.4, data-path rule 3).
 const DEFAULT_BEAT: u64 = 64;
+
+/// The `clock` key of `what` (Section 4.1): a positive integer or "p/q",
+/// default 1.
+fn clock_of(n: &Option<Num>, what: &str) -> Result<Ratio, ConfigError> {
+    let bad = || {
+        err(format!(
+            "{what}: clock must be a positive integer or \"p/q\""
+        ))
+    };
+    match n {
+        None => Ok(Ratio::ONE),
+        Some(Num::Int(0)) | Some(Num::Float(_)) => bad(),
+        Some(Num::Int(k)) => Ok(Ratio::int(*k)),
+        Some(Num::Str(s)) => {
+            let Some((p, q)) = s.trim().split_once('/') else {
+                return bad();
+            };
+            match (p.trim().parse::<u64>(), q.trim().parse::<u64>()) {
+                (Ok(p), Ok(q)) if p > 0 && q > 0 => Ok(Ratio::new(p, q)),
+                _ => bad(),
+            }
+        }
+    }
+}
 
 /// `beat_bytes` of `what`, or the default.
 fn beat_of(b: &Option<Num>, what: &str) -> Result<u64, ConfigError> {

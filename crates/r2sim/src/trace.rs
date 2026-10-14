@@ -139,10 +139,10 @@ pub fn write(o: &Opts, names: &Names, stats: &Stats, phases: &[Phase]) -> std::i
             }
         }
         let Some(log) = &r.log else { continue };
-        // Per bin: busy lane-cycles over the resource's lanes, and their
-        // read, write and work parts (an interval's lane-cycles spread
+        // Per bin: busy slot-cycles over the resource's slots, and their
+        // read, write and work parts (an interval's slot-cycles spread
         // evenly over it).
-        let lanes = r.lanes.max(1) as f64;
+        let slots = r.slots.max(1e-9);
         let mut bins: BTreeMap<u64, (f64, [f64; 3])> = BTreeMap::new();
         for x in log {
             let len = (x.end - x.start).max(1) as f64;
@@ -152,10 +152,10 @@ pub fn write(o: &Opts, names: &Names, stats: &Stats, phases: &[Phase]) -> std::i
                 let b = t / bin * bin;
                 let end = (b + bin).min(e);
                 let entry = bins.entry(b).or_default();
-                let frac = (end - t) as f64 / len / lanes;
+                let frac = (end - t) as f64 / len / slots;
                 for (k, part) in x.dir.iter().enumerate() {
-                    entry.1[k] += *part as f64 * frac;
-                    entry.0 += *part as f64 * frac;
+                    entry.1[k] += part * frac;
+                    entry.0 += part * frac;
                 }
                 t = end;
             }

@@ -164,11 +164,7 @@ struct PhaseStats {
 }
 
 fn phase_stats(stats: &Stats) -> Vec<PhaseStats> {
-    let lanes: Vec<f64> = stats
-        .resources
-        .iter()
-        .map(|r| r.lanes.max(1) as f64)
-        .collect();
+    let slots: Vec<f64> = stats.resources.iter().map(|r| r.slots.max(1e-9)).collect();
     let names: Vec<&str> = stats.resources.iter().map(|r| r.name.as_str()).collect();
     let top = |v: Vec<(usize, f64)>| -> Vec<(String, f64)> {
         let mut v: Vec<(usize, f64)> = v.into_iter().filter(|x| x.1 > 0.0).collect();
@@ -202,7 +198,7 @@ fn phase_stats(stats: &Stats) -> Vec<PhaseStats> {
             let busiest = top(d
                 .iter()
                 .enumerate()
-                .map(|(i, x)| (i, x[0] as f64 / (len * lanes[i])))
+                .map(|(i, x)| (i, x[0] as f64 / (len * slots[i])))
                 .collect());
             PhaseStats {
                 name: b.name.clone(),
@@ -231,9 +227,20 @@ struct Spread {
 struct ResourceOut {
     name: String,
     kind: String,
-    /// Lanes (Section 5.4); `busy_cycles` counts lane-cycles.
-    lanes: u32,
+    /// Slots per core cycle (Section 5.2); `busy_cycles` counts
+    /// slot-cycles, rounded.
+    slots: f64,
     busy_cycles: u64,
+    busy_slot_cycles: f64,
+    /// Bytes charged, and their share of `rate x end`.
+    bytes: u64,
+    byte_utilization: f64,
+    /// Occupancy resources: the size and the peak; an in-flight pool also
+    /// its mean occupancy (held byte-cycles over the end time) and, in
+    /// `delay_cycles`, the cycles chunks waited for it.
+    size: u64,
+    peak: u64,
+    mean_occupancy: f64,
     /// `busy_cycles` by direction (they sum to it).
     busy_read: u64,
     busy_write: u64,
@@ -648,12 +655,18 @@ fn resource_outs(stats: &Stats) -> Vec<ResourceOut> {
         .map(|r| ResourceOut {
             name: r.name.clone(),
             kind: format!("{:?}", r.kind),
-            lanes: r.lanes,
+            slots: r.slots,
             busy_cycles: r.busy_cycles,
+            busy_slot_cycles: r.busy_slot_cycles,
+            bytes: r.bytes,
+            byte_utilization: r.bytes as f64 / (end as f64 * r.rate.max(1e-9)),
+            size: r.size,
+            peak: r.peak,
+            mean_occupancy: r.held_cycles / end as f64,
             busy_read: r.busy_read,
             busy_write: r.busy_write,
             busy_work: r.busy_work,
-            utilization: r.busy_cycles as f64 / (end as f64 * r.lanes.max(1) as f64),
+            utilization: r.busy_slot_cycles / (end as f64 * r.slots.max(1e-9)),
             culprit_cycles: r.culprit_cycles,
             culprit_share: r.culprit_cycles as f64 / total_culprit.max(1) as f64,
             delay_cycles: r.delay_cycles,

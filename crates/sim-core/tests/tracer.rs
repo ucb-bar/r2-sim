@@ -59,7 +59,7 @@ struct Seen {
     invokes: Vec<(u64, NeutrinoId, TaskCall, Cycle)>,
     retires: usize,
     /// Cycles per resource from the charges.
-    cycles: Vec<u64>,
+    cycles: Vec<f64>,
     message_charges: usize,
     /// Opened remote requests: (requester, request, gid).
     remote: Vec<(NeutrinoId, u32, u64)>,
@@ -75,7 +75,7 @@ struct Recorder(Rc<RefCell<Seen>>);
 
 impl Tracer for Recorder {
     fn begin(&mut self, sim: &Sim) {
-        self.0.borrow_mut().cycles = vec![0; sim.resources().len()];
+        self.0.borrow_mut().cycles = vec![0.0; sim.resources().len()];
     }
     fn task_invoke(&mut self, t: &TaskEntered) {
         let e = (t.gid, t.nu, t.call, t.time);
@@ -124,10 +124,15 @@ fn both(setup: impl Fn() -> Sim) -> (Stats, Stats, Seen) {
     (plain, traced, seen)
 }
 
-/// The charges add up to each flow resource's busy cycles.
+/// The charges add up to each flow resource's busy slot-cycles.
 fn check_cycles(s: &Stats, seen: &Seen) {
     for (i, r) in s.resources.iter().enumerate() {
-        assert_eq!(seen.cycles[i], r.busy_cycles, "resource {}", r.name);
+        let (got, want) = (seen.cycles[i], r.busy_slot_cycles);
+        assert!(
+            (got - want).abs() <= 1e-6 * want.max(1.0),
+            "resource {}: {got} vs {want}",
+            r.name
+        );
     }
 }
 
@@ -223,7 +228,7 @@ fn two_gpc_run() -> Sim {
 fn a_traced_two_gpc_run_ends_at_the_untraced_cycle() {
     let (plain, traced, seen) = both(two_gpc_run);
     assert_eq!(plain.fatal, None);
-    assert_eq!((plain.end_time, traced.end_time), (377, 377));
+    assert_eq!((plain.end_time, traced.end_time), (375, 375));
     assert_eq!(plain.events, traced.events);
     let b = built("two_gpc.yaml");
     let (root, g0, g1) = (b.nu("root"), b.nu("root.gpc0"), b.nu("root.gpc1"));
@@ -238,7 +243,7 @@ fn a_traced_two_gpc_run_ends_at_the_untraced_cycle() {
     );
     let mut r = seen.returns.clone();
     r.sort_by_key(|x| x.1);
-    assert_eq!(r, vec![(g1, 291), (g0, 348), (root, 377)]);
+    assert_eq!(r, vec![(g1, 290), (g0, 346), (root, 375)]);
     assert_eq!(seen.invokes.len(), 3);
     assert_eq!(seen.retires, 3);
     check_cycles(&traced, &seen);

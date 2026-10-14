@@ -131,23 +131,29 @@ fn trace_raw_writes_whole_records_that_match_the_stats() {
         let z = std::fs::File::open(packed.join(format!("{stem}.bin.zst"))).unwrap();
         assert_eq!(zstd::decode_all(z).unwrap(), data, "{stem} compressed");
     }
-    // Every task has a record; per rated resource the charge cycles sum to
-    // its busy cycles.
+    // Every task has a record; per rated resource the charges' slot-cycles
+    // (usage / 65536 x span, trace-raw 1.7) match its busy slot-cycles
+    // within the rounding of each record's usage (span / 65536).
     assert_eq!(summary["counts"]["tasks"], j["tasks"]);
     let charges = std::fs::read(plain.join("charges.bin")).unwrap();
-    let mut cycles: std::collections::HashMap<u16, u64> = Default::default();
+    let mut sc: std::collections::HashMap<u16, (f64, f64)> = Default::default();
     for c in charges.chunks(32) {
         let r = u16::from_le_bytes([c[28], c[29]]);
-        *cycles.entry(r).or_default() += u32::from_le_bytes([c[20], c[21], c[22], c[23]]) as u64;
+        let span = u32::from_le_bytes([c[16], c[17], c[18], c[19]]) as f64;
+        let usage = u32::from_le_bytes([c[20], c[21], c[22], c[23]]) as f64;
+        let e = sc.entry(r).or_default();
+        e.0 += usage / 65536.0 * span;
+        e.1 += span / 65536.0;
     }
     let res = manifest["resources"].as_array().unwrap();
     for r in j["resources"].as_array().unwrap() {
         let m = res.iter().find(|m| m["name"] == r["name"]).unwrap();
         let id = m["id"].as_u64().unwrap() as u16;
-        assert_eq!(
-            cycles.get(&id).copied().unwrap_or(0),
-            r["busy_cycles"].as_u64().unwrap(),
-            "{}",
+        let (got, tol) = sc.get(&id).copied().unwrap_or((0.0, 0.0));
+        let want = r["busy_slot_cycles"].as_f64().unwrap();
+        assert!(
+            (got - want).abs() <= tol + 1e-6,
+            "{}: {got} vs {want}",
             r["name"]
         );
     }
@@ -246,9 +252,8 @@ fn trace_out_writes_consistent_files() {
         *sum.entry(f[0].to_string()).or_default() += f[4].parse::<f64>().unwrap() * 1000.0;
     }
     for r in j["resources"].as_array().unwrap() {
-        // Busy lane-cycles over the resource's lanes.
-        let busy =
-            r["busy_cycles"].as_u64().unwrap() as f64 / r["lanes"].as_u64().unwrap().max(1) as f64;
+        // Busy slot-cycles over the resource's slots.
+        let busy = r["busy_slot_cycles"].as_f64().unwrap() / r["slots"].as_f64().unwrap().max(1e-9);
         let got = sum.get(r["name"].as_str().unwrap()).copied().unwrap_or(0.0);
         assert!(
             (got - busy).abs() <= 1.0 + busy * 1e-3,

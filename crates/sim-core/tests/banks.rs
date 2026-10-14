@@ -239,18 +239,18 @@ fn a_dma_chunk_stops_at_a_block_boundary() {
 #[test]
 fn a_dma_through_a_hash_link_moves_one_granule_per_chunk() {
     // 4 KiB into the linear range: 8 chunks of 512 B, two per bank, each on
-    // the bank's write port (32 B/cycle: 2 x 16 cycles); the read ports
-    // stay idle.
+    // the bank's write port (32 B/cycle in 64 B beats: half a slot, 2 x 16
+    // cycles, 16 slot-cycles); the read ports stay idle.
     let b = hashed(&[]);
     let smem = b.memory("root.sm0.smem").base;
     let s = dma(b, "root", smem, 0x1000, 4096);
     assert_eq!(s.tasks[0].chunks.len(), 8);
     for i in 0..4 {
-        assert_eq!(busy(&s, &format!("root.hbm.b{i}.wport")), 32);
+        assert_eq!(busy(&s, &format!("root.hbm.b{i}.wport")), 16);
         assert_eq!(busy(&s, &format!("root.hbm.b{i}.port")), 0);
     }
     // Reads use the read ports: 1 KiB per bank at 64 B/cycle, 16 cycles;
-    // on b2 at 128 B/cycle in two 64 B lanes, 8 cycles x 2 lanes.
+    // on b2 at 128 B/cycle in two 64 B slots, 8 cycles x 2 slots.
     let b = hashed(&[]);
     let smem = b.memory("root.sm0.smem").base;
     let s = dma(b, "root.sm0", 0x1000, smem, 4096);
@@ -274,8 +274,10 @@ fn a_store_through_a_hash_link_is_one_piece_per_granule() {
     });
     let s = sim.run();
     assert_eq!(s.fatal, None);
+    // 512 B per bank on its half-slot write port: 16 cycles, 8
+    // slot-cycles.
     for i in 0..4 {
-        assert_eq!(busy(&s, &format!("root.hbm.b{i}.wport")), 16);
+        assert_eq!(busy(&s, &format!("root.hbm.b{i}.wport")), 8);
     }
 }
 

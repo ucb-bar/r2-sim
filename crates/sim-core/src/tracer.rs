@@ -178,7 +178,7 @@ pub enum Owner {
 }
 
 /// One direction of one calendar charge of a flow resource.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Charge {
     pub resource: ResourceId,
     pub dir: Dir,
@@ -188,8 +188,15 @@ pub struct Charge {
     pub start: Cycle,
     /// Cycles of the whole charge.
     pub span: Cycle,
-    /// Cycles of this direction; the directions of a charge sum to `span`.
-    pub cycles: Cycle,
+    /// Slots this direction holds over `span`, in
+    /// [`crate::resource::SCALE`] units; the directions of a charge sum to
+    /// its usage.
+    pub usage: u64,
+    /// Slot-cycles of this direction.
+    pub cycles: f64,
+    /// The rate class the charge ran at, on a resource whose rate depends
+    /// on the operand type (see [`crate::resource::Demand::class`]).
+    pub class: Option<u8>,
 }
 
 /// A part of a chunk that moves bytes over a fabric route: from attachment
@@ -503,9 +510,9 @@ impl Tracer for Collector {
         let end = c.start + c.span;
         let k = c.dir as usize;
         match log.last_mut() {
-            Some(e) if e.start == c.start && e.end == end && e.dir[k] == 0 => e.dir[k] = c.cycles,
+            Some(e) if e.start == c.start && e.end == end && e.dir[k] == 0.0 => e.dir[k] = c.cycles,
             _ => {
-                let mut dir = [0; 3];
+                let mut dir = [0.0; 3];
                 dir[k] = c.cycles;
                 log.push(LogEntry {
                     start: c.start,

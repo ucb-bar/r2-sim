@@ -157,10 +157,12 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
     // rtx6000-half.yaml: sm0 of gpc0 copies 4 MiB from the linear GDDR7
     // range into its smem in 64 KiB transfers, two buffers in turn. Each
     // chunk is one 256 B granule (the channel stripe), so the transfers
-    // touch all 32 channels and no L2 slice. A chunk runs at its channel's
-    // 9.5 B/cycle and takes one of the SM link's three lanes, so three
-    // overlap: 28.5 B/cycle, 4 MiB in 147,169 cycles plus a pipeline fill
-    // (the engine's 490 cycles and the links) per pair of transfers.
+    // touch all 32 channels and no L2 slice. A channel moves 2 B per DRAM
+    // cycle at clock 51/10 (10.2 B/cycle) in 32 B beats, and consecutive
+    // chunks go to different channels, so the SM link (32 B/cycle) is the
+    // bound: 4 MiB in at least 131,072 cycles, plus a pipeline fill (the
+    // GDDR7's 142 cycles, the engine's 289 and the links' 81: 512) per
+    // transfer, partly overlapped by the other transfer in flight.
     let b = config("rtx6000-half.yaml");
     let sm = b.nu("root.gpc0.sm0");
     let (hbm, smem) = (
@@ -219,11 +221,12 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
     );
     assert_eq!(chunks, (4 << 20) / 256);
     assert_eq!((channels, slices), (32, 0));
-    // The two transfers in flight interleave chunk by chunk and end
-    // together, so each of the 32 pairs starts on a pipeline that is partly
-    // empty (156,019 cycles measured 2026-10-12, at most 32 fills of 560).
+    // The two transfers in flight interleave chunk by chunk, so each
+    // transfer starts on a pipeline that is partly empty (152,078 cycles
+    // measured 2026-10-14 with the physical configuration, without the
+    // backward pass; at most one fill of 512 per transfer).
     assert!(
-        s.end_time >= 147_169 && s.end_time <= 147_169 + 32 * 560,
+        s.end_time >= 131_072 && s.end_time <= 131_072 + 64 * 512,
         "{}",
         s.end_time
     );

@@ -243,7 +243,7 @@ pub struct LoadRec {
 }
 
 /// The outputs of one run; `r2sim --stats` serializes them into JSON.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Stats {
     /// Resource totals at program marks, when on.
     pub marks: Vec<Mark>,

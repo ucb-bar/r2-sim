@@ -1,39 +1,39 @@
 # One SM of the RTX PRO 6000 Blackwell (GB202) reference configuration
-# (architecture Section 8.3). Numbers are per SM clock cycle at the boost
-# clock of 2617 MHz (global.clock_ghz in rtx6000.yaml).
+# (architecture Section 8.3). One cycle is an SM cycle; the card's numbers
+# are from microbenchmarks with the clocks locked by NCU at the boost point
+# (SM 2.61 GHz, L2 2.29 GHz; r2-sim scratch/corr/ubench suite8, 2026-10-14).
+# Every value is a hardware number or the result of a test that isolates
+# it; none is set to make another test match.
 #
-# * Link to the gpc crossbar: 32 B/cycle per direction (measured 2026-10-12:
-#   one SM reaches exactly 32.0 B/cycle from the L2 and from the GDDR7 with
-#   16 KB or more in flight), in three lanes of 10.7 B/cycle (11 B beats) so
-#   that three chunks narrowed to a GDDR7 channel's 9.5 B/cycle overlap
-#   (28.5 B/cycle). Latency 20 cycles.
-# * smem: the SM's 128 KB L1/shared block at 128 B/cycle (measured 128 for
-#   stores, 2026-10-12), of which 100 KB can be shared memory (99 KB per
-#   block): a placement limit for the builders, not a model limit. Latency
-#   34 cycles (a dependent ld.shared on the card).
-# * atlas: the four fifth-generation tensor cores as one unit, dense MAC per
-#   cycle: bf16 512, fp8 1024, fp4 2048 (measured 2026-10-12 with mma.sync
-#   from registers: 511.8, 1023.6 and 2047, block-scaled fp4 for mxfp4).
-#   The Pro part keeps full-rate FP32 accumulate.
-# * muon: the 128 CUDA cores as a 128-lane vector unit (measured 125 fp32
-#   FMA per cycle; ex2, rsqrt and tanh 16 per cycle, bf16x2 FMA and integer
-#   multiply-add 63.5); overhead 20 cycles per task (warp launch, reduction
-#   tail).
-# * dma: the SM's asynchronous copy path (cp.async, TMA); latency 490 cycles
-#   before the first hop, so that a 1 KiB copy from the L2 takes about 550
-#   cycles from issue to done as a TMA bulk copy does on the card (16 KiB:
-#   1,020; 32 KiB: 1,620; 2026-10-12); 8 transfers in flight, chunks issued
-#   at the beat rate (Section 5.3). The L2 slice granule (256 B) sets the
-#   chunk size.
-# * neutrino: the Radiance 2 tables as in sm.yaml; the GPU has no such unit,
-#   so this is the superset's cost on top of the GPU's data path.
+# * Link to the gpc crossbar: 32 B/cycle per direction in 32 B beats (one
+#   sector per cycle). One SM reads 32.0 B/cycle from the L2 and from the
+#   GDDR7, the same per SM cycle at both lock points, so the link is on the
+#   SM clock. Latency 27 cycles: an L2 hit costs 354 SM cycles at the boost
+#   point, of which 124 L2 cycles (142 SM cycles) are the slice's (the two
+#   lock points separate them) and 49 are the SM's own load path (an L1
+#   hit); the other 163 are the fabric, both ways: 81 per direction, split
+#   1:2 between this link and the GPC link (the split is not measured).
+# * smem: the 128 KB L1/shared block at 128 B/cycle in 32 B beats (8 B
+#   loads, ldmatrix and 16 B stores reach 128; 4 B and 16 B loads 64).
+#   Latency 34 cycles (a dependent ld.shared).
+# * atlas: the four tensor cores as one unit, dense MAC per cycle: bf16
+#   512, fp8 1024, fp4 2048 (mma.sync from registers: 511.8, 1023.6, 2047).
+# * muon: the 128 CUDA cores as a 128-lane vector unit (125 fp32 FMA per
+#   cycle measured); overhead 20 cycles per task (not measured).
+# * dma: the SM's bulk copy engine (TMA). Latency 289 cycles, the one
+#   calibrated parameter of the copy path: a 1 KiB copy from the L2 takes
+#   the card's 550 cycles. It covers the request's way to the L2 (81
+#   cycles; the model charges a DMA only the data's route) and the TMA
+#   unit's own time (about 208). The other copy sizes are predictions.
+#   8 transfers in flight; 32 B beats.
+# * neutrino: the Radiance 2 tables as in sm.yaml; the GPU has no such unit.
 
 fabric:
   - {name: smsbus, topology: xbar}
   - {name: smcbus, topology: xbar, control: true}
   - {name: lbus, topology: xbar}
-  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 32, beat_bytes: 11, latency: 20}
-  - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 32, beat_bytes: 32, latency: 20, control: true}
+  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 32, beat_bytes: 32, latency: 27}
+  - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 32, beat_bytes: 32, latency: 27, control: true}
 memory:
   - {name: smem, type: scratch, addr: [[0x0, 0x20000]], bw_bytes: 128, beat_bytes: 32, latency: 34,
      slave: [$this.lbus, $this.smsbus]}
@@ -42,6 +42,6 @@ compute:
   - {name: atlas, type: tensor, rate: {bf16: 512, fp8: 1024, mxfp4: 2048},
      quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 128}, overhead: 20, master: [$this.lbus, $this.smsbus]}
-  - {name: dma, type: dma, latency: 490, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
+  - {name: dma, type: dma, latency: 289, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
            c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}

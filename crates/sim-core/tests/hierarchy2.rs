@@ -6,11 +6,14 @@
 //! Message times used below (1 beat unless noted):
 //! * root -> gpc (Start): the gpc's bridge down (1 cycle + 20), its control
 //!   crossbar's bridge port and neutrino port (1 + 1): 23 cycles.
+//! * The SM bridges (32 B per cycle) have capacity 1/2 at the 64 B message
+//!   beat: one slot in each odd cycle (whole slots by cycle). A beat that
+//!   enters at an odd cycle takes 1 cycle, at an even cycle 2.
 //! * gpc -> its SM: the crossbar's neutrino port and SM port (1 + 1), the
-//!   SM's bridge down (2 + 10): 14 cycles; a 72 B matmul descriptor (2
-//!   beats): 2 + 2 + 4 + 10 = 18.
-//! * SM -> its gpc: 2 + 10 + 1 + 1 = 14. gpc -> root (Return): 1 + 1 +
-//!   1 + 20 = 23.
+//!   SM's bridge down (1 or 2, + 10): 13 or 14 cycles; a 72 B matmul
+//!   descriptor (2 beats): 2 + 2 + (3 or 4) + 10 = 17 or 18.
+//! * SM -> its gpc: (1 or 2) + 10 + 1 + 1 = 13 or 14. gpc -> root
+//!   (Return): 1 + 1 + 1 + 20 = 23.
 //! * Costs: c_spawn 16, c_invoke 8, c_wait 2, c_complete 4; a 64^3 bf16
 //!   matmul takes 192 cycles on smem.
 
@@ -63,23 +66,25 @@ type Log = Rc<RefCell<Vec<(&'static str, u64)>>>;
 fn a_device_program_starts_two_gpc_drivers() {
     // The root spawns P0 on gpc0 (Start sent at 16, after c_spawn) and P1
     // on gpc1 (sent at 32): they start at 16 + 23 = 39 and 32 + 23 = 55.
-    // * P1 forwards M1 to gpc1.sm0 at 63 (after c_invoke): it enters the
-    //   scoreboard at 63 + 18 = 81 and runs [81, 273), done at 277. P1's
-    //   Await (sent at 65 after c_wait) waits for the SM bridge behind M1
-    //   ([71, 73) + 10: at 83). The Resolve leaves at 277 and reaches gpc1
-    //   at 291; P1 returns, the Return reaches the root at 314, and spawn
-    //   task 1 completes at 318.
+    // * P1 forwards M1 to gpc1.sm0 at 63 (after c_invoke): ports [63, 67),
+    //   sm0's bridge down [67, 70) (slots 67 and 69) + 10: it enters the
+    //   scoreboard at 80 and runs [80, 272), done at 276. P1's Await (sent
+    //   at 65 after c_wait) waits for the SM bridge behind M1 ([70, 72) +
+    //   10: at 82). The Resolve leaves at 276, takes sm0's bridge up
+    //   [276, 278) + 10 and the ports [288, 290): it reaches gpc1 at 290;
+    //   P1 returns, the Return reaches the root at 313, and spawn task 1
+    //   completes at 317.
     // * P0 waits for (M1, 1) across the gpcs: its Await (sent at 41) takes
     //   gpc0's crossbar ports [41, 43), gpc0's bridge up [43, 44) + 20,
     //   gpc1's bridge down [64, 65) + 20, gpc1's ports [85, 87) and sm0's
-    //   bridge down [87, 89) + 10: at 99. Its Resolve follows P1's: the
-    //   stage after sm0's bridge up holds P1's until 290, so [290, 292) +
-    //   10, sm0's port [302, 303), gpc1's bridge port [303, 304), gpc1's
-    //   bridge up [304, 305) + 20, gpc0's bridge down [325, 326) + 20,
-    //   gpc0's ports [346, 348): P0 resumes at 348. Its Return (ports
-    //   [348, 350), bridge up [350, 351) + 20) reaches the root at 371;
-    //   spawn task 0 completes at 375, the root resumes, and its wait on
-    //   the done spawn task 1 ends at 377.
+    //   bridge down [87, 88) + 10: at 98. Its Resolve follows P1's: the
+    //   stage after sm0's bridge up holds P1's until 289, so [289, 290) +
+    //   10, sm0's port [300, 301), gpc1's bridge port [301, 302), gpc1's
+    //   bridge up [302, 303) + 20, gpc0's bridge down [323, 324) + 20,
+    //   gpc0's ports [344, 346): P0 resumes at 346. Its Return (ports
+    //   [346, 348), bridge up [348, 349) + 20) reaches the root at 369;
+    //   spawn task 0 completes at 373, the root resumes, and its wait on
+    //   the done spawn task 1 ends at 375.
     let b = two_gpc(&[]);
     let (root, g0, g1) = (b.nu("root"), b.nu("root.gpc0"), b.nu("root.gpc1"));
     let sync = b.sync_only(root).unwrap();
@@ -121,14 +126,14 @@ fn a_device_program_starts_two_gpc_drivers() {
         vec![
             ("p0 start", 39),
             ("p1 start", 55),
-            ("p1 resume", 291),
-            ("p0 resume", 348),
-            ("root h0", 375),
-            ("root h1", 377)
+            ("p1 resume", 290),
+            ("p0 resume", 346),
+            ("root h0", 373),
+            ("root h1", 375)
         ]
     );
     let t = s.tasks.iter().find(|t| t.label == Some(1)).unwrap();
-    assert_eq!((t.invoke, t.issue, t.complete), (81, Some(81), Some(277)));
+    assert_eq!((t.invoke, t.issue, t.complete), (80, Some(80), Some(276)));
     let k = &s.messages_by_kind;
     assert_eq!((k.get("Start"), k.get("Return")), (Some(&2), Some(&2)));
 }

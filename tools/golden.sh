@@ -10,8 +10,10 @@
 # every run (for example GOLDEN_ARGS="--set global.endpoint_charging=false").
 # The rows run the default hierarchical program (configs/forward.toml);
 # GOLDEN_ARGS="--param drivers=single" runs the single driver. References:
-# scratch/fwd18 (hierarchical), scratch/fwd18-single (two SMEM banks and
-# Atlas rates by type, 2026-10-13; fwd18-4bank the four-bank version of
+# scratch/fwd21 (hierarchical), scratch/fwd21-single (no backward pass in
+# the data-path rule, 2026-10-14; fwd20 with the backward pass, fwd19 with
+# integer lanes, fwd18 before a
+# transfer paid its source latency, fwd18-4bank the four-bank SMEM of
 # 2026-10-12, fwd17 before the banks, fwd16 before compute chunks start on
 # the free lanes, fwd15 with one SMEM port).
 # "check" exits with 1 when a summary line or a JSON file differs; the

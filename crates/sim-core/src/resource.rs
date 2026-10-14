@@ -1,14 +1,17 @@
 //! The resource plane (architecture Section 5).
 //!
-//! A flow resource has a rational rate and a calendar of busy intervals.
-//! A chunk occupies it exclusively for whole cycles: a link moves whole
-//! beats, so a transfer takes `ceil(amount / (rate * utilization))`
-//! cycles, at least one, and nothing carries over to the next transfer
-//! (Section 5.2). An occupancy resource has a size and a FIFO of waiters.
+//! A flow resource has a rate per cycle of its own clock, a clock ratio to
+//! the core clock and a capacity in slots per core cycle (Section 5.2): a
+//! slot moves one beat per core cycle. Its calendar holds the slots in use
+//! over time in fixed point ([`SCALE`] units per slot). A chunk holds a
+//! constant usage of slots for whole cycles, at least one, and nothing
+//! carries over to the next chunk. An occupancy resource has a size and a
+//! FIFO of waiters.
 //!
-//! [`Resources::reserve`] co-charges one chunk over all resources of its
-//! demand vector (Section 5.4) and returns the granted interval and the
-//! culprit.
+//! [`Resources::reserve`] co-charges a compute chunk over the resources of
+//! its demand vector and [`Resources::reserve_path`] places a transfer
+//! chunk hop by hop (Section 5.4); both return the granted interval and
+//! the culprit.
 
 use std::collections::VecDeque;
 
@@ -74,6 +77,14 @@ pub struct Demand {
     pub utilization: Ratio,
     /// Read, write or work.
     pub dir: Dir,
+    /// The master's beat in bytes on a data resource (the chunk's beat
+    /// there is the smaller of it and the resource's beat; Section 5.4);
+    /// 0: the resource's beat.
+    pub beat: u64,
+    /// The rate class of a work demand on a resource whose rate depends
+    /// on the operand type (the index of the class an Atlas tile runs at,
+    /// in the order of its `rates`), for a tracer.
+    pub class: Option<u8>,
 }
 
 impl Demand {
@@ -84,6 +95,8 @@ impl Demand {
             amount,
             utilization: Ratio::ONE,
             dir,
+            beat: 0,
+            class: None,
         }
     }
 
@@ -103,19 +116,35 @@ impl Demand {
     }
 }
 
-/// Cycles split by direction, indexed by [`Dir`] (read, write, work).
-pub type DirCycles = [u64; 3];
+/// Fixed-point units of one slot: usages and capacities are integer
+/// multiples of `1 / SCALE` slot. 2^16 x 720,720 is exact for every
+/// power-of-two beat ratio up to 2^16 and every clock denominator up to 16;
+/// a needed usage rounds up and a capacity rounds down, so a calendar
+/// never holds more than the capacity.
+pub const SCALE: u64 = 65_536 * 720_720;
 
-/// Splits `d` charged cycles in proportion to `amounts` (by direction);
-/// the parts sum to `d`.
-fn split(d: u64, amounts: &DirCycles) -> DirCycles {
+/// Slot-cycles split by direction, in [`SCALE`] units, indexed by [`Dir`]
+/// (read, write, work).
+pub type DirSlots = [u128; 3];
+
+/// Amounts by direction, indexed by [`Dir`] (read, write, work).
+pub type DirAmounts = [u64; 3];
+
+/// Splits `total` in proportion to `amounts` (by direction); the parts sum
+/// to `total`.
+fn split(total: u128, amounts: &DirAmounts) -> DirSlots {
     let tot: u128 = amounts.iter().map(|&a| a as u128).sum();
     if tot == 0 {
-        return [0, 0, d];
+        return [0, 0, total];
     }
-    let part = |a: u64| (d as u128 * a as u128 / tot) as u64;
+    let part = |a: u64| total * a as u128 / tot;
     let (r, k) = (part(amounts[0]), part(amounts[2]));
-    [r, d - r - k, k]
+    [r, total - r - k, k]
+}
+
+/// `ceil(a / b)` in u128.
+fn ceil_div(a: u128, b: u128) -> u128 {
+    a.div_ceil(b)
 }
 
 /// The interval granted to one chunk.
@@ -132,39 +161,50 @@ pub struct Grant {
     pub queue_culprit: Option<ResourceId>,
 }
 
-/// A flow resource: a rate split into lanes, and a calendar of the lanes
-/// in use over time (Section 5.4, data-path rule 3).
+/// A flow resource: a rate, a clock ratio, a capacity in slots and a
+/// calendar of the slots in use over time (Section 5.2).
 #[derive(Debug, Clone)]
 pub struct FlowResource {
+    /// Units per cycle of the resource's own clock.
     rate: Ratio,
-    /// Lanes: `ceil(rate / beat_bytes)`; 1 without a beat.
-    lanes: u32,
-    /// The rate of one lane: `rate / lanes`.
-    lane_rate: Ratio,
-    /// The beat in bytes, when the resource has lanes.
+    /// Its clock over the core clock (Section 4.1).
+    clock: Ratio,
+    /// The beat in bytes of a data resource (`beat_bytes`); `None`: one
+    /// slot whose beat is the whole rate (a compute unit, or a data
+    /// resource built without a beat).
     beat: Option<u64>,
-    /// Lanes in use from each key until the next one; 0 after the last.
-    /// Sorted by time. A calendar holds a few tens of keys after pruning,
-    /// so a sorted deque beats a tree on every operation.
-    used: VecDeque<(Cycle, u32)>,
-    /// Lane-cycles charged.
-    busy_total: u64,
+    /// Slots per core cycle, in [`SCALE`] units: `rate / beat x clock`, or
+    /// `clock` without a beat (rounded down).
+    cap: u64,
+    /// The capacity as `(p, q)` when it is not an integer: its slots then
+    /// exist at fixed cycles (Section 5.2, whole slots by cycle), and a
+    /// window's length depends on its start. `None` for an integer
+    /// capacity.
+    frac: Option<(u64, u64)>,
+    /// Slots in use from each key until the next one, in [`SCALE`] units;
+    /// 0 after the last. Sorted by time. A calendar holds a few tens of
+    /// keys after pruning, so a sorted deque beats a tree on every
+    /// operation.
+    used: VecDeque<(Cycle, u64)>,
+    /// Slot-cycles charged, in [`SCALE`] units.
+    busy_total: u128,
     /// `busy_total` by direction.
-    busy_dir: DirCycles,
+    busy_dir: DirSlots,
+    /// Bytes charged (read and write).
+    bytes: u64,
     culprit_total: u64,
     delay_total: u64,
 }
 
-/// One charged interval and its cycles by direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// One charged interval and its slot-cycles by direction.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct LogEntry {
     /// First cycle.
     pub start: Cycle,
     /// End (exclusive).
     pub end: Cycle,
-    /// Its cycles by direction (read, write, work); they sum to
-    /// `end - start`.
-    pub dir: DirCycles,
+    /// Its slot-cycles by direction (read, write, work).
+    pub dir: [f64; 3],
 }
 
 impl FlowResource {
@@ -172,44 +212,170 @@ impl FlowResource {
         assert!(rate.num > 0, "flow resource with zero rate");
         Self {
             rate,
-            lanes: 1,
-            lane_rate: rate,
+            clock: Ratio::ONE,
             beat: None,
+            cap: SCALE,
+            frac: None,
             used: VecDeque::new(),
             busy_total: 0,
             busy_dir: [0; 3],
+            bytes: 0,
             culprit_total: 0,
             delay_total: 0,
         }
     }
 
-    /// Units per cycle.
+    /// Units per cycle of the resource's own clock.
     pub fn rate(&self) -> Ratio {
         self.rate
     }
 
-    /// Lanes.
-    pub fn lanes(&self) -> u32 {
-        self.lanes
+    /// The clock ratio to the core clock.
+    pub fn clock(&self) -> Ratio {
+        self.clock
     }
 
-    /// The beat in bytes; `None` for a resource without lanes.
+    /// Units per core cycle: `rate x clock`.
+    pub fn core_rate(&self) -> Ratio {
+        Ratio::new(
+            self.rate.num * self.clock.num,
+            self.rate.den * self.clock.den,
+        )
+    }
+
+    /// The beat in bytes; `None` for a one-slot resource.
     pub fn beat(&self) -> Option<u64> {
         self.beat
     }
 
-    /// Splits the rate into `ceil(rate / beat)` lanes of `rate / lanes`.
-    fn set_beat(&mut self, beat: u64) {
-        assert!(beat > 0, "beat of 0 bytes");
-        let lanes = (self.rate.num as u128).div_ceil(self.rate.den as u128 * beat as u128);
-        self.lanes = lanes.max(1) as u32;
-        self.lane_rate = Ratio::new(self.rate.num, self.rate.den * self.lanes as u64);
-        self.beat = Some(beat);
+    /// Slots per core cycle, exactly: `rate / beat x clock`, or `clock`.
+    pub fn capacity(&self) -> Ratio {
+        match self.beat {
+            Some(b) => Ratio::new(
+                self.rate.num * self.clock.num,
+                self.rate.den * self.clock.den * b,
+            ),
+            None => self.clock,
+        }
     }
 
-    /// Whole cycles for `amount` at `util`: `ceil(amount / (rate * util))`,
-    /// at least one for a nonzero amount; 0 for none.
-    fn duration(&self, amount: u64, util: Ratio) -> u64 {
+    /// Slots per core cycle.
+    pub fn slots(&self) -> f64 {
+        self.cap as f64 / SCALE as f64
+    }
+
+    fn set_cap(&mut self) {
+        let c = self.capacity();
+        self.cap = (c.num as u128 * SCALE as u128 / c.den as u128) as u64;
+        self.frac = (c.den != 1).then_some((c.num, c.den));
+        assert!(self.cap > 0, "a flow resource with no capacity");
+    }
+
+    /// The slots of the cycles `[0, t)`: `floor(t x C)` (Section 5.2).
+    fn slots_to(t: Cycle, p: u64, q: u64) -> u128 {
+        t as u128 * p as u128 / q as u128
+    }
+
+    /// The end of a window from `t0` that needs `n` of the resource's
+    /// slots (the first t1 with `floor(t1 x C) - floor(t0 x C) >= n`).
+    fn slot_end(t0: Cycle, n: u128, p: u64, q: u64) -> Cycle {
+        ceil_div((Self::slots_to(t0, p, q) + n) * q as u128, p as u128) as Cycle
+    }
+
+    /// Whole cycles from `t0` for `beats` at `u` slots (Section 5.2): with
+    /// an integer capacity `ceil(beats / u)`; otherwise the chunk moves u
+    /// / C of the slots that exist in its window, so it needs `N =
+    /// ceil(beats x C / u)` of them (`beats` when it holds the whole
+    /// capacity), and its window ends at the cycle that holds the N-th. At
+    /// least one cycle.
+    #[inline]
+    fn window(&self, t0: Cycle, beats: u64, u: u64) -> u64 {
+        let Some((p, q)) = self.frac else {
+            return Self::dur(beats, u);
+        };
+        let n = if u >= self.cap {
+            beats as u128
+        } else {
+            ceil_div(
+                beats as u128 * p as u128 * SCALE as u128,
+                q as u128 * u as u128,
+            )
+        };
+        (Self::slot_end(t0, n, p, q) - t0).max(1)
+    }
+
+    /// Whole cycles from `t0` of a work demand that holds the whole
+    /// capacity: its beats are `ceil(amount / (rate x util))` (own
+    /// cycles), one per slot.
+    fn work_window(&self, t0: Cycle, amount: u64, util: Ratio) -> u64 {
+        let Some((p, q)) = self.frac else {
+            return self.work_duration(amount, util);
+        };
+        if amount == 0 {
+            return 0;
+        }
+        let r = self.rate;
+        let beats = ceil_div(
+            amount as u128 * r.den as u128 * util.den as u128,
+            r.num as u128 * util.num as u128,
+        )
+        .max(1);
+        (Self::slot_end(t0, beats, p, q) - t0).max(1)
+    }
+
+    /// The earliest `t' >= t` with `u` slots free over `[t', t' +
+    /// len(t'))`: with an integer capacity the length does not depend on
+    /// the start; otherwise the search repeats from each candidate until a
+    /// window of its own length is free.
+    #[inline]
+    fn earliest_by(&self, t: Cycle, u: u64, len: impl Fn(Cycle) -> u64) -> Cycle {
+        if self.frac.is_none() {
+            return self.earliest(t, len(t), u);
+        }
+        let mut t = t;
+        loop {
+            let s = self.earliest(t, len(t), u);
+            if s == t {
+                return t;
+            }
+            t = s;
+        }
+    }
+
+    /// The earliest start `>= t` of a window for `beats` at `u` slots,
+    /// and the window's length there.
+    #[inline]
+    fn earliest_window(&self, t: Cycle, beats: u64, u: u64) -> (Cycle, u64) {
+        if self.frac.is_none() {
+            let d = Self::dur(beats, u);
+            return (self.earliest(t, d, u), d);
+        }
+        let s = self.earliest_by(t, u, |x| self.window(x, beats, u));
+        (s, self.window(s, beats, u))
+    }
+
+    /// Splits the rate into slots of `beat` bytes (Section 5.2).
+    fn set_beat(&mut self, beat: u64) {
+        assert!(beat > 0, "beat of 0 bytes");
+        self.beat = Some(beat);
+        self.set_cap();
+    }
+
+    /// Sets the clock ratio (Section 4.1).
+    fn set_clock(&mut self, clock: Ratio) {
+        assert!(clock.num > 0, "clock 0");
+        self.clock = clock;
+        self.set_cap();
+    }
+
+    /// The beat of a data resource: `beat_bytes`, or its rate without one.
+    fn data_beat(&self) -> u64 {
+        self.beat.unwrap_or((self.rate.num / self.rate.den).max(1))
+    }
+
+    /// Whole core cycles of a work demand: `ceil(amount / (rate x clock x
+    /// util))`, at least one for a nonzero amount; 0 for none.
+    fn work_duration(&self, amount: u64, util: Ratio) -> u64 {
         assert!(
             util.num > 0 && util.num <= util.den,
             "utilization must be in (0, 1]"
@@ -217,21 +383,35 @@ impl FlowResource {
         if amount == 0 {
             return 0;
         }
-        // Fast path: integer rate, full utilization.
-        if self.rate.den == 1 && util.num == util.den {
-            return amount.div_ceil(self.rate.num);
+        let (r, c) = (self.rate, self.clock);
+        if r.den == 1 && c.num == c.den && util.num == util.den {
+            return amount.div_ceil(r.num);
         }
-        let e_num = amount as u128 * self.rate.den as u128 * util.den as u128;
-        let e_den = self.rate.num as u128 * util.num as u128;
-        e_num.div_ceil(e_den).max(1) as u64
+        let n = amount as u128 * r.den as u128 * c.den as u128 * util.den as u128;
+        let d = r.num as u128 * c.num as u128 * util.num as u128;
+        n.div_ceil(d).max(1) as u64
     }
 
-    /// Lanes that a flow at `r` units per cycle holds: `ceil(r / lane
-    /// rate)`, at least one and at most all.
-    fn lanes_for(&self, r: Ratio) -> u32 {
-        let k = (r.num as u128 * self.lane_rate.den as u128)
-            .div_ceil(r.den as u128 * self.lane_rate.num as u128);
-        k.clamp(1, self.lanes as u128) as u32
+    /// The beat and the beats of `amount` bytes for a master of `beat`
+    /// bytes (0: none), at `util`.
+    fn beats(&self, amount: u64, beat: u64, util: Ratio) -> (u64, u64) {
+        let b = match beat {
+            0 => self.data_beat(),
+            m => m.min(self.data_beat()),
+        };
+        let n = amount.div_ceil(b);
+        let n = if util.num == util.den {
+            n
+        } else {
+            ceil_div(n as u128 * util.den as u128, util.num as u128) as u64
+        };
+        (b, n)
+    }
+
+    /// Whole cycles for `beats` at `u` slots: `ceil(beats / u)`, at least
+    /// one.
+    fn dur(beats: u64, u: u64) -> u64 {
+        ceil_div(beats as u128 * SCALE as u128, u as u128).max(1) as u64
     }
 
     /// Keys at or before `t`.
@@ -239,27 +419,27 @@ impl FlowResource {
         self.used.partition_point(|&(k, _)| k <= t)
     }
 
-    /// Lanes in use at `t`.
-    fn used_at(&self, t: Cycle) -> u32 {
+    /// Slots in use at `t`.
+    fn used_at(&self, t: Cycle) -> u64 {
         match self.keys_to(t) {
             0 => 0,
             i => self.used[i - 1].1,
         }
     }
 
-    /// The earliest `t' >= t` with `k` lanes free over `[t', t' + d)`: one
+    /// The earliest `t' >= t` with `u` slots free over `[t', t' + d)`: one
     /// forward pass over the keys from `t`.
-    pub(crate) fn earliest(&self, t: Cycle, d: u64, k: u32) -> Cycle {
+    pub(crate) fn earliest(&self, t: Cycle, d: u64, u: u64) -> Cycle {
         if d == 0 {
             return t;
         }
-        // The tail: at or after the last key every lane is free.
+        // The tail: at or after the last key every slot is free.
         if self.used.back().is_none_or(|&(last, _)| last <= t) {
             return t;
         }
-        let free = self.lanes - k.min(self.lanes);
+        let free = self.cap - u.min(self.cap);
         let mut cand = t;
-        // Lanes in use at `cand`; they change only at keys, and the last
+        // Slots in use at `cand`; they change only at keys, and the last
         // key's value is 0.
         let i = self.keys_to(t);
         let mut busy = i > 0 && self.used[i - 1].1 > free;
@@ -279,7 +459,32 @@ impl FlowResource {
         cand
     }
 
-    /// The index of key `t`, inserted with the lanes in use there if it is
+    /// The earliest `t' >= t` at which some slots are free.
+    fn first_free(&self, t: Cycle) -> Cycle {
+        if self.used_at(t) < self.cap {
+            return t;
+        }
+        let i = self.keys_to(t);
+        self.used
+            .range(i..)
+            .find(|&&(_, v)| v < self.cap)
+            .map_or(t, |&(at, _)| at)
+    }
+
+    /// The slots free throughout `[t, t + d)`.
+    fn min_free(&self, t: Cycle, d: u64) -> u64 {
+        let i = self.keys_to(t);
+        let mut most = if i > 0 { self.used[i - 1].1 } else { 0 };
+        for &(at, v) in self.used.range(i..) {
+            if at >= t + d {
+                break;
+            }
+            most = most.max(v);
+        }
+        self.cap - most
+    }
+
+    /// The index of key `t`, inserted with the slots in use there if it is
     /// not a key.
     fn key(&mut self, t: Cycle) -> usize {
         let i = self.used.partition_point(|&(k, _)| k < t);
@@ -290,7 +495,7 @@ impl FlowResource {
         i
     }
 
-    /// Removes key `i` when it repeats the lanes in use before it.
+    /// Removes key `i` when it repeats the slots in use before it.
     fn coalesce(&mut self, i: usize) -> bool {
         let before = if i == 0 { 0 } else { self.used[i - 1].1 };
         let same = before == self.used[i].1;
@@ -300,7 +505,7 @@ impl FlowResource {
         same
     }
 
-    /// Adds `delta` lanes in use over `[t, t + d)`.
+    /// Adds `delta` slots in use over `[t, t + d)`.
     fn add(&mut self, t: Cycle, d: u64, delta: i64) {
         if d == 0 {
             return;
@@ -310,39 +515,168 @@ impl FlowResource {
         let ie = self.key(e);
         for (_, v) in self.used.range_mut(it..ie) {
             let n = *v as i64 + delta;
-            debug_assert!(n >= 0 && n <= self.lanes as i64, "lanes over capacity");
-            *v = n as u32;
+            debug_assert!(n >= 0 && n as u64 <= self.cap, "slots over capacity");
+            *v = n as u64;
         }
         // Coalesce at the two ends.
         let ie = if self.coalesce(it) { ie - 1 } else { ie };
         self.coalesce(ie);
     }
 
-    /// Holds `k` lanes over `[t, t + d)` (the calendar only).
-    fn occupy(&mut self, t: Cycle, d: u64, k: u32) {
-        self.add(t, d, k as i64);
+    /// Holds `u` slots over `[t, t + d)` (the calendar only).
+    fn occupy(&mut self, t: Cycle, d: u64, u: u64) {
+        self.add(t, d, u as i64);
     }
 
-    /// Frees `k` lanes over `[t, t + d)` held by [`FlowResource::occupy`].
-    fn release(&mut self, t: Cycle, d: u64, k: u32) {
-        self.add(t, d, -(k as i64));
+    /// Frees `u` slots over `[t, t + d)` held by [`FlowResource::occupy`].
+    fn release(&mut self, t: Cycle, d: u64, u: u64) {
+        self.add(t, d, -(u as i64));
     }
 
-    /// Counts `k` lanes over `d` cycles in the statistics; returns the
-    /// lane-cycles by direction.
-    fn account(&mut self, d: u64, k: u32, amounts: &DirCycles) -> DirCycles {
-        let lc = d * k as u64;
-        let parts = split(lc, amounts);
+    /// Counts `u` slots over `d` cycles and the bytes of `amounts` in the
+    /// statistics; returns the slot-cycles by direction.
+    fn account(&mut self, d: u64, u: u64, amounts: &DirAmounts) -> DirSlots {
+        let sc = d as u128 * u as u128;
+        let parts = split(sc, amounts);
         for (b, p) in self.busy_dir.iter_mut().zip(parts) {
             *b += p;
         }
-        self.busy_total += lc;
+        self.busy_total += sc;
+        self.bytes += amounts[0] + amounts[1];
         parts
     }
 
     /// Drops the calendar before `now`.
+    #[inline]
     fn prune(&mut self, now: Cycle) {
+        // Nothing before `now`: the common case, without a search.
+        if self.used.front().is_none_or(|&(k, _)| k >= now) {
+            return;
+        }
         let v = self.used_at(now);
+        let gone = self.used.partition_point(|&(k, _)| k < now);
+        self.used.drain(..gone);
+        if v > 0 && self.used.front().is_none_or(|&(k, _)| k != now) {
+            self.used.push_front((now, v));
+        }
+    }
+}
+
+/// A pool for the data in flight into a node through one link (Section
+/// 5.4, data-path rule 7): a calendar of the bytes held over time, at most
+/// `cap` at any cycle.
+#[derive(Debug, Clone)]
+pub(crate) struct Pool {
+    /// Its occupancy resource (name, statistics, queue culprit).
+    resource: ResourceId,
+    cap: u64,
+    /// Bytes held from each key until the next one; 0 after the last.
+    used: VecDeque<(Cycle, u64)>,
+    peak: u64,
+    /// Byte-cycles held.
+    held: u128,
+    /// Cycles chunks waited for room.
+    waited: u64,
+}
+
+impl Pool {
+    fn keys_to(&self, t: Cycle) -> usize {
+        self.used.partition_point(|&(k, _)| k <= t)
+    }
+
+    /// The most bytes held at any cycle of `[t0, t1)`.
+    fn most(&self, t0: Cycle, t1: Cycle) -> u64 {
+        let i = self.keys_to(t0);
+        let mut most = if i > 0 { self.used[i - 1].1 } else { 0 };
+        for &(at, v) in self.used.range(i..) {
+            if at >= t1 {
+                break;
+            }
+            most = most.max(v);
+        }
+        most
+    }
+
+    /// True when `bytes` more fit over `[t0, t1)`.
+    fn fits(&self, t0: Cycle, t1: Cycle, bytes: u64) -> bool {
+        self.most(t0, t1) + bytes <= self.cap
+    }
+
+    /// The first cycle from which `bytes` more fit up to `t1`: the end of
+    /// the last interval in `[t0, t1)` where they do not (`t0` if they fit
+    /// throughout).
+    fn room_from(&self, t0: Cycle, t1: Cycle, bytes: u64) -> Cycle {
+        let free = self.cap.saturating_sub(bytes);
+        let i = self.keys_to(t0);
+        let mut over = i > 0 && self.used[i - 1].1 > free;
+        let mut from = t0;
+        for &(at, v) in self.used.range(i..) {
+            if at >= t1 {
+                break;
+            }
+            if over && v <= free {
+                from = at;
+            }
+            over = v > free;
+            if over {
+                from = t1;
+            }
+        }
+        if over {
+            // Held to `t1` and beyond: room from the first key after it
+            // that frees enough.
+            let j = self.keys_to(t1.saturating_sub(1));
+            return self
+                .used
+                .range(j..)
+                .find(|&&(_, v)| v <= free)
+                .map_or(t1, |&(at, _)| at);
+        }
+        from
+    }
+
+    fn key(&mut self, t: Cycle) -> usize {
+        let i = self.used.partition_point(|&(k, _)| k < t);
+        if self.used.get(i).is_none_or(|&(k, _)| k != t) {
+            let v = if i == 0 { 0 } else { self.used[i - 1].1 };
+            self.used.insert(i, (t, v));
+        }
+        i
+    }
+
+    /// Holds `bytes` over `[t0, t1)`.
+    fn hold(&mut self, t0: Cycle, t1: Cycle, bytes: u64) {
+        if t1 <= t0 || bytes == 0 {
+            return;
+        }
+        let it = self.key(t0);
+        let ie = self.key(t1);
+        for (_, v) in self.used.range_mut(it..ie) {
+            *v += bytes;
+            debug_assert!(*v <= self.cap, "pool over its bytes");
+            self.peak = self.peak.max(*v);
+        }
+        let before = |u: &VecDeque<(Cycle, u64)>, i: usize| if i == 0 { 0 } else { u[i - 1].1 };
+        let ie = if before(&self.used, it) == self.used[it].1 {
+            self.used.remove(it);
+            ie - 1
+        } else {
+            ie
+        };
+        if before(&self.used, ie) == self.used[ie].1 {
+            self.used.remove(ie);
+        }
+        self.held += (t1 - t0) as u128 * bytes as u128;
+    }
+
+    /// Drops the calendar before `now`.
+    #[inline]
+    fn prune(&mut self, now: Cycle) {
+        if self.used.front().is_none_or(|&(k, _)| k >= now) {
+            return;
+        }
+        let i = self.keys_to(now);
+        let v = if i > 0 { self.used[i - 1].1 } else { 0 };
         let gone = self.used.partition_point(|&(k, _)| k < now);
         self.used.drain(..gone);
         if v > 0 && self.used.front().is_none_or(|&(k, _)| k != now) {
@@ -397,25 +731,37 @@ pub struct Resource {
 }
 
 /// Per-resource statistics at the end of a run.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ResourceStats {
     /// The resource's name.
     pub name: String,
     /// The resource's kind.
     pub kind: Kind,
-    /// Flow: lanes (1 for a resource without a beat). Occupancy: 0.
-    pub lanes: u32,
-    /// Flow: charged lane-cycles (cycles for a one-lane resource).
+    /// Flow: slots per core cycle (Section 5.2). Occupancy: 0.
+    pub slots: f64,
+    /// Flow: units (bytes, MACs, lane-ops, instructions) per core cycle.
     /// Occupancy: 0.
+    pub rate: f64,
+    /// Flow: charged slot-cycles, rounded to whole ones. Occupancy: 0.
     pub busy_cycles: u64,
+    /// Flow: charged slot-cycles, unrounded.
+    pub busy_slot_cycles: f64,
     /// The part of `busy_cycles` charged for reads.
     pub busy_read: u64,
     /// The part charged for writes.
     pub busy_write: u64,
     /// The part charged for work (compute).
     pub busy_work: u64,
+    /// Flow: bytes charged (reads and writes); the byte utilization is
+    /// `bytes / (rate x clock x cycles)`.
+    pub bytes: u64,
     /// Occupancy: the largest amount held at once.
     pub peak: u64,
+    /// Occupancy: its size (an in-flight pool: `inflight_bytes`).
+    pub size: u64,
+    /// An in-flight pool: the byte-cycles held (the mean occupancy is
+    /// this over the run's end time). 0 otherwise.
+    pub held_cycles: f64,
     /// Flow: charged intervals, when logging is on.
     pub log: Option<Vec<LogEntry>>,
     /// Flow: cycles of the chunks for which this resource was the culprit
@@ -453,13 +799,15 @@ pub struct Resources {
     /// Scratch buffers of `reserve`, kept to avoid allocation.
     merged: Vec<Demand>,
     /// Per merged demand: its amount by direction.
-    merged_dir: Vec<DirCycles>,
+    merged_dir: Vec<DirAmounts>,
     own: Vec<Own>,
     /// Scratch buffer of `reserve_path`.
     plan: Vec<Placed>,
-    /// The (lanes, length) of a compute chunk's narrow option (kept
+    /// The (usage, length) of a compute chunk's narrow option (kept
     /// across chunks).
-    narrow_plan: Vec<(u32, u64)>,
+    narrow_plan: Vec<(u64, u64)>,
+    /// The in-flight pools (Section 5.4, data-path rule 7).
+    pools: Vec<Pool>,
 }
 
 /// One hop of a transfer chunk, in route order.
@@ -472,20 +820,52 @@ pub struct PathHop {
     pub dir: Dir,
     /// Cycles from this hop's start to the next hop's earliest start.
     pub latency: Cycle,
+    /// The in-flight pool whose hold ends with this hop's window: the
+    /// chunk crossed the pool's link into its node before this hop
+    /// (Section 5.4, data-path rule 7).
+    pub pool: Option<PoolMark>,
+}
+
+/// A pool on a route (Section 5.4, data-path rule 7): its index, and the
+/// route latency from the pool's link to the hop that carries the mark
+/// (0 when the hop is the link itself).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PoolMark {
+    pub pool: u32,
+    pub skip: Cycle,
+}
+
+/// What the in-flight pools need of a transfer chunk (Section 5.4,
+/// data-path rule 7): its issue cycle, the latency of its source block,
+/// and a pool whose link the chunk crosses after its last hop (the hold
+/// then ends with the chunk).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Admit {
+    pub issue: Cycle,
+    pub src_latency: Cycle,
+    pub tail: Option<PoolMark>,
 }
 
 /// One demand of a compute chunk while it is co-charged.
 #[derive(Debug, Clone, Copy)]
 struct Own {
     resource: ResourceId,
-    /// Own duration with every lane.
+    /// Own duration with the whole capacity.
     dur: u64,
     /// The cycles it is charged.
     charged: u64,
-    /// The lanes it holds.
-    lanes: u32,
+    /// The slots it holds, in [`SCALE`] units.
+    usage: u64,
     /// Its own earliest start.
     start: Cycle,
+    /// Beats on a data resource; `None` on a work resource.
+    beats: Option<u64>,
+    /// The demand's rate class, for a tracer.
+    class: Option<u8>,
+    /// A work demand's amount and utilization (its window on a resource
+    /// with a fractional capacity, Section 5.2).
+    amount: u64,
+    util: Ratio,
 }
 
 /// A hop's window while a transfer is placed.
@@ -493,8 +873,9 @@ struct Own {
 struct Placed {
     start: Cycle,
     dur: u64,
-    lanes: u32,
-    /// Start delay on this hop in the forward pass.
+    /// The slots it holds, in [`SCALE`] units.
+    usage: u64,
+    /// Start delay on this hop.
     delay: Cycle,
 }
 
@@ -516,6 +897,7 @@ impl Resources {
             own: Vec::new(),
             plan: Vec::new(),
             narrow_plan: Vec::new(),
+            pools: Vec::new(),
         }
     }
 
@@ -579,10 +961,14 @@ impl Resources {
         self.res.is_empty()
     }
 
-    /// Splits flow resource `id` into lanes of `beat` bytes (Section 5.4,
-    /// data-path rule 3).
+    /// Splits flow resource `id` into slots of `beat` bytes (Section 5.2).
     pub fn set_beat(&mut self, id: ResourceId, beat: u64) {
         self.flow_mut(id).set_beat(beat);
+    }
+
+    /// Sets the clock ratio of flow resource `id` (Section 4.1).
+    pub fn set_clock(&mut self, id: ResourceId, clock: Ratio) {
+        self.flow_mut(id).set_clock(clock);
     }
 
     /// The rate of flow resource `id`; `None` for an occupancy resource.
@@ -635,49 +1021,66 @@ impl Resources {
     fn co_charge(
         &mut self,
         merged: &[Demand],
-        merged_dir: &[DirCycles],
+        merged_dir: &[DirAmounts],
         own: &mut Vec<Own>,
         earliest: Cycle,
     ) -> Option<Grant> {
         if merged.is_empty() {
             return None;
         }
-        // Step 1: own durations (all lanes assumed) and the chunk's D.
-        own.extend(merged.iter().map(|d| Own {
-            resource: d.resource,
-            dur: self.flow(d.resource).duration(d.amount, d.utilization),
-            charged: 0,
-            lanes: 0,
-            start: 0,
+        // Step 1: own durations with the whole capacity, and the chunk's D.
+        own.extend(merged.iter().map(|d| {
+            let f = self.flow(d.resource);
+            let beats = (d.dir != Dir::Work).then(|| f.beats(d.amount, d.beat, d.utilization).1);
+            let dur = match beats {
+                Some(n) => FlowResource::dur(n, f.cap),
+                None => f.work_duration(d.amount, d.utilization),
+            };
+            Own {
+                resource: d.resource,
+                dur,
+                charged: 0,
+                usage: f.cap,
+                start: 0,
+                beats,
+                class: d.class,
+                amount: d.amount,
+                util: d.utilization,
+            }
         }));
         let big_d = own.iter().map(|o| o.dur).max().expect("nonempty");
-        // What each resource holds: a resource with lanes holds the lanes
-        // its own rate needs over D, `ceil(amount / (D x lane rate))` (at
-        // least one, at most all), for D; a one-lane resource holds its
-        // lane for its own duration (or D under the longest rule).
+        // What each resource holds: a data resource the slots its own
+        // rate needs over D, `beats / D` (Section 5.4), for D; a work
+        // resource its whole capacity for its own duration (or D under the
+        // longest rule).
         let own_mode = self.cocharge == CoCharge::Own;
-        for (o, d) in own.iter_mut().zip(merged) {
+        for o in own.iter_mut() {
             let f = self.flow(o.resource);
-            if f.lanes > 1 && big_d > 0 {
-                let lr = f.lane_rate;
-                let k =
-                    (d.amount as u128 * lr.den as u128).div_ceil(big_d as u128 * lr.num as u128);
-                o.lanes = k.clamp(1, f.lanes as u128) as u32;
-                o.charged = big_d;
-            } else {
-                o.lanes = f.lanes;
-                o.charged = if own_mode { o.dur } else { big_d };
+            match o.beats {
+                Some(n) => {
+                    o.usage =
+                        (ceil_div(n as u128 * SCALE as u128, big_d as u128) as u64).clamp(1, f.cap);
+                    o.charged = big_d;
+                }
+                None => o.charged = if own_mode { o.dur } else { big_d },
             }
-            o.start = f.earliest(earliest, o.charged, o.lanes);
+            o.start = f.earliest_by(earliest, o.usage, |x| {
+                self.own_len(o, o.usage, o.charged, x, own_mode)
+            });
         }
         // Step 2.
         let mut t = own.iter().map(|o| o.start).max().expect("nonempty");
         // Step 3: fixpoint; t only advances. Each resource must have its
-        // lanes free for the length it is charged.
+        // slots free for the length it is charged (from t, on a resource
+        // with a fractional capacity).
         loop {
             let next = own
                 .iter()
-                .map(|o| self.flow(o.resource).earliest(t, o.charged, o.lanes))
+                .map(|o| {
+                    self.flow(o.resource).earliest_by(t, o.usage, |x| {
+                        self.own_len(o, o.usage, o.charged, x, own_mode)
+                    })
+                })
                 .max()
                 .expect("nonempty");
             if next == t {
@@ -685,17 +1088,20 @@ impl Resources {
             }
             t = next;
         }
-        // Starting on the free lanes (Section 5.4, decided 2026-10-12): a
-        // chunk that the full lanes delay may start at `earliest` on the
-        // lanes free there and run longer, if it then ends sooner.
-        let mut end = t + big_d;
+        for o in own.iter_mut() {
+            o.charged = self.own_len(o, o.usage, o.charged, t, own_mode);
+        }
+        let mut end = t + own.iter().map(|o| o.charged).max().expect("nonempty");
+        // Starting on the free slots (Section 5.4): a chunk that its full
+        // usage delays may start at `earliest` on the slots free there and
+        // run longer, if it then ends strictly sooner.
         if own_mode && t > earliest {
             let mut plan = std::mem::take(&mut self.narrow_plan);
-            if let Some((t2, d2)) = self.narrow(merged, own, earliest, &mut plan) {
-                if t2 + d2 < end {
-                    (t, end) = (t2, t2 + d2);
-                    for (o, &(k, c)) in own.iter_mut().zip(&plan) {
-                        (o.lanes, o.charged) = (k, c);
+            if let Some((t2, e2)) = self.narrow(own, earliest, &mut plan) {
+                if e2 < end {
+                    (t, end) = (t2, e2);
+                    for (o, &(u, c)) in own.iter_mut().zip(&plan) {
+                        (o.usage, o.charged) = (u, c);
                     }
                 }
             }
@@ -704,9 +1110,10 @@ impl Resources {
         // Step 4.
         for (i, o) in own.iter().enumerate() {
             let f = self.flow_mut(o.resource);
-            f.occupy(t, o.charged, o.lanes);
-            let parts = f.account(o.charged, o.lanes, &merged_dir[i]);
-            self.record_charge(o.resource, &merged_dir[i], t, o.charged, &parts);
+            f.occupy(t, o.charged, o.usage);
+            let parts = f.account(o.charged, o.usage, &merged_dir[i]);
+            let (span, usage, class) = (o.charged, o.usage, o.class);
+            self.record_charge(o.resource, &merged_dir[i], t, span, usage, &parts, class);
         }
         // Culprit: longest own duration; on a tie, the latest own start.
         let culprit = own
@@ -737,58 +1144,98 @@ impl Resources {
         })
     }
 
+    /// The length of `o`'s window from `t` at `usage`: `fixed` on an
+    /// integer capacity; on a fractional one the window that holds its
+    /// beats in the slots from `t` (Section 5.2), except a work demand
+    /// charged the chunk's D under the longest rule.
+    #[inline]
+    fn own_len(&self, o: &Own, usage: u64, fixed: u64, t: Cycle, own_mode: bool) -> u64 {
+        let f = self.flow(o.resource);
+        if f.frac.is_none() {
+            return fixed;
+        }
+        match o.beats {
+            Some(n) => f.window(t, n, usage),
+            None if own_mode => f.work_window(t, o.amount, o.util),
+            None => fixed,
+        }
+    }
+
     /// The narrow option of a compute chunk (Section 5.4, starting on the
-    /// free lanes): on each laned resource k' = the lanes free at
-    /// `earliest` (at least one, at most its full-lane count in `own`); D'
-    /// = the longest of the one-lane resources' own durations and
-    /// `ceil(amount / (k' x lane rate))` on each laned resource; each laned
-    /// resource holds `ceil(amount / (D' x lane rate))` lanes for D', a
-    /// one-lane resource its own duration. Returns the start found by the
-    /// same fixpoint and D', with the (lanes, length) of each resource in
-    /// `plan`; `None` without a laned resource.
+    /// free slots): on each data resource u' = the slots that stay free
+    /// from `earliest` over the window (at most its full usage), found by
+    /// shrinking u' while the window lengthens; D' = the longest of the
+    /// work resources' own durations and `ceil(beats / u')` on each data
+    /// resource; each data resource holds `beats / D'` slots for D', a
+    /// work resource its full usage. Returns the start found by the same
+    /// fixpoint and the chunk's end, with the (usage, length) of each
+    /// resource in `plan`; `None` without a data resource or with one that
+    /// has no free slot.
     fn narrow(
         &self,
-        merged: &[Demand],
         own: &[Own],
         earliest: Cycle,
-        plan: &mut Vec<(u32, u64)>,
+        plan: &mut Vec<(u64, u64)>,
     ) -> Option<(Cycle, u64)> {
-        let mut d2 = 0u64;
-        let mut laned = false;
-        for (o, d) in own.iter().zip(merged) {
-            let f = self.flow(o.resource);
-            if f.lanes > 1 {
-                laned = true;
-                let free = f.lanes.saturating_sub(f.used_at(earliest));
-                let k = free.clamp(1, o.lanes.max(1));
-                let lr = f.lane_rate;
-                d2 = d2.max(
-                    (d.amount as u128 * lr.den as u128).div_ceil(k as u128 * lr.num as u128) as u64,
-                );
-            } else {
-                d2 = d2.max(o.dur);
-            }
-        }
-        if !laned || d2 == 0 {
+        if own.iter().all(|o| o.beats.is_none()) {
             return None;
         }
         plan.clear();
-        plan.extend(own.iter().zip(merged).map(|(o, d)| {
+        plan.extend(own.iter().map(|o| {
             let f = self.flow(o.resource);
-            if f.lanes > 1 {
-                let lr = f.lane_rate;
-                let k = (d.amount as u128 * lr.den as u128).div_ceil(d2 as u128 * lr.num as u128);
-                (k.clamp(1, f.lanes as u128) as u32, d2)
-            } else {
-                (o.lanes, o.charged)
+            match o.beats {
+                Some(_) => ((f.cap - f.used_at(earliest)).min(o.usage), 0),
+                None => (o.usage, o.charged),
             }
         }));
+        let mut d2;
+        loop {
+            if own
+                .iter()
+                .zip(plan.iter())
+                .any(|(o, p)| o.beats.is_some() && p.0 == 0)
+            {
+                return None;
+            }
+            d2 = own
+                .iter()
+                .zip(plan.iter())
+                .map(|(o, &(u, _))| match o.beats {
+                    Some(n) => self.flow(o.resource).window(earliest, n, u),
+                    None => o.dur,
+                })
+                .max()
+                .expect("nonempty");
+            let mut changed = false;
+            for (o, p) in own.iter().zip(plan.iter_mut()) {
+                if o.beats.is_some() {
+                    let m = self.flow(o.resource).min_free(earliest, d2);
+                    if m < p.0 {
+                        p.0 = m;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (o, p) in own.iter().zip(plan.iter_mut()) {
+            if let Some(n) = o.beats {
+                let u =
+                    (ceil_div(n as u128 * SCALE as u128, d2 as u128) as u64).clamp(1, p.0.max(1));
+                *p = (u, d2);
+            }
+        }
         let mut t = earliest;
         loop {
             let next = own
                 .iter()
                 .zip(plan.iter())
-                .map(|(o, &(k, c))| self.flow(o.resource).earliest(t, c, k))
+                .map(|(o, &(u, c))| {
+                    self.flow(o.resource)
+                        .earliest_by(t, u, |x| self.own_len(o, u, c, x, true))
+                })
                 .max()
                 .expect("nonempty");
             if next == t {
@@ -796,22 +1243,31 @@ impl Resources {
             }
             t = next;
         }
-        Some((t, d2))
+        for (o, p) in own.iter().zip(plan.iter_mut()) {
+            p.1 = self.own_len(o, p.0, p.1, t, true);
+        }
+        let end = t + plan.iter().map(|p| p.1).max().expect("nonempty");
+        Some((t, end))
     }
 
     /// Records one charge per direction with a nonzero amount, when
-    /// recording; `cycles` are lane-cycles.
+    /// recording: its usage (`usage` split in proportion to the amounts)
+    /// and its slot-cycles.
+    #[allow(clippy::too_many_arguments)]
     fn record_charge(
         &mut self,
         r: ResourceId,
-        amounts: &DirCycles,
+        amounts: &DirAmounts,
         start: Cycle,
         span: Cycle,
-        parts: &DirCycles,
+        usage: u64,
+        parts: &DirSlots,
+        class: Option<u8>,
     ) {
         if !self.record {
             return;
         }
+        let tot: u128 = amounts.iter().map(|&a| a as u128).sum();
         for (k, dir) in [Dir::Read, Dir::Write, Dir::Work].into_iter().enumerate() {
             if amounts[k] > 0 {
                 self.charges.push(crate::tracer::Charge {
@@ -820,73 +1276,184 @@ impl Resources {
                     amount: amounts[k],
                     start,
                     span,
-                    cycles: parts[k],
+                    usage: (usage as u128 * amounts[k] as u128 / tot.max(1)) as u64,
+                    cycles: parts[k] as f64 / SCALE as f64,
+                    class,
                 });
             }
         }
     }
 
     /// Reserves a transfer chunk along `hops` in route order (Section 5.4,
-    /// data-path rule): hop 0 at the earliest window at or after
-    /// `earliest`, hop i+1 at or after hop i's start plus its latency. Hop
-    /// i's rate is the narrowest of `rate` (the master's) and the rates of
-    /// hops 0 to i; it holds `ceil(r / lane rate)` lanes for `ceil(bytes /
-    /// r)` cycles. A backward pass moves a hop later when the next one
-    /// starts more than one skid (its latency plus one cycle) after it
-    /// ends, unless that would put it after the next hop's start less its
-    /// latency (data order wins). The chunk ends at the last window's
-    /// end plus the last hop's latency. Returns `None` for no hops.
-    pub fn reserve_path(
+    /// data-path rule) for a master that moves one beat of `beat` bytes
+    /// per cycle. Hop 0 at or after `earliest`, hop i+1 at or after hop
+    /// i's start plus its latency. The chunk's beat on hop i is the
+    /// smaller of its beat on hop i-1 and the hop's beat; it needs r /
+    /// b_i slots there (r the rate from hop i-1, rule 2) and takes the
+    /// earlier-ending of two windows (rule 3, sharing): the earliest with
+    /// the need free throughout, and one from the earliest cycle with any
+    /// slot free on the slots that stay free over it. Each hop keeps that
+    /// window: data waits between hops when a later hop is busy. The
+    /// chunk ends at the last window's end plus the last hop's latency.
+    /// Returns `None` for no hops.
+    pub fn reserve_path(&mut self, hops: &[PathHop], beat: u64, earliest: Cycle) -> Option<Grant> {
+        let admit = Admit {
+            issue: earliest,
+            ..Admit::default()
+        };
+        self.place(hops, beat, Ratio::int(beat), earliest, false, admit)
+    }
+
+    /// [`Resources::reserve_path`] for a master of `beat` bytes that moves
+    /// `rate` bytes per core cycle (a clocked engine, Section 4.1); the
+    /// in-flight pools of the hops take the chunk by `admit` (Section
+    /// 5.4, data-path rule 7).
+    pub fn reserve_path_at(
         &mut self,
         hops: &[PathHop],
+        beat: u64,
         rate: Ratio,
         earliest: Cycle,
+        admit: Admit,
+    ) -> Option<Grant> {
+        self.place(hops, beat, rate, earliest, false, admit)
+    }
+
+    /// Adds an in-flight pool of `bytes` named `name` (Section 5.4,
+    /// data-path rule 7): an occupancy resource for its statistics and as
+    /// a queue culprit. Returns its index for [`PoolMark`].
+    pub fn add_pool(&mut self, name: &str, bytes: u64) -> u32 {
+        assert!(bytes > 0, "a pool of 0 bytes");
+        let resource = self.add_occupancy(name, Kind::Slots, bytes);
+        self.pools.push(Pool {
+            resource,
+            cap: bytes,
+            used: VecDeque::new(),
+            peak: 0,
+            held: 0,
+            waited: 0,
+        });
+        self.pools.len() as u32 - 1
+    }
+
+    /// Reserves a protocol message of `hop.amount` bytes on one hop
+    /// (Section 5.4, details): one slot, or the whole capacity of a hop
+    /// with less than one, for the message's beats at the smaller of
+    /// `beat` and the hop's beat; store and forward, so the sender's
+    /// earlier hops do not narrow it.
+    pub fn reserve_message(&mut self, hop: PathHop, beat: u64, earliest: Cycle) -> Grant {
+        let admit = Admit {
+            issue: earliest,
+            ..Admit::default()
+        };
+        self.place(&[hop], beat, Ratio::int(beat), earliest, true, admit)
+            .expect("one hop")
+    }
+
+    /// Books the hops of a transfer chunk from `earliest` in route order
+    /// (rules 1 to 3) into `plan`.
+    fn book(
+        &mut self,
+        hops: &[PathHop],
+        beat: u64,
+        rate: Ratio,
+        earliest: Cycle,
+        message: bool,
+        plan: &mut Vec<Placed>,
+    ) {
+        plan.clear();
+        // The rate from the previous hop, in bytes per cycle x SCALE, and
+        // the beat there.
+        let mut r = rate.num as u128 * SCALE as u128 / rate.den as u128;
+        let mut b_prev = beat;
+        let mut want = earliest;
+        for h in hops {
+            let f = self.flow(h.resource);
+            let b = b_prev.min(f.data_beat());
+            let beats = h.amount.div_ceil(b);
+            let need = if message {
+                SCALE.min(f.cap)
+            } else {
+                (ceil_div(r, b as u128).min(f.cap as u128) as u64).max(1)
+            };
+            let (s, d) = f.earliest_window(want, beats, need);
+            let (mut s, mut u, mut d) = (s, need, d);
+            if s > want && !message {
+                // Window B: from the first cycle with a free slot, on the
+                // slots that stay free while the window lengthens.
+                let tb = f.first_free(want);
+                if tb < s {
+                    let mut ub = need.min(f.cap - f.used_at(tb));
+                    let mut db;
+                    loop {
+                        db = f.window(tb, beats, ub);
+                        let m = f.min_free(tb, db);
+                        if m >= ub || m == 0 {
+                            ub = if m == 0 { 0 } else { ub };
+                            break;
+                        }
+                        ub = m;
+                    }
+                    if ub > 0 && tb + db < s + d {
+                        (s, u, d) = (tb, ub, db);
+                    }
+                }
+            }
+            self.flow_mut(h.resource).occupy(s, d, u);
+            plan.push(Placed {
+                start: s,
+                dur: d,
+                usage: u,
+                delay: s - want,
+            });
+            r = u as u128 * b as u128;
+            b_prev = b;
+            want = s + h.latency;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place(
+        &mut self,
+        hops: &[PathHop],
+        beat: u64,
+        rate: Ratio,
+        earliest: Cycle,
+        message: bool,
+        admit: Admit,
     ) -> Option<Grant> {
         if hops.is_empty() {
             return None;
         }
         let mut plan = std::mem::take(&mut self.plan);
-        plan.clear();
-        let mut r = rate;
-        let mut want = earliest;
-        for h in hops {
-            let f = self.flow(h.resource);
-            r = r.min(f.rate);
-            let k = f.lanes_for(r);
-            let d = (h.amount as u128 * r.den as u128)
-                .div_ceil(r.num as u128)
-                .max(1) as u64;
-            let s = f.earliest(want, d, k);
-            self.flow_mut(h.resource).occupy(s, d, k);
-            plan.push(Placed {
-                start: s,
-                dur: d,
-                lanes: k,
-                delay: s - want,
-            });
-            want = s + h.latency;
-        }
-        // Backward pass: no storage between hops beyond one skid.
-        for i in (0..hops.len() - 1).rev() {
-            let (cur, next) = (plan[i], plan[i + 1]);
-            let lat = hops[i].latency;
-            if next.start <= cur.start + cur.dur + lat + 1 {
-                continue;
+        let pooled = !message && (admit.tail.is_some() || hops.iter().any(|h| h.pool.is_some()));
+        let mut e = earliest;
+        // The pool whose room set the final e.
+        let mut waited_on: Option<u32> = None;
+        loop {
+            self.book(hops, beat, rate, e, message, &mut plan);
+            if !pooled {
+                break;
             }
-            let target = next.start - lat - 1 - cur.dur;
-            let res = hops[i].resource;
-            self.flow_mut(res).release(cur.start, cur.dur, cur.lanes);
-            let s = self.flow(res).earliest(target, cur.dur, cur.lanes);
-            let s = if s + lat <= next.start { s } else { cur.start };
-            self.flow_mut(res).occupy(s, cur.dur, cur.lanes);
-            plan[i].start = s;
+            match self.admit(hops, &plan, e, admit) {
+                None => break,
+                Some((next, p)) => {
+                    // Not admitted: free the route and try again later.
+                    for (h, q) in hops.iter().zip(plan.iter()) {
+                        self.flow_mut(h.resource).release(q.start, q.dur, q.usage);
+                    }
+                    e = next;
+                    waited_on = Some(p);
+                }
+            }
         }
+        let pool_wait = e - earliest;
         // Statistics, records, culprits.
         for (h, p) in hops.iter().zip(plan.iter()) {
             let mut amounts = [0; 3];
             amounts[h.dir.index()] = h.amount;
-            let parts = self.flow_mut(h.resource).account(p.dur, p.lanes, &amounts);
-            self.record_charge(h.resource, &amounts, p.start, p.dur, &parts);
+            let parts = self.flow_mut(h.resource).account(p.dur, p.usage, &amounts);
+            self.record_charge(h.resource, &amounts, p.start, p.dur, p.usage, &parts, None);
         }
         // The data arrives the last hop's latency after its window.
         let start = plan[0].start;
@@ -906,11 +1473,27 @@ impl Resources {
             .enumerate()
             .max_by_key(|(i, p)| (p.delay, *i))
             .expect("hops");
-        let queue_culprit = (qp.delay > 0).then(|| {
-            let q = hops[qi].resource;
-            self.flow_mut(q).delay_total += qp.delay;
-            q
-        });
+        let queue_culprit = match waited_on {
+            // The pool's wait counts in full; it is the queue culprit when
+            // it is longer than every hop's delay.
+            Some(p) => {
+                let pool = &mut self.pools[p as usize];
+                pool.waited += pool_wait;
+                let r = pool.resource;
+                if pool_wait >= qp.delay {
+                    Some(r)
+                } else {
+                    let q = hops[qi].resource;
+                    self.flow_mut(q).delay_total += qp.delay;
+                    Some(q)
+                }
+            }
+            None => (qp.delay > 0).then(|| {
+                let q = hops[qi].resource;
+                self.flow_mut(q).delay_total += qp.delay;
+                q
+            }),
+        };
         self.plan = plan;
         Some(Grant {
             start,
@@ -920,12 +1503,69 @@ impl Resources {
         })
     }
 
+    /// The pool test of a booked chunk (rule 7): each pool on the route
+    /// must hold the chunk's bytes from its request crossing the link,
+    /// max(issue, e - L_src - L_req), to the end of the marked hop's
+    /// window (the chunk's end for the tail). Holds them and returns
+    /// `None` when every pool has room; otherwise holds nothing and
+    /// returns the next e (the latest that any pool asks for) and that
+    /// pool.
+    fn admit(
+        &mut self,
+        hops: &[PathHop],
+        plan: &[Placed],
+        e: Cycle,
+        admit: Admit,
+    ) -> Option<(Cycle, u32)> {
+        let end = plan.iter().map(|p| p.start + p.dur).max().expect("hops")
+            + hops.last().expect("hops").latency;
+        let mut retry: Option<(Cycle, u32)> = None;
+        let mut holds: [(u32, Cycle, Cycle, u64); 4] = [(0, 0, 0, 0); 4];
+        let mut n = 0;
+        let mut at = 0;
+        let mut test = |pools: &[Pool], m: PoolMark, at: Cycle, h1: Cycle, bytes: u64| {
+            let back = admit.src_latency + at.saturating_sub(m.skip);
+            let h0 = admit.issue.max(e.saturating_sub(back));
+            let pool = &pools[m.pool as usize];
+            // A chunk larger than the pool holds the whole pool.
+            let bytes = bytes.min(pool.cap);
+            if pool.fits(h0, h1, bytes) {
+                assert!(n < holds.len(), "more than four pools on one route");
+                holds[n] = (m.pool, h0, h1, bytes);
+                n += 1;
+            } else {
+                let next = (pool.room_from(h0, h1, bytes) + back).max(e + 1);
+                if retry.is_none_or(|r| next > r.0) {
+                    retry = Some((next, m.pool));
+                }
+            }
+        };
+        for (h, p) in hops.iter().zip(plan) {
+            if let Some(m) = h.pool {
+                test(&self.pools, m, at, p.start + p.dur, h.amount);
+            }
+            at += h.latency;
+        }
+        if let Some(m) = admit.tail {
+            test(&self.pools, m, at, end, hops.last().expect("hops").amount);
+        }
+        if retry.is_none() {
+            for &(p, h0, h1, bytes) in &holds[..n] {
+                self.pools[p as usize].hold(h0, h1, bytes);
+            }
+        }
+        retry
+    }
+
     /// Drops calendar intervals that end at or before `now`.
     pub fn prune(&mut self, now: Cycle) {
         for r in &mut self.res {
             if let ResourceState::Flow(f) = &mut r.state {
                 f.prune(now);
             }
+        }
+        for p in &mut self.pools {
+            p.prune(now);
         }
     }
 
@@ -968,19 +1608,37 @@ impl Resources {
         o.waiters.drain(..).collect()
     }
 
-    /// Statistics of every resource, indexed by `ResourceId`.
+    /// Statistics of every resource, indexed by `ResourceId`. An in-flight
+    /// pool's row has its peak bytes, held byte-cycles and, in
+    /// `delay_cycles`, the cycles chunks waited for it.
     pub fn stats(&self) -> Vec<ResourceStats> {
+        let mut out = self.stats_rows();
+        for p in &self.pools {
+            let r = &mut out[p.resource.0 as usize];
+            r.peak = p.peak;
+            r.held_cycles = p.held as f64;
+            r.delay_cycles = p.waited;
+        }
+        out
+    }
+
+    fn stats_rows(&self) -> Vec<ResourceStats> {
         self.res
             .iter()
             .map(|r| match &r.state {
                 ResourceState::Flow(f) => ResourceStats {
                     name: r.name.clone(),
                     kind: r.kind,
-                    lanes: f.lanes,
-                    busy_cycles: f.busy_total,
-                    busy_read: f.busy_dir[0],
-                    busy_write: f.busy_dir[1],
-                    busy_work: f.busy_dir[2],
+                    slots: f.slots(),
+                    rate: f.core_rate().to_f64(),
+                    busy_cycles: whole(f.busy_total),
+                    busy_slot_cycles: f.busy_total as f64 / SCALE as f64,
+                    busy_read: whole(f.busy_dir[0]),
+                    busy_write: whole(f.busy_dir[1]),
+                    busy_work: whole(f.busy_dir[2]),
+                    bytes: f.bytes,
+                    size: 0,
+                    held_cycles: 0.0,
                     peak: 0,
                     log: None,
                     culprit_cycles: f.culprit_total,
@@ -989,11 +1647,16 @@ impl Resources {
                 ResourceState::Occupancy(o) => ResourceStats {
                     name: r.name.clone(),
                     kind: r.kind,
-                    lanes: 0,
+                    slots: 0.0,
+                    rate: 0.0,
                     busy_cycles: 0,
+                    busy_slot_cycles: 0.0,
                     busy_read: 0,
                     busy_write: 0,
                     busy_work: 0,
+                    bytes: 0,
+                    size: o.size,
+                    held_cycles: 0.0,
                     peak: o.peak,
                     log: None,
                     culprit_cycles: 0,
@@ -1004,9 +1667,14 @@ impl Resources {
     }
 }
 
+/// Slot-cycles in [`SCALE`] units, rounded to whole slot-cycles.
+fn whole(sc: u128) -> u64 {
+    ((sc + SCALE as u128 / 2) / SCALE as u128) as u64
+}
+
 /// Sums demands on the same resource and utilization into `out`; drops
 /// zero amounts.
-fn merge(demand: &[Demand], out: &mut Vec<Demand>, dirs: &mut Vec<DirCycles>) {
+fn merge(demand: &[Demand], out: &mut Vec<Demand>, dirs: &mut Vec<DirAmounts>) {
     out.clear();
     dirs.clear();
     for d in demand.iter().filter(|d| d.amount > 0) {
@@ -1033,25 +1701,25 @@ fn merge(demand: &[Demand], out: &mut Vec<Demand>, dirs: &mut Vec<DirCycles>) {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::FlowResource;
+    use super::{FlowResource, SCALE};
     use crate::time::Ratio;
 
     /// The calendar as it was before 2026-10-08: a tree, with the search
     /// that looks up every key it passes. The reference for the deque.
     #[derive(Default)]
-    struct Tree(BTreeMap<u64, u32>);
+    struct Tree(BTreeMap<u64, u64>);
 
     impl Tree {
-        fn used_at(&self, t: u64) -> u32 {
+        fn used_at(&self, t: u64) -> u64 {
             self.0.range(..=t).next_back().map_or(0, |(_, &v)| v)
         }
 
-        fn earliest(&self, lanes: u32, t: u64, d: u64, k: u32) -> u64 {
+        fn earliest(&self, cap: u64, t: u64, d: u64, k: u64) -> u64 {
             use std::ops::Bound::{Excluded, Unbounded};
             if d == 0 {
                 return t;
             }
-            let free = lanes - k.min(lanes);
+            let free = cap - k.min(cap);
             let mut cand = t;
             'search: loop {
                 if self.used_at(cand) > free {
@@ -1080,10 +1748,10 @@ mod tests {
             self.0.entry(t).or_insert(vt);
             self.0.entry(e).or_insert(ve);
             for (_, v) in self.0.range_mut(t..e) {
-                *v = (*v as i64 + delta) as u32;
+                *v = (*v as i64 + delta) as u64;
             }
             let before =
-                |m: &BTreeMap<u64, u32>, x: u64| m.range(..x).next_back().map_or(0, |(_, &v)| v);
+                |m: &BTreeMap<u64, u64>, x: u64| m.range(..x).next_back().map_or(0, |(_, &v)| v);
             if before(&self.0, t) == self.0[&t] {
                 self.0.remove(&t);
             }
@@ -1114,25 +1782,28 @@ mod tests {
             x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             (x >> 33) % n
         };
-        for lanes in [1u32, 2, 4, 8] {
-            let mut f = FlowResource::new(Ratio::int(64 * lanes as u64));
+        // Usages in quarter slots, on capacities of 1 to 8 slots.
+        let q = SCALE / 4;
+        for slots in [1u64, 2, 4, 8] {
+            let mut f = FlowResource::new(Ratio::int(64 * slots));
             f.set_beat(64);
-            assert_eq!(f.lanes, lanes);
+            let cap = slots * SCALE;
+            assert_eq!(f.cap, cap);
             let mut tree = Tree::default();
-            let mut held: Vec<(u64, u64, u32)> = Vec::new();
+            let mut held: Vec<(u64, u64, u64)> = Vec::new();
             let mut now = 0;
             for _ in 0..20_000 {
                 match rnd(10) {
                     // Reserve at the earliest window.
                     0..=5 => {
-                        let (t, d, k) = (now + rnd(200), 1 + rnd(40), 1 + rnd(lanes as u64) as u32);
+                        let (t, d, k) = (now + rnd(200), 1 + rnd(40), (1 + rnd(4 * slots)) * q);
                         let s = f.earliest(t, d, k);
-                        assert_eq!(s, tree.earliest(lanes, t, d, k), "earliest({t}, {d}, {k})");
+                        assert_eq!(s, tree.earliest(cap, t, d, k), "earliest({t}, {d}, {k})");
                         f.occupy(s, d, k);
                         tree.add(s, d, k as i64);
                         held.push((s, d, k));
                     }
-                    // Release a held window (the backward pass does).
+                    // Release a held window (pool admission does).
                     6 | 7 if !held.is_empty() => {
                         let (s, d, k) = held.swap_remove(rnd(held.len() as u64) as usize);
                         if s >= now {
@@ -1148,8 +1819,8 @@ mod tests {
                         held.retain(|&(s, _, _)| s >= now);
                     }
                 }
-                let keys: Vec<(u64, u32)> = f.used.iter().copied().collect();
-                let want: Vec<(u64, u32)> = tree.0.iter().map(|(&k, &v)| (k, v)).collect();
+                let keys: Vec<(u64, u64)> = f.used.iter().copied().collect();
+                let want: Vec<(u64, u64)> = tree.0.iter().map(|(&k, &v)| (k, v)).collect();
                 assert_eq!(keys, want);
             }
         }

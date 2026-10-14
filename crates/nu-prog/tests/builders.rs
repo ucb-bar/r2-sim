@@ -55,57 +55,64 @@ fn one_linear_layer() {
     let (s, end) = linear(tiny(), 256);
     assert_eq!(s.fatal, None);
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
-    // Hand computation (tiny.yaml; own co-charging; control lanes at 1/8
-    // of the data rate: a 64 B beat takes 16 cycles on a 4 B/cycle SM
-    // bridge lane and 8 on an 8 B/cycle crossbar port lane; each bridge
-    // adds 10 cycles of latency; the crossbar clsbus is an xbar, charged per
-    // port). Control messages go store and forward through one-message
-    // stages (after sm0's up bridge, after the port from sm0, after the port
-    // to the target, then the target's inbound table): a 1-beat message
-    // between SMs takes 16 + 10 + 8 + 8 + 16 + 10 = 68 cycles, a 2-beat
-    // matmul descriptor (88 B) 32 + 10 + 16 + 16 + 32 + 10 = 116. Each SM
-    // has one output block, so its end signal is a pin of the matmul
-    // (no join), and x has no producer in the window (its dep drops).
+    // Hand computation (tiny.yaml; own co-charging; control links at 1/8
+    // of the data rate: a 4 B/cycle SM bridge lane has capacity 1/16 at the
+    // 64 B message beat, with its slot in the cycles 15 mod 16, and an
+    // 8 B/cycle crossbar port lane capacity 1/8, with its slot in the
+    // cycles 7 mod 8 (whole slots by cycle): a beat waits for the next
+    // slot cycle; each bridge adds 10 cycles of latency; the crossbar
+    // clsbus is an xbar, charged per port). Control messages go store and
+    // forward through one-message stages (after sm0's up bridge, after the
+    // port from sm0, after the port to the target, then the target's
+    // inbound table): a 1-beat message between SMs sent at 8 takes the up
+    // bridge [8, 16) + 10, the ports [26, 32) and [32, 40) and the down
+    // bridge [40, 48) + 10: it arrives at 58. Each SM has one output
+    // block, so its end signal is a pin of the matmul (no join), and x has
+    // no producer in the window (its dep drops).
     // * The driver invokes 6 tasks at 8, 16, .., 48. The stage after sm0's
     //   up bridge holds one message until its transmission through the port
     //   from sm0 ends, so each forward starts its up-bridge transmission
     //   when the previous one leaves that stage: sm1 enters its tasks at
-    //   76, 110, 192 (up bridge from 8, 42, 76), sm2 at 202, 236, 318 (from
-    //   134, 168, 202).
-    // * DMAs (Section 5.4, data-path rule): hops in route order from the
+    //   58, 90, 170 (up bridge from 8, 32, 64; the third is a 2-beat
+    //   matmul descriptor (88 B) with the slots 79 and 95, ports to 136,
+    //   down bridge [136, 160)), sm2 at 170, 202, 282 (from 120, 144, 176).
+    // * DMAs (Section 5.4, data-path rule): hops in route order after the
+    //   source block's latency (SMEM 10, HBM 100; Section 5.7) and the
     //   engine latency 50, at the engine's 64 B beat narrowed by each hop.
-    //   x to sm1 (8 KiB): sm0's SMEM port [126, 254) on one of its two
-    //   lanes, sm0's bridge up (32 B/cycle) [126, 382), sm1's bridge down
-    //   and SMEM port to 402. x to sm2: sm0's bridge is busy until 382,
-    //   [382, 638); the backward pass moves its SMEM hop to [253, 381), one
-    //   skid before: chunk [253, 658), end at sm2's SMEM port.
-    // * W0 (64 KiB from HBM to sm1): HBM (64 B/cycle) [160, 1184), not held
+    //   x to sm1 (8 KiB): sm0's SMEM port [118, 246) on one of its two
+    //   slots, sm0's bridge up (32 B/cycle) [118, 374), sm1's bridge down
+    //   and SMEM port to 394. x to sm2: its SMEM hop [230, 358) on the
+    //   other slot; sm0's bridge is busy until 374, so the data waits and
+    //   crosses it [374, 630): chunk [230, 650), end at sm2's SMEM port.
+    // * W0 (64 KiB from HBM to sm1): HBM (64 B/cycle) [240, 1264), not held
     //   back by the slower bridge (no backpressure); sm1's bridge down after
-    //   the x DMA, [392, 2440), its SMEM port to 2450. W1 (to sm2): HBM
-    //   after W0, [1184, 2208); sm2's bridge [1184, 3232), SMEM to 3242.
-    // * Matmuls (608 cycles on SMEM) after the weights: sm1 [2454, 3062),
-    //   done 3066; sm2 [3246, 3854), done 3858.
-    // * The driver waits on (out1, 1): Resolve reaches it at 3134; the
-    //   Await for (out2, 1) registers at sm2; Resolve leaves at 3858 and
-    //   arrives at 3926.
-    // * sm0's source invoke queue: the head waits from 16 to 42, 42 to 76,
-    //   76 to 134, 134 to 168 and 168 to 202 (186 cycles).
-    assert_eq!(end, 3926);
+    //   the x DMA, [384, 2432), its SMEM port to 2442. W1 (to sm2): HBM
+    //   after W0, [1264, 2288); sm2's bridge [1264, 3312), SMEM to 3322.
+    // * Matmuls (608 cycles on SMEM) after the weights: sm1 [2446, 3054),
+    //   done 3058; sm2 [3326, 3934), done 3938.
+    // * The driver waits on (out1, 1): Resolve leaves sm1 at 3058 and
+    //   reaches it at 3114; the Await for (out2, 1) registers at sm2;
+    //   Resolve leaves at 3938: up bridge [3938, 3952) + 10, ports
+    //   [3962, 3968) and [3968, 3976), down bridge [3976, 3984) + 10: it
+    //   arrives at 3994.
+    // * sm0's source invoke queue: the head waits from 16 to 32, 32 to 64,
+    //   64 to 120, 120 to 144 and 144 to 176 (160 cycles).
+    assert_eq!(end, 3994);
     assert_eq!(
         (s.tasks[3].chunks[0].start, s.tasks[3].chunks[0].end),
-        (253, 658),
+        (230, 650),
         "sm2's x DMA waits for sm0's bridge behind sm1's"
     );
     assert_eq!(
         s.tasks[1].chunks[0],
         sim_core::ChunkRec {
-            start: 160,
-            end: 2450,
+            start: 240,
+            end: 2442,
             culprit: s.tasks[1].chunks[0].culprit
         }
     );
     assert_eq!(
-        s.tasks[4].chunks[0].start, 1184,
+        s.tasks[4].chunks[0].start, 1264,
         "W1 queues on HBM only for W0's HBM window"
     );
     // 6 Invoke, 2 Await, 2 AwaitAck, 2 Resolve; the two matmul invokes
@@ -118,7 +125,7 @@ fn one_linear_layer() {
             .find(|x| x.stage == name)
             .map_or(0, |x| x.hol_cycles)
     };
-    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 186);
+    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 160);
 }
 
 #[test]
@@ -143,28 +150,35 @@ fn one_moe_dispatch() {
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
     let r = report.borrow();
     assert_eq!(r.tokens_per_expert, vec![vec![vec![14, 2]]]);
-    // Critical path (by hand; a 1-beat message between SMs takes 68
-    // cycles, see one_linear_layer; DMAs by the data-path rule, hops in
-    // route order at the engine's 64 B beat): rmsnorm [18, 274); router
+    // Critical path (by hand; control messages by the slot cycles of
+    // one_linear_layer; DMAs by the data-path rule, hops in route order at
+    // the engine's 64 B beat after the source block's latency, HBM 100 and
+    // SMEM 10, and the engine latency 50): rmsnorm [18, 274); router
     // [278, 351); the load of its output [366, 367); the MoE window's
-    // forwards from 375. HBM (64 B/cycle) is not held back by the 32
-    // B/cycle SM bridges, so it serves the weight DMAs in invoke order,
-    // 1024 cycles each: expert 0's gate [527, 1551) and up [1551, 2575),
-    // expert 1's gate [2575, 3599) and up [3599, 4623). Expert 1 on sm2 (2
-    // tokens): its gate weight reaches SMEM at 4633; the gate matmul needs
-    // both SMEM lanes, but the up weight's DMA holds one lane at 32 B/cycle
-    // until 6681, so the matmul starts on the free lane (Section 5.4,
-    // starting on the free lanes) and takes 2 x 524 cycles: [4637, 5685).
-    // Down weight from 5739 (latency 50 after the gate matmul's
-    // completion), [5739, 8729). The up matmul (after the up weight, 6685)
-    // also runs on one lane beside the down weight's DMA: [6685, 7733).
-    // The vector op is bound by its Muon, so its SMEM demand takes one
-    // lane, [7747, 7779). Down matmul (it reads the down weight) 2 x 264
-    // cycles [8733, 9261), done 9265. Home depends on the down matmul's
-    // output directly (a pin, no end join): Resolve reaches home at 9333;
-    // pull [9383, 9435); add [9449, 9473), done 9477; the driver resumes
-    // at 9477.
-    assert_eq!(r.step_end[0], 9477);
+    // forwards from 375: the first takes the up bridge [375, 384) + 10,
+    // the ports [394, 400) and [400, 408) and the down bridge [408, 416) +
+    // 10 and reaches sm1 at 426; the second (expert 0's gate weight DMA)
+    // reaches it at 458. HBM (64 B/cycle) is not held back by the
+    // 32 B/cycle SM bridges, so it serves the weight DMAs in invoke order,
+    // 1024 cycles each: expert 0's gate [608, 1632) and up [1632, 2656),
+    // expert 1's gate [2656, 3680) and up [3680, 4704).
+    // Expert 1 on sm2 (2 tokens): its gate weight crosses sm2's bridge
+    // [2656, 4704) and reaches SMEM at 4714. The up weight's DMA then holds
+    // 0.5 SMEM slot (32 B/cycle) until 6762, so the gate matmul starts on
+    // the 1.5 free slots (Section 5.4, starting on the free slots): its
+    // 1048 slot-cycles take 699 cycles, [4718, 5417). The down weight's DMA
+    // waits for sm2's bridge behind the up weight: [6752, 8800), SMEM to
+    // 8810. The up matmul (after the up weight, 6766) also runs on the 1.5
+    // slots beside the down weight's DMA: [6766, 7465). The vector op is
+    // bound by its Muon, so its SMEM demand takes one slot, [7479, 7511).
+    // Down matmul (it reads the down weight) 2 x 264 cycles [8814, 9342),
+    // done 9346. Home depends on the down matmul's output directly (a pin,
+    // no end join): Resolve takes sm2's up bridge [9346, 9360) + 10, the
+    // ports [9370, 9376) and [9376, 9384) and sm0's down bridge
+    // [9384, 9392) + 10 and reaches home at 9402; pull (SMEM latency 10,
+    // engine latency 50) [9462, 9514); add [9528, 9552), done 9556; the
+    // driver resumes at 9556.
+    assert_eq!(r.step_end[0], 9556);
     // 16 Invoke, 2 Await, 2 AwaitAck, 2 Resolve.
     assert_eq!(s.messages, 22);
 }
@@ -258,22 +272,24 @@ fn matmul(b: &Built, pe: &str, c: nu_model::Range, n: u64, deps: Vec<nu_model::D
 fn an_invoke_to_a_full_owner_delays_an_invoke_to_a_free_owner() {
     // Head-of-line blocking (Section 3.3): sm1 has one scoreboard entry and
     // one inbound invoke entry; P1 (128^3) runs and P2 holds the scoreboard
-    // entry until P1 is done, at T. sm0 forwards M1..M4 to sm1 at 8, .., 32
-    // and M5 to sm2 at 40 (72 B matmul descriptors, 2 beats). Stages after
-    // sm0's up bridge (S1), the port from sm0 (S2), the port to the target
-    // (S3) and the target's down bridge (S4) hold one message each; the
-    // transmissions take 32 (+ 10), 16, 16 and 32 (+ 10) cycles.
-    // * M1: [8,40) S1 at 50; [50,66); [66,82); [82,114) + 10: sm1's inbound
-    //   entry at 124.
-    // * M2: [66,98) S1 at 108; [108,124); [124,140); [140,172) + 10: S4 at
-    //   182, waits for the inbound entry.
-    // * M3: [124,156) S1 at 166; [166,182); [182,198): S3 at 198, waits for
-    //   S4. M4: [182,214) S1 at 224; [224,240): S2 at 240, waits for S3.
-    // * M5 (to sm2): [240,272) S1 at 282, waits for S2, which M4 holds.
+    // entry until P1 is done, at T = 1292. sm0 forwards M1..M4 to sm1 at
+    // 8, .., 32 and M5 to sm2 at 40 (72 B matmul descriptors, 2 beats).
+    // Stages after sm0's up bridge (S1), the port from sm0 (S2), the port
+    // to the target (S3) and the target's down bridge (S4) hold one
+    // message each. A beat waits for the next slot cycle: 15 mod 16 on a
+    // bridge (+ 10 latency), 7 mod 8 on a port (whole slots by cycle).
+    // * M1: [8,32) S1 at 42; [42,56); [56,72); [72,96) + 10: sm1's inbound
+    //   entry at 106.
+    // * M2: [56,80) S1 at 90; [90,104); [104,120); [120,144) + 10: S4 at
+    //   154, waits for the inbound entry.
+    // * M3: [104,128) S1 at 138; [138,152); [152,168): S3 at 168, waits for
+    //   S4. M4: [152,176) S1 at 186; [186,200): S2 at 200, waits for S3.
+    // * M5 (to sm2): [200,224) S1 at 234, waits for S2, which M4 holds.
     // At T M1 enters sm1's scoreboard and M2 its inbound table; M3 moves
-    // [T, T+32), M4 [T+32, T+48), and M5 [T+48, T+64) into S2, then
-    // [T+64, T+80) and sm2's down bridge [T+80, T+112) + 10: sm2 at T+122.
-    // On a free path M5 would reach sm2 at 40 + 116 = 156.
+    // [1292, 1312) (slots 1295 and 1311), M4 [1312, 1328), and M5
+    // [1328, 1344) into S2, then [1344, 1360) and sm2's down bridge
+    // [1360, 1392) + 10: sm2 at 1402. On a free path M5 would reach sm2 at
+    // 40 + 98 = 138.
     let b = tiny_with(&[
         "root.gpc0.sm1.neutrino.scoreboard=1",
         "root.gpc0.sm1.neutrino.inbound_invokes=1",
@@ -320,26 +336,23 @@ fn an_invoke_to_a_full_owner_delays_an_invoke_to_a_free_owner() {
     assert_eq!(s.fatal, None, "{:?}", s.fatal);
     assert!(s.unfinished.is_empty());
     let t = s.tasks[2].invoke;
-    assert!(t > 282, "P1 is still running when M5 reaches S1");
+    assert_eq!(t, 1292, "P1 is still running when M5 reaches S1");
     let m5 = s.tasks.iter().find(|x| x.nu == b2).unwrap();
-    assert_eq!(m5.invoke, t + 122);
+    assert_eq!(m5.invoke, 1402);
     let hol = |name: &str| {
         s.stages
             .iter()
             .find(|x| x.stage == name)
             .map_or(0, |x| x.hol_cycles)
     };
-    // Head-of-line cycles on M5's path: S1 M5 [282, T+48); S2 M4
-    // [240, T+32); sm0's source queue M2 [16,66), M3 [66,124), M4
-    // [124,182), M5 [182,240). None after the port to sm2.
-    assert_eq!(
-        hol("root.gpc0.sm0.smcbus_to_clcbus.ab.invoke"),
-        t + 48 - 282
-    );
+    // Head-of-line cycles on M5's path: S1 M5 [234, 1328); S2 M4
+    // [200, 1312); sm0's source queue M2 [16,56), M3 [56,104), M4
+    // [104,152), M5 [152,200). None after the port to sm2.
+    assert_eq!(hol("root.gpc0.sm0.smcbus_to_clcbus.ab.invoke"), 1328 - 234);
     assert_eq!(
         hol("root.gpc0.clcbus.sm0.smcbus_to_clcbus.in.invoke"),
-        t + 32 - 240
+        1312 - 200
     );
-    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 50 + 58 + 58 + 58);
+    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 40 + 48 + 48 + 48);
     assert_eq!(hol("root.gpc0.clcbus.sm2.smcbus_to_clcbus.out.invoke"), 0);
 }

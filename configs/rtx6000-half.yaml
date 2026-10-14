@@ -1,12 +1,11 @@
-# The MIG 2g.48gb half of the RTX PRO 6000 Blackwell (rtx6000.yaml): the
-# instance we correlate against. Half the SMs (94 on the card; 6 GPCs x 16
-# here), half the memory controllers (8 devices, 896 GB/s = 343 B/cycle;
-# 32 GDDR7 channels of 9.5 B/cycle as tuned in rtx6000.yaml), half the L2
-# (64 MB, 32 slices), 48 GB. The device crossbar, the copy engine at the
-# device and the channel latency as rtx6000.yaml (tuned 2026-10-12). The slice hash
-# of a MIG instance is unmeasured: the full card's hash with the top index
-# bit (address bit 15) dropped is assumed. Everything else as rtx6000.yaml
-# (hash links, physical slices and channels).
+# The MIG 2g.48gb half of the RTX PRO 6000 Blackwell (rtx6000.yaml): half
+# the SMs (94 on the card; 6 GPCs x 16 here), half the memory controllers
+# (8 devices, 32 GDDR7 channels), half the L2 (64 MB, 32 slices), 48 GB.
+# Every block as in rtx6000.yaml (physical values of 2026-10-14: L2 slices
+# 64 / 32 B per L2 cycle at clock 7/8, GDDR7 channels 2 B per DRAM cycle at
+# 51/10, latencies 142). The slice hash of a MIG instance is unmeasured:
+# the full card's hash with the top index bit (address bit 15) dropped is
+# assumed. MIG is off on the measured card, so this half is not measured.
 
 global:
   neutrino_granule: 512
@@ -36,9 +35,9 @@ device:
               index: [0x100, 0x200, 0x400, 0x800, 0x1000]}}
   memory:
     - {name: l2, type: scratch, addr: [[0x100000000, 0x104000000]], banks: 32,
-       bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, latency: 180, slave: $this.l2bus}
+       bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, clock: 7/8, latency: 142, slave: $this.l2bus}
     - {name: hbm, type: dram, addr: [[0x2000000000, 0x2C00000000]], banks: 32,
-       bw_bytes: 9.5, beat_bytes: 4, latency: 830, slave: $this.mbus}
+       bw_bytes: 2, beat_bytes: 32, clock: 51/10, latency: 142, slave: $this.mbus}
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
   compute:
     - {name: dma, type: dma, latency: 40, inflight: 64, beat_bytes: 512, master: [$this.sbus]}

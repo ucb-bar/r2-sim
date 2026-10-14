@@ -1,23 +1,27 @@
 # One GPC of the RTX PRO 6000 Blackwell reference configuration: 16 SMs
 # (rtx6000-sm.yaml) behind the GPC's crossbar, with no memory of its own
-# (the L2 and the GDDR7 are the device's, rtx6000.yaml). The real GB202
-# has 192 SMs of which 188 are enabled; the model keeps 16 per GPC (+2 %).
+# (the L2 and the GDDR7 are the device's, rtx6000.yaml). GB202 has 192 SMs
+# of which 188 are enabled; the model keeps 16 per GPC (+2 %).
 #
-# * clsbus: the GPC crossbar, 512 B/cycle per port (16 SM links at 32).
-# * Link to the device crossbar: 272 B/cycle per direction (measured
-#   2026-10-12: the 14 SMs of one GPC read the L2 at 272 B/cycle together,
-#   19 each, while 14 SMs spread over other GPCs reach 462, 33 each), in 4 B
-#   lanes so that eight 32 B/cycle SM flows share it (256 B/cycle).
-#   Latency 40 cycles. The control link at 64 B/cycle, one message beat per
-#   cycle.
+# * clsbus: the GPC crossbar, 512 B/cycle per port in 32 B beats (16 SM
+#   links at 32; no limit observed inside a GPC).
+# * Link to the device crossbar: 276 B/cycle per direction in 32 B beats,
+#   the measured read rate of one GPC (the 14 SMs of one GPC: 275.9 B per SM
+#   cycle at the boost point; 14 SMs spread over GPCs: 421.9). This is a
+#   calibration point, not a match: on the card the limit is the data in
+#   flight per GPC (about 97 KB at both lock points, Little's law), so it
+#   scales with latency and saturates gradually, where a link rate gives a
+#   sharp knee. Latency 54 cycles (two thirds of the 81 per direction of
+#   fabric latency, rtx6000-sm.yaml). The control link: 64 B/cycle,
+#   latency 54 as the data link.
 # * No copy engine: SM transfers are the SMs' own (rtx6000-sm.yaml).
 
 fidelity: numeric
 fabric:
   - {name: clsbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
   - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
-  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 272, beat_bytes: 4, latency: 40}
-  - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 64, latency: 40, control: true}
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 276, beat_bytes: 32, latency: 54}
+  - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 64, latency: 54, control: true}
 memory:
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}

@@ -278,6 +278,10 @@ pub struct Half {
     /// (`u64::MAX`: none); all are powers of two, so its multiples are
     /// every boundary of the half.
     pub grid: u64,
+    /// Read half: a pool whose link the route crosses after its last hop
+    /// (Section 5.4, rule 7); its hold ends with the write half's first
+    /// hop.
+    pub pool_after: Option<crate::resource::PoolMark>,
 }
 
 /// A transfer chunk: `bytes` over the read half then the write half.
@@ -286,6 +290,9 @@ pub struct TransferChunk {
     pub read: Rc<Half>,
     pub write: Rc<Half>,
     pub bytes: u64,
+    /// The engine's beat in bytes (the start of the beat chain, Section
+    /// 5.4); the chunk's `rate` is the engine's bytes per core cycle.
+    pub beat: u64,
 }
 
 impl TransferChunk {
@@ -299,10 +306,20 @@ impl TransferChunk {
         if let Some(last) = buf.last_mut() {
             last.latency += self.write.lead;
         }
+        let first = buf.len();
         buf.extend(self.write.hops.iter().map(|h| PathHop {
             amount: self.bytes,
             ..*h
         }));
+        // A pool crossed after the read half's last hop ends with the
+        // write half's first hop.
+        if let (Some(m), Some(h)) = (self.read.pool_after, buf.get_mut(first)) {
+            debug_assert!(h.pool.is_none(), "two pools on one hop");
+            h.pool = Some(crate::resource::PoolMark {
+                skip: m.skip + self.write.lead,
+                ..m
+            });
+        }
     }
 }
 
@@ -355,6 +372,11 @@ impl TransferRoutes {
                     amount: 0,
                     dir,
                     latency,
+                    pool: None,
+                };
+                let from = |h: &crate::topology::Hop, dir| PathHop {
+                    pool: h.pool,
+                    ..hop(h.lane, dir, h.latency)
                 };
                 let grid = |blocks: &[u64]| {
                     blocks
@@ -366,13 +388,21 @@ impl TransferRoutes {
                 };
                 let read = topo.best_path(&m.attach, masters).map(|p| {
                     let mut hops = vec![hop(m.port, Dir::Read, p.lead)];
-                    hops.extend(p.hops.iter().map(|h| hop(h.lane, Dir::Read, h.latency)));
+                    hops.extend(p.hops.iter().map(|h| from(h, Dir::Read)));
+                    let after = hops.len();
                     hops.extend(links.iter().map(|l| hop(*l, Dir::Read, 0)));
+                    // A pool crossed after the route's last hop ends with
+                    // the engine's first link, else with the write half.
+                    let mut pool_after = p.pool_after;
+                    if let Some(h) = hops.get_mut(after) {
+                        h.pool = pool_after.take();
+                    }
                     Rc::new(Half {
                         hops: hops.into(),
                         lead: 0,
                         pair: topo.best_pair(&m.attach, masters),
                         grid: grid(&p.blocks),
+                        pool_after,
                     })
                 });
                 // The write half on the write channels (Section 3.5).
@@ -380,14 +410,20 @@ impl TransferRoutes {
                     let mut hops: Vec<PathHop> = p
                         .hops_for(Dir::Write)
                         .iter()
-                        .map(|h| hop(h.lane, Dir::Write, h.latency))
+                        .map(|h| from(h, Dir::Write))
                         .collect();
-                    hops.push(hop(m.port_for(Dir::Write), Dir::Write, 0));
+                    // A pool crossed after the route's last hop ends with
+                    // the block's write port.
+                    hops.push(PathHop {
+                        pool: p.pool_after,
+                        ..hop(m.port_for(Dir::Write), Dir::Write, 0)
+                    });
                     Rc::new(Half {
                         hops: hops.into(),
                         lead: p.lead,
                         pair: topo.best_pair(masters, &m.attach),
                         grid: grid(&p.blocks),
+                        pool_after: None,
                     })
                 });
                 halves.push((read, write));
@@ -479,6 +515,10 @@ pub struct Profile {
     pub chunks: Vec<Chunk>,
     /// Occupancy held from issue to completion.
     pub holds: Vec<Occupancy>,
+    /// A transfer's pipeline fill (architecture Section 5.7, source memory
+    /// latency): no chunk starts before the task's issue plus this many
+    /// cycles plus the chunk's own latency. 0 for a compute task.
+    pub fill: Cycle,
 }
 
 /// What a profile function sees of the hardware.
@@ -603,7 +643,9 @@ impl ProfileRegistry {
 /// engine to the destination block (each over the engine's master bus
 /// with the fewest bridges), and the destination port. The chunk latency
 /// is the engine latency; each hop carries the route latency to the next
-/// hop. The engine's beat rate starts the narrowing chain.
+/// hop. The engine's beat rate starts the narrowing chain. The transfer's
+/// pipeline fill is the latency of the block of its first source byte
+/// (architecture Section 5.7, source memory latency).
 pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Dma {
         src,
@@ -618,6 +660,7 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         latency,
         burst,
         beat,
+        clock,
         ..
     } = &node.pe.params
     else {
@@ -680,14 +723,19 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 read: rh.clone(),
                 write: wh.clone(),
                 bytes: n,
+                beat: *beat,
             }),
-            rate: Ratio::int(*beat),
+            rate: Ratio::new(*beat * clock.num, clock.den),
             latency: *latency,
         });
     }
+    let fill = r
+        .locate(src.0)
+        .map_or(0, |(b, _)| node.memories[b].load_latency);
     Profile {
         chunks,
         holds: Vec::new(),
+        fill,
     }
 }
 
@@ -728,6 +776,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         row_panel,
         ref rates,
         ref masters,
+        beat,
         ..
     } = node.pe.params
     else {
@@ -751,6 +800,17 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 node.topology.best_pair(masters, &m.attach),
             )
         });
+    // The class a tile runs at, for a tracer: the slower operand type's
+    // index in `rates` (the faster one's on a tie).
+    let class = (!rates.is_empty()).then(|| {
+        let at = |d: Dtype| rates.iter().position(|r| r.0 == d).unwrap_or(0);
+        let (a, b) = (at(in_dtype), at(b_dtype));
+        (if ratio_cmp(&rates[b].1, &rates[a].1).is_lt() {
+            b
+        } else {
+            a
+        }) as u8
+    });
     // The slower operand type sets the rate: the array charges
     // MACs * max / rate, as a utilization of rate / max.
     let utilization = match rates.iter().map(|r| r.1).max_by(ratio_cmp) {
@@ -788,6 +848,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             };
             let mut ops = Demand::work(array, qm * qn * k);
             ops.utilization = utilization;
+            ops.class = class;
             // Operands in, C out, and C in when accumulating. C is exact.
             let c_bytes = tm * tn * es;
             // With a row panel, A is read at the first output tile of the row.
@@ -859,6 +920,10 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                     dir,
                 })
             };
+            // The array's operand and C bytes move in its beats.
+            for d in demand.iter_mut().filter(|d| d.dir != Dir::Work) {
+                d.beat = beat;
+            }
             chunks.push(Chunk {
                 demand,
                 transfer: None,
@@ -874,6 +939,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     Profile {
         chunks,
         holds: Vec::new(),
+        fill: 0,
     }
 }
 
@@ -984,6 +1050,7 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         ref masters,
         utilization,
         overhead,
+        beat,
     } = node.pe.params
     else {
         panic!("vector opcode on PE {}", node.pe.name);
@@ -1035,6 +1102,9 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             demand.push(Demand::new(block.port_for(dir), bytes, dir));
         }
     }
+    for d in demand.iter_mut().filter(|d| d.dir != Dir::Work) {
+        d.beat = beat;
+    }
     Profile {
         chunks: vec![Chunk {
             demand,
@@ -1044,6 +1114,7 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             routes,
         }],
         holds: Vec::new(),
+        fill: 0,
     }
 }
 
@@ -1148,6 +1219,7 @@ device:
                 amount: n,
                 dir,
                 latency,
+                pool: None,
             };
             let mut path = vec![hop(sm.port, Dir::Read, inp.lead)];
             path.extend(inp.hops.iter().map(|h| hop(h.lane, Dir::Read, h.latency)));

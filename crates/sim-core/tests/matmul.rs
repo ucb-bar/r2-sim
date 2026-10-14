@@ -22,41 +22,43 @@ fn matmul_end_to_end() {
         ctx.invoke(db).await;
         ctx.invoke(mm).await;
         ctx.wait(c.base, 1).await;
-        assert_eq!(ctx.now(), 820);
+        assert_eq!(ctx.now(), 920);
     });
     let s = sim.run();
     assert_eq!(s.fatal, None);
     assert!(s.unfinished.is_empty());
-    assert_eq!(s.end_time, 820);
+    assert_eq!(s.end_time, 920);
 
     // Hand computation. Scalar: invoke A [0,8), invoke B [8,16),
     // invoke C [16,24), wait [24,26).
     let (ta, tb, tc) = (&s.tasks[0], &s.tasks[1], &s.tasks[2]);
-    // DMA A: issue 8, latency 100; hops in route order from 108: dram port
-    // (64 B/cycle) [108, 236), link (32) [108, 364), smem port narrowed to
-    // the link's 32 [108, 364); culprit link (the first longest window).
+    // DMA A: issue 8, the dram block's latency 100 (the pipeline fill,
+    // architecture Section 5.7) and the engine latency 100; hops in route
+    // order from 208: dram port (64 B/cycle) [208, 336), link (32)
+    // [208, 464), smem port narrowed to the link's 32 [208, 464); culprit
+    // link (the first longest window).
     assert_eq!((ta.invoke, ta.issue), (8, Some(8)));
-    assert_eq!((ta.chunks[0].start, ta.chunks[0].end), (108, 364));
+    assert_eq!((ta.chunks[0].start, ta.chunks[0].end), (208, 464));
     assert_eq!(ta.chunks[0].culprit, Some(n.link));
-    // c_complete [364, 368).
-    assert_eq!(ta.complete, Some(368));
-    // DMA B: issue 16, earliest 116: dram port busy until 236, [236, 364);
-    // the link is busy until 364, [364, 620), and the smem port [364, 620).
+    // c_complete [464, 468).
+    assert_eq!(ta.complete, Some(468));
+    // DMA B: issue 16, earliest 216: dram port busy until 336, [336, 464);
+    // the link is busy until 464, [464, 720), and the smem port [464, 720).
     // The chunk starts at its first hop.
     assert_eq!(tb.issue, Some(16));
-    assert_eq!((tb.chunks[0].start, tb.chunks[0].end), (236, 620));
-    assert_eq!(tb.complete, Some(624));
+    assert_eq!((tb.chunks[0].start, tb.chunks[0].end), (336, 720));
+    assert_eq!(tb.complete, Some(724));
     // Matmul: ready at B's completion. 64^3 MAC / 4096 = 64 cycles on the
     // array. On smem: operands (64*64 + 64*64) * 2 B plus the C writeback
     // 64*64 * 2 B = 24576 B / 128 = 192 cycles: culprit smem.
-    assert_eq!((tc.invoke, tc.ready, tc.issue), (24, Some(624), Some(624)));
-    assert_eq!((tc.chunks[0].start, tc.chunks[0].end), (624, 816));
+    assert_eq!((tc.invoke, tc.ready, tc.issue), (24, Some(724), Some(724)));
+    assert_eq!((tc.chunks[0].start, tc.chunks[0].end), (724, 916));
     assert_eq!(tc.chunks[0].culprit, Some(n.smem_port));
-    // c_complete [816, 820); the wait wakes at 820.
-    assert_eq!(tc.complete, Some(820));
+    // c_complete [916, 920); the wait wakes at 920.
+    assert_eq!(tc.complete, Some(920));
     // Versioned tasks retire at their own completion.
     let retires: Vec<Option<u64>> = s.tasks.iter().map(|t| t.retire).collect();
-    assert_eq!(retires, vec![Some(368), Some(624), Some(820)]);
+    assert_eq!(retires, vec![Some(468), Some(724), Some(920)]);
     assert_eq!(s.func_ops, 3);
     assert_eq!(s.resources[n.link.0 as usize].busy_cycles, 512);
 }
@@ -77,17 +79,19 @@ fn two_dmas(k: Knobs, bytes: u64, tile: u64) -> (Stats, sim_core::ResourceId) {
 
 #[test]
 fn two_dmas_on_one_link_interleave_by_chunk() {
-    // 4 chunks of 2 KiB each, 64 cycles on the link, no latency.
+    // 4 chunks of 2 KiB each, 64 cycles on the link, no engine latency;
+    // each transfer waits the dram block's latency (100) once.
     let k = Knobs {
         dma_latency: 0,
         ..Knobs::default()
     };
     let (s, _) = two_dmas(k, KB8, 2048);
     let ends = |i: usize| -> Vec<u64> { s.tasks[i].chunks.iter().map(|c| c.end).collect() };
-    // A issues at 8, B at 16. They alternate on the link.
-    assert_eq!(ends(0), vec![72, 200, 328, 456]);
-    assert_eq!(ends(1), vec![136, 264, 392, 520]);
-    // FIFO (one chunk per DMA) would end A at 8 + 256 = 264.
+    // A issues at 8 and starts at 108, B at 16 and 116. They alternate on
+    // the link.
+    assert_eq!(ends(0), vec![172, 300, 428, 556]);
+    assert_eq!(ends(1), vec![236, 364, 492, 620]);
+    // FIFO (one chunk per DMA) would end A at 108 + 256 = 364.
     let (s, _) = two_dmas(
         Knobs {
             dma_latency: 0,
@@ -96,8 +100,8 @@ fn two_dmas_on_one_link_interleave_by_chunk() {
         KB8,
         KB8,
     );
-    assert_eq!(s.tasks[0].chunks[0].end, 264);
-    assert_eq!(s.tasks[1].chunks[0].end, 520);
+    assert_eq!(s.tasks[0].chunks[0].end, 364);
+    assert_eq!(s.tasks[1].chunks[0].end, 620);
 }
 
 fn one_dma_last_end(outstanding: u32) -> u64 {
@@ -116,14 +120,16 @@ fn one_dma_last_end(outstanding: u32) -> u64 {
 
 #[test]
 fn max_outstanding_overlaps_latency() {
-    // 4 chunks, 64 cycles each on the link, latency 100, issue at 8.
-    // N = 1: every chunk pays the latency in series: 8 + 4 * (100 + 64).
-    assert_eq!(one_dma_last_end(1), 8 + 4 * 164);
-    // N = 2: chunks 0 and 1 at 108 and 172; chunk 2 is requested at 172
-    // and starts at 272, chunk 3 at 336.
-    assert_eq!(one_dma_last_end(2), 400);
-    // N = 4: all requested at 8, serialized from 108 at the link rate.
-    assert_eq!(one_dma_last_end(4), 108 + 4 * 64);
+    // 4 chunks, 64 cycles each on the link, engine latency 100, issue at
+    // 8; the dram block's latency (100) once, before the first chunk.
+    // N = 1: every chunk pays the engine latency in series:
+    // 8 + 100 + 4 * (100 + 64).
+    assert_eq!(one_dma_last_end(1), 108 + 4 * 164);
+    // N = 2: chunks 0 and 1 at 208 and 272; chunk 2 is requested at 272
+    // and starts at 372, chunk 3 at 436.
+    assert_eq!(one_dma_last_end(2), 500);
+    // N = 4: all requested at 8, serialized from 208 at the link rate.
+    assert_eq!(one_dma_last_end(4), 208 + 4 * 64);
 }
 
 #[test]
@@ -148,11 +154,12 @@ fn full_scoreboard_stalls_invoke_until_issue() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let (ta, tc, tb) = (&s.tasks[0], &s.tasks[1], &s.tasks[2]);
-    // A: [8, 264), c_complete [264, 268). The matmul issues at 268 and frees
-    // the scoreboard slot; the stalled invoke enters at the same time.
-    assert_eq!(ta.complete, Some(268));
-    assert_eq!(tc.issue, Some(268));
-    assert_eq!(tb.invoke, 268);
+    // A: the dram latency 100, [108, 364), c_complete [364, 368). The
+    // matmul issues at 368 and frees the scoreboard slot; the stalled
+    // invoke enters at the same time.
+    assert_eq!(ta.complete, Some(368));
+    assert_eq!(tc.issue, Some(368));
+    assert_eq!(tb.invoke, 368);
     assert!(s.unfinished.is_empty());
 }
 
@@ -361,8 +368,11 @@ fn a_full_version_table_is_fatal_for_a_local_invoke() {
     let s = sim.run();
     let f = s.fatal.expect("fatal");
     assert_eq!(f.error, FatalError::Dep(DepError::VersionsFull));
-    // 17 invokes of 8 cycles: the 17th executes at 136.
-    assert_eq!(f.time, 17 * 8);
+    // 17 invokes of 8 cycles; the 17th waits for a scoreboard entry (16):
+    // the first DMA issues at 8, waits the dram latency and the engine
+    // latency (208), moves 512 B on the 32 B/cycle link [208, 224) and
+    // completes at 228, when the 17th enters and finds no version entry.
+    assert_eq!(f.time, 228);
     assert_eq!(s.version_peak, vec![16]);
 }
 
@@ -612,8 +622,8 @@ fn an_accumulator_buffer_keeps_c_across_a_chain() {
 #[test]
 fn resolution_latency_delays_ready_and_wait_wake() {
     // As matmul_end_to_end with c_resolve = 100: the matmul's last dep
-    // (DMA B) resolves at 624, the matmul is ready at 724 and ends at 920;
-    // the program's pending wait on C wakes 100 later, at 1020. The DMAs
+    // (DMA B) resolves at 724, the matmul is ready at 824 and ends at 1020;
+    // the program's pending wait on C wakes 100 later, at 1120. The DMAs
     // have no deps and issue at once.
     let n = node(Knobs {
         resolve: 100,
@@ -628,13 +638,13 @@ fn resolution_latency_delays_ready_and_wait_wake() {
         ctx.invoke(db).await;
         ctx.invoke(mm).await;
         ctx.wait(c.base, 1).await;
-        assert_eq!(ctx.now(), 1020);
+        assert_eq!(ctx.now(), 1120);
     });
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let tc = &s.tasks[2];
-    assert_eq!((tc.ready, tc.complete), (Some(724), Some(920)));
-    assert_eq!(s.end_time, 1020);
+    assert_eq!((tc.ready, tc.complete), (Some(824), Some(1020)));
+    assert_eq!(s.end_time, 1120);
 }
 
 #[test]

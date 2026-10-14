@@ -149,12 +149,19 @@ pub enum PeParams {
         /// Data width in bytes: the engine moves at most one beat per
         /// cycle, the start of a transfer's narrowing chain (Section 5.4).
         beat: u64,
+        /// Clock ratio to the core clock (Section 4.1): the engine moves
+        /// `beat x clock` bytes per core cycle.
+        clock: Ratio,
     },
     /// A tensor unit.
     Atlas {
         /// The tensor-op resource, at the highest rate of `rates` (MACs per
         /// cycle).
         array: ResourceId,
+        /// Data width as a master (`beat_bytes`, default 64): operands and
+        /// C move in beats of this size, or of the port's if smaller
+        /// (Section 5.4).
+        beat: u64,
         /// MACs per cycle by operand type (Section 8.2); a GEMM whose
         /// slower operand type has rate r charges `MACs * max / r`. Empty:
         /// every type at the array rate.
@@ -190,6 +197,10 @@ pub enum PeParams {
     Muon {
         /// The vector-op resource (lane-ops per cycle).
         vector: ResourceId,
+        /// Data width as a master (`beat_bytes`, default 64): its bytes
+        /// move in beats of this size, or of a hop's if smaller (Section
+        /// 5.4).
+        beat: u64,
         /// The unit's attachments to the buses it masters: a task charges
         /// the block that holds its `dst`, over the route with the fewest
         /// links.

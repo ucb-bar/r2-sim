@@ -1,6 +1,6 @@
 //! The raw trace dump for the r2-vis converter (`--trace-raw DIR`).
 //!
-//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.6.
+//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.7.
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -25,7 +25,7 @@
 //! table; an outbound invoke entry waits for its task's invoke at the
 //! owner, which gives its gid.
 //!
-//! Unlimited links (lanes without a resource) get ids after the real
+//! Unlimited links (links without a resource) get ids after the real
 //! resources and records synthesized from the granted interval of the
 //! chunk, load, store or message hop that uses them (at least 1 cycle).
 
@@ -51,6 +51,9 @@ const NULL32: u32 = u32::MAX;
 const NULL64: u64 = u64::MAX;
 /// No slab entry.
 const NONE: u32 = u32::MAX;
+
+/// One slot in a charge record's `usage` (trace-raw 1.7).
+const USAGE_ONE: u32 = 65_536;
 
 /// Record layouts, in file order (trace-raw.md Section 4).
 const TASKS: &[(&str, &str)] = &[
@@ -94,11 +97,11 @@ const CHARGES: &[(&str, &str)] = &[
     ("start", "u64"),
     ("amount", "u64"),
     ("span", "u32"),
-    ("cycles", "u32"),
+    ("usage", "u32"),
     ("gid", "u32"),
     ("resource", "u16"),
     ("dir", "u8"),
-    ("msg", "u8"),
+    ("sub", "u8"),
 ];
 const PROGRAMS: &[(&str, &str)] = &[
     ("nu", "u16"),
@@ -814,16 +817,19 @@ impl RawTracer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// One charge record (trace-raw 1.7): `usage` in 1/65536 slot; `sub`
+    /// the message kind of a protocol message or the rate class of a
+    /// charge on a resource with rate classes.
     fn write_charge(
         &mut self,
         start: Cycle,
         amount: u64,
         span: Cycle,
-        cycles: Cycle,
+        usage: u32,
         owner: Own,
         resource: u16,
         dir: Dir,
-        msg: Option<u8>,
+        sub: Option<u8>,
     ) {
         if !(self.keep_res[resource as usize] && self.in_window(start, start + span)) {
             return;
@@ -836,11 +842,11 @@ impl RawTracer {
         r.u64(start)
             .u64(amount)
             .u32(c32(span))
-            .u32(c32(cycles))
+            .u32(usage)
             .u32(o32(gid))
             .u16(resource)
             .u8(dir as u8)
-            .u8(msg.unwrap_or(u8::MAX));
+            .u8(sub.unwrap_or(u8::MAX));
         match owner {
             Own::Gid(_) => self.emit(T_CHARGES, r.done()),
             Own::Held(k) => {
@@ -899,7 +905,8 @@ impl RawTracer {
         let span = end.saturating_sub(start).max(1);
         for k in ids.0..ids.0 + ids.1 {
             let id = self.links[k as usize];
-            self.write_charge(start, amount, span, span, owner, id, dir, msg);
+            // One notional slot on an unlimited link.
+            self.write_charge(start, amount, span, USAGE_ONE, owner, id, dir, msg);
         }
     }
 
@@ -1330,15 +1337,17 @@ impl Tracer for RawTracer {
             _ => None,
         };
         let owner = self.owner(who);
+        // Slots x 65536, rounded down.
+        let usage = (c.usage as u128 * USAGE_ONE as u128 / sim_core::SCALE as u128) as u32;
         self.write_charge(
             c.start,
             c.amount,
             c.span,
-            c.cycles,
+            usage,
             owner,
             c.resource.0 as u16,
             c.dir,
-            msg,
+            msg.or(c.class),
         );
         if let Who::Message {
             from,
@@ -1925,16 +1934,41 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             let r = res.get(id);
             json!({
                 "id": i, "name": r.name, "kind": format!("{:?}", r.kind),
-                "rate": res.flow_rate(id).map_or(Value::Null, ratio),
-                // Lanes: a flow resource has them (1 without a beat); an
-                // occupancy resource has none.
-                "lanes": res.flow_rate(id).map(|_| res.flow(id).lanes()),
+                // Units per core cycle; slots per core cycle (1.7).
+                "rate": res.flow_rate(id).map_or(Value::Null, |_| ratio(res.flow(id).core_rate())),
+                "capacity": res.flow_rate(id).map_or(Value::Null, |_| ratio(res.flow(id).capacity())),
+                "clock": res.flow_rate(id).map_or(json!([1, 1]), |_| ratio(res.flow(id).clock())),
                 "beat_bytes": res.flow_rate(id).and_then(|_| res.flow(id).beat()),
                 "owner": owner_of(&r.name, &nodes),
                 "role": role[i].clone().unwrap_or(json!({"type": "other"})),
             })
         })
         .collect();
+    // Rate classes (1.7): an Atlas array's rate per operand type, per core
+    // cycle, in the order its charges' `sub` indexes.
+    for i in 0..b.sim.pe_count() {
+        if let sim_core::PeParams::Atlas { array, rates, .. } =
+            &b.sim.pe_config(sim_core::PeId(i as u32)).params
+        {
+            let clock = res.flow(*array).clock();
+            let classes: Vec<Value> = rates
+                .iter()
+                .map(|(d, r)| {
+                    let name = match d {
+                        sim_core::Dtype::Bf16 => "bf16",
+                        sim_core::Dtype::F32 => "f32",
+                        sim_core::Dtype::Fp8 => "fp8",
+                        sim_core::Dtype::Mxfp4 => "mxfp4",
+                    };
+                    let core = sim_core::Ratio::new(r.num * clock.num, r.den * clock.den);
+                    json!({"name": name, "rate": ratio(core)})
+                })
+                .collect();
+            if !classes.is_empty() {
+                res_rows[array.0 as usize]["rates"] = Value::Array(classes);
+            }
+        }
+    }
     let mut links: Vec<(&Link, &u16)> = unlimited.iter().collect();
     links.sort_by_key(|l| *l.1);
     for (l, &id) in links {
@@ -1962,7 +1996,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         };
         res_rows.push(json!({
             "id": id, "name": name, "kind": "Bandwidth", "rate": null,
-            "lanes": null, "beat_bytes": null,
+            "capacity": null, "clock": [1, 1], "beat_bytes": null,
             "owner": owner_of(&name, &nodes), "role": role,
         }));
     }
@@ -1977,7 +2011,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
     let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
     json!({
         "format": "r2raw",
-        "version": [1, 6],
+        "version": [1, 7],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

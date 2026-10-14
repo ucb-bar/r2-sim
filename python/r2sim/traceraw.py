@@ -1,16 +1,20 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.6). The checks are the
-ones of its Section 8, plus the file layout:
+The format is r2-vis's `trace-raw.md` (version 1.7; older versions read
+as that document says). The checks are the ones of its Section 8, plus
+the file layout:
 
 * the manifest's record layouts have the record sizes of the format, every
   binary file holds whole records, and the counts match `summary.json`;
 * in a complete dump (`filters.partial` false), every gid in chunks,
   deps, charges and programs.spawn has a task record;
-* on a resource with a rate, the lanes held at any cycle (a record holds
-  cycles / span lanes over [start, start + span)) are at most its `lanes`
-  (one for a 1.0 dump); per resource the cycles (lane-cycles) sum to
-  `busy_cycles` of the `--stats` JSON (with `--stats`);
+* on a resource with a rate, the slots held at any cycle (version 1.7: a
+  record holds usage / 65536 slots over [start, start + span), at most
+  floor(capacity x 65536) / 65536 in all; 1.1 to 1.6: cycles / span
+  lanes, at most `lanes`) fit its capacity; per resource the slot-cycles
+  match the `--stats` JSON (1.7: `busy_slot_cycles` within the records'
+  spans / 65536; before: `busy_cycles` exactly); a charge's `sub` on a
+  resource with `rates` is one of its classes;
 * entries (version 1.3): end >= start; per Neutrino and table the open
   entries at any cycle are at most the table's capacity in the manifest;
   in a complete dump every gid has a task record, a pending entry that
@@ -23,8 +27,9 @@ ones of its Section 8, plus the file layout:
   the role mem_port with "write" true;
 * write channels (version 1.5): every write channel resource (links
   `ab_wr`/`ba_wr`, attachments `in_wr`/`out_wr`, a bus's resource with a
-  write role) has the role of its element with "write" true and lanes =
-  ceil(wr_bytes / beat_bytes); charges on it are writes, and no write
+  write role) has the role of its element with "write" true and capacity
+  = wr_bytes / beat_bytes x clock (lanes = ceil(wr_bytes / beat_bytes)
+  before 1.7); charges on it are writes, and no write
   charge lands on the read channel of an element that has a write
   channel;
 * charge owners (version 1.6): every non-null `gid` is a task gid (with a
@@ -37,7 +42,7 @@ ones of its Section 8, plus the file layout:
   owners are counted by message kind or resource role;
 * every resource id in the records is in the manifest, every link of the
   topology tables has a resource, and records on unlimited links have
-  span = cycles >= 1;
+  span >= 1 and usage = 65536 (1.7; span = cycles before);
 * with `--reference FULL` (a complete dump of the same run): the dump
   holds exactly the records of FULL that the filters of its manifest keep
   (architecture Section 7.3, trace-raw.md Section 1.1).
@@ -162,6 +167,35 @@ def check_gids(r: Report, manifest: dict, recs: dict) -> None:
             r.check(n == 0, f"{stem}.{field}: {n} gids without a task record")
 
 
+USAGE_ONE = 65536
+
+
+def v17(manifest: dict) -> bool:
+    return manifest["version"] >= [1, 7]
+
+
+def capacity(x: dict) -> float:
+    """Slots per core cycle (1.7), or the lanes of an older dump."""
+    if x.get("capacity") is not None:
+        num, den = x["capacity"]
+        return num / den
+    return float(x.get("lanes") or 1)
+
+
+def sub_of(c: np.ndarray) -> np.ndarray:
+    """The `sub` field (1.7), `msg` before."""
+    return c["sub"] if "sub" in c.dtype.names else c["msg"]
+
+
+def is_message(manifest: dict, c: np.ndarray) -> np.ndarray:
+    """Records of protocol messages: a `sub` on a resource without rate
+    classes (on one with `rates`, `sub` is the class)."""
+    res = manifest["resources"]
+    classed = np.array([bool(x.get("rates")) for x in res] + [False])
+    ids = np.minimum(c["resource"].astype(np.int64), len(res))
+    return (sub_of(c) != 0xFF) & ~classed[ids]
+
+
 def check_charges(r: Report, manifest: dict, recs: dict, stats: dict | None) -> None:
     c = recs.get("charges")
     if c is None:
@@ -174,14 +208,24 @@ def check_charges(r: Report, manifest: dict, recs: dict, stats: dict | None) -> 
     ids = np.minimum(ids, len(res) - 1)
     on_rated = rated[ids]
     u = c[~on_rated]
-    r.check(bool(((u["span"] >= 1) & (u["span"] == u["cycles"])).all()),
-            f"{len(u)} unlimited-link records have span = cycles >= 1")
+    if v17(manifest):
+        r.check(bool(((u["span"] >= 1) & (u["usage"] == USAGE_ONE)).all()),
+                f"{len(u)} unlimited-link records have span >= 1 and usage = one slot")
+    else:
+        r.check(bool(((u["span"] >= 1) & (u["span"] == u["cycles"])).all()),
+                f"{len(u)} unlimited-link records have span = cycles >= 1")
     # Capacity on rated resources: sweep the records of nonzero span in
     # time order per resource (an end before a start at the same cycle);
-    # the lanes held never exceed the resource's lanes.
-    lanes = np.array([x.get("lanes") or 1 for x in res], dtype=np.float64)
+    # the slots held never exceed the resource's capacity.
+    if v17(manifest):
+        lanes = np.array([np.floor(capacity(x) * USAGE_ONE) / USAGE_ONE for x in res])
+    else:
+        lanes = np.array([capacity(x) for x in res], dtype=np.float64)
     k = c[on_rated & (c["span"] > 0)]
-    held = k["cycles"].astype(np.float64) / k["span"].astype(np.float64)
+    if v17(manifest):
+        held = k["usage"].astype(np.float64) / USAGE_ONE
+    else:
+        held = k["cycles"].astype(np.float64) / k["span"].astype(np.float64)
     rid = k["resource"].astype(np.int64)
     t = np.concatenate([k["start"], k["start"] + k["span"].astype(np.uint64)])
     dl = np.concatenate([held, -held])
@@ -199,9 +243,29 @@ def check_charges(r: Report, manifest: dict, recs: dict, stats: dict | None) -> 
     r.check(n == 0, f"rated resources: {n} cycles over capacity")
     if n:
         i = int(np.flatnonzero(over)[0])
-        print(f"      first: resource {rr[i]} at {t[i]}: {level[i]:.2f} of {lanes[rr[i]]:.0f} lanes")
+        print(f"      first: resource {rr[i]} at {t[i]}: {level[i]:.4f} of {lanes[rr[i]]:.4f} slots")
+    if v17(manifest):
+        classes = np.array([len(x.get("rates") or []) for x in res] + [0])
+        sub = sub_of(c).astype(np.int64)
+        on_classed = classes[np.minimum(c["resource"].astype(np.int64), len(res))] > 0
+        bad = int(np.count_nonzero(on_classed & (sub != 0xFF)
+                                   & (sub >= classes[np.minimum(c["resource"].astype(np.int64), len(res))])))
+        r.check(bad == 0, f"rate classes: {int(on_classed.sum())} records, {bad} with no such class")
     if stats is not None and manifest["filters"]["partial"]:
         print("skip  per-resource cycles against busy_cycles (partial dump)")
+    elif stats is not None and v17(manifest):
+        busy = {x["name"]: x["busy_slot_cycles"] for x in stats["resources"]}
+        k = c[on_rated]
+        sc = np.bincount(k["resource"], weights=k["usage"].astype(np.float64) / USAGE_ONE
+                         * k["span"].astype(np.float64), minlength=len(res))
+        tol = np.bincount(k["resource"], weights=k["span"].astype(np.float64) / USAGE_ONE,
+                          minlength=len(res))
+        bad = [(x["name"], sc[x["id"]], busy[x["name"]]) for x in res
+               if x["rate"] is not None and x["name"] in busy
+               and abs(sc[x["id"]] - busy[x["name"]]) > tol[x["id"]] + 1e-6]
+        r.check(not bad, f"per-resource slot-cycles match busy_slot_cycles ({len(bad)} differ)")
+        for b in bad[:5]:
+            print(f"      {b[0]}: charges {b[1]:.3f}, stats {b[2]:.3f}")
     elif stats is not None:
         busy = {x["name"]: x["busy_cycles"] for x in stats["resources"]}
         sums = np.bincount(c["resource"], weights=c["cycles"].astype(np.float64),
@@ -324,10 +388,18 @@ def check_channels(r: Report, manifest: dict, recs: dict) -> None:
         if not w["role"].get("write") or w["role"]["type"] != rr["role"]["type"]:
             bad.append(f"{w['name']}: role {w['role']}")
         num, den = w["rate"]
-        want = -(-num // (den * w["beat_bytes"])) if w["beat_bytes"] else 1
-        if w["lanes"] != max(want, 1) or w["beat_bytes"] != rr["beat_bytes"]:
-            bad.append(f"{w['name']}: lanes {w['lanes']} beat {w['beat_bytes']}")
-    r.check(not bad, f"{len(pairs)} write channels: roles and lanes")
+        if v17(manifest):
+            # `rate` is per core cycle: capacity = rate / beat.
+            beat = w["beat_bytes"] or 1
+            ok = abs(capacity(w) - num / (den * beat)) < 1e-9
+            what = f"capacity {w.get('capacity')}"
+        else:
+            want = -(-num // (den * w["beat_bytes"])) if w["beat_bytes"] else 1
+            ok = w["lanes"] == max(want, 1)
+            what = f"lanes {w['lanes']}"
+        if not ok or w["beat_bytes"] != rr["beat_bytes"]:
+            bad.append(f"{w['name']}: {what} beat {w['beat_bytes']}")
+    r.check(not bad, f"{len(pairs)} write channels: roles and capacity")
     for b in bad[:5]:
         print(f"      {b}")
     c = recs.get("charges")
@@ -371,8 +443,8 @@ def check_owners(r: Report, manifest: dict, recs: dict) -> None:
         miss = int(np.count_nonzero(known[pos] != g)) if len(known) else len(g)
         r.check(miss == 0, f"task owners: {int(task.sum())} records, {miss} without a task record")
     kinds = manifest["message_kinds"]
-    msg = c["msg"].astype(np.int64)
-    is_msg = msg != 0xFF
+    msg = sub_of(c).astype(np.int64)
+    is_msg = is_message(manifest, c)
     # Allowed owners per kind: t task, p program, s spawn task.
     allowed = {"Invoke": "t", "InvokeAck": "tp", "RetryAck": "tp", "Reject": "tp",
                "Await": "tp", "AwaitAck": "tp", "Resolve": "tp", "Start": "s", "Return": "s"}
@@ -475,7 +547,7 @@ def kept(manifest: dict, full: dict) -> dict[str, np.ndarray]:
         c = full["charges"]
         end = c["start"] + c["span"].astype(np.uint64)
         types = f.get("types")
-        is_msg = c["msg"] != 0xFF
+        is_msg = is_message(manifest, c)
         kind = np.where(is_msg, types is None or "messages" in types,
                         types is None or "charges" in types)
         out["charges"] = c[keep_res[c["resource"]] & overlaps(c["start"], end, lo, hi) & kind]

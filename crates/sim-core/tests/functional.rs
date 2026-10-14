@@ -95,14 +95,14 @@ fn zero_time_functional_check_is_bit_exact() {
 fn timing_mode_with_numeric_gives_the_same_c() {
     let (end, loaded, final_c, want) = matmul_numeric(false);
     // Scalar: invoke C [0,8), A [8,16), B [16,24), wait [24,26). DMA A at
-    // 16, hops in route order from 116: DRAM port [116,244) at 64 B/cycle,
-    // the link (32 B/cycle) [116,372), the SMEM port narrowed to 32
-    // [116,372); complete 376. DMA B at 24: DRAM port [244,372), link busy
-    // until 372, [372,628), SMEM port [372,628); complete 632. Matmul
-    // [632,824), complete 828. Load: 1 cycle issue cost, 10 cycles smem
-    // latency, then 8 KiB on the port at the Neutrino's 64 B beat: 128
-    // cycles.
-    assert_eq!(end, 828 + 1 + 10 + 128);
+    // 16, the DRAM block's latency 100 and the engine latency 100, hops in
+    // route order from 216: DRAM port [216,344) at 64 B/cycle, the link
+    // (32 B/cycle) [216,472), the SMEM port narrowed to 32 [216,472);
+    // complete 476. DMA B at 24: DRAM port [344,472), link busy until 472,
+    // [472,728), SMEM port [472,728); complete 732. Matmul [732,924),
+    // complete 928. Load: 1 cycle issue cost, 10 cycles smem latency, then
+    // 8 KiB on the port at the Neutrino's 64 B beat: 128 cycles.
+    assert_eq!(end, 928 + 1 + 10 + 128);
     assert_eq!(loaded, want);
     assert_eq!(final_c, want);
 }
@@ -228,6 +228,8 @@ fn load_does_not_wait_for_unrelated_ops() {
             max_inflight: 8,
             max_outstanding: 1,
             params: PeParams::Atlas {
+                // Wide enough not to narrow the ports.
+                beat: 1024,
                 masters: Vec::new(),
                 rates: Vec::new(),
                 row_panel: false,

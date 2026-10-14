@@ -103,7 +103,8 @@ fn busy(s: &Stats, name: &str) -> u64 {
 /// at 64 B/cycle (4096 B, 64 cycles on the shared element): on one channel
 /// the second waits for the first; with a write channel of 64 B/cycle each
 /// takes as long as alone; with one of 32 B/cycle the write takes 4096 /
-/// 32 = 128 cycles on it. `cfg(wr)` gives the bus and link keys (`wr` 0:
+/// 32 = 128 cycles on it, on its half slot (64 B beats): 64 slot-cycles.
+/// `cfg(wr)` gives the bus and link keys (`wr` 0:
 /// no write channel); `rd` and `wr` name the shared element's channels.
 fn check(cfg: impl Fn(u64) -> (String, String), rd: &str, wr: &str) {
     let build = |w| {
@@ -125,7 +126,7 @@ fn check(cfg: impl Fn(u64) -> (String, String), rd: &str, wr: &str) {
         (read.max(write), 64, 64)
     );
     let (_, s) = run(build(32), true);
-    assert_eq!((busy(&s, rd), busy(&s, wr)), (64, 128));
+    assert_eq!((busy(&s, rd), busy(&s, wr)), (64, 64));
     // A read alone does not touch the write channel.
     let (end, s) = run(build(32), false);
     assert_eq!((end, busy(&s, wr)), (64, 0));

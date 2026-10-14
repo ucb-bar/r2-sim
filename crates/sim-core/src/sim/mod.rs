@@ -250,6 +250,12 @@ struct Running {
     held: bool,
     /// Streaming: the latest end of the chunks issued so far.
     last_end: Cycle,
+    /// No chunk starts before this cycle plus its own latency: the issue
+    /// plus the profile's pipeline fill (architecture Section 5.7).
+    fill: Cycle,
+    /// The pipeline fill itself: the source block's latency (for the
+    /// in-flight pools, Section 5.4, rule 7).
+    src_latency: Cycle,
 }
 
 struct Pe {
@@ -330,6 +336,8 @@ pub struct Sim {
     bus_wr_rates: Vec<Option<crate::time::Ratio>>,
     /// Beat of each bus's resources; `None`: one lane.
     bus_beats: Vec<Option<u64>>,
+    /// Per bus: its clock ratio (Section 4.1), for its resources.
+    bus_clocks: Vec<crate::time::Ratio>,
     /// Cycle of the last task issue or completion.
     last_progress: Cycle,
     /// Idle cycles with continuing replays that stop the run as a retry
@@ -386,6 +394,7 @@ impl Sim {
             bus_rates: Vec::new(),
             bus_wr_rates: Vec::new(),
             bus_beats: Vec::new(),
+            bus_clocks: Vec::new(),
             last_progress: 0,
             livelock_cycles: None,
             livelock: Cycle::MAX,
@@ -565,6 +574,7 @@ impl Sim {
         self.bus_rates.push(rate);
         self.bus_wr_rates.push(None);
         self.bus_beats.push(None);
+        self.bus_clocks.push(crate::time::Ratio::ONE);
         self.topo.add_bus(Bus {
             name: name.to_string(),
             topology,
@@ -582,7 +592,7 @@ impl Sim {
         self.bus_rates[bus.0 as usize]
     }
 
-    /// Splits the resources of `bus` into lanes of `beat` bytes: its shared
+    /// Splits the resources of `bus` into slots of `beat` bytes: its shared
     /// lane, and the ports of the attachments made from now on.
     /// Gives a bus a write channel at `rate` (`wr_bytes`, Section 3.5): a
     /// write lane for a `Shared` bus, write ports for the attachments of an
@@ -612,8 +622,19 @@ impl Sim {
             if let (Some(r), Some(beat)) = (lane, self.bus_beats[bus.0 as usize]) {
                 self.res.set_beat(r, beat);
             }
+            if let Some(r) = lane {
+                self.res.set_clock(r, self.bus_clocks[bus.0 as usize]);
+            }
             self.topo.set_bus_wr(bus, lane);
         }
+    }
+
+    /// Gives fabric link `link` an in-flight pool of `bytes` named `name`
+    /// for the data moving from its `a` bus to its `b` bus (`ab`) or back
+    /// (Section 5.4, data-path rule 7).
+    pub fn set_link_pool(&mut self, link: usize, ab: bool, name: &str, bytes: u64) {
+        let pool = self.res.add_pool(name, bytes);
+        self.topo.set_link_pool(link, ab, pool);
     }
 
     /// Gives fabric link `link` a write channel per direction.
@@ -625,6 +646,16 @@ impl Sim {
         self.bus_beats[bus.0 as usize] = Some(beat);
         if let Some(r) = self.topo.bus(bus).lane {
             self.res.set_beat(r, beat);
+        }
+    }
+
+    /// Sets the clock ratio of `bus` (Section 4.1): its shared resource,
+    /// and the ports of the attachments and the write channel made from
+    /// now on.
+    pub fn set_bus_clock(&mut self, bus: BusId, clock: crate::time::Ratio) {
+        self.bus_clocks[bus.0 as usize] = clock;
+        if let Some(r) = self.topo.bus(bus).lane {
+            self.res.set_clock(r, clock);
         }
     }
 
@@ -648,10 +679,14 @@ impl Sim {
             ),
             BusTopology::Shared => (None, None),
         };
+        let clock = self.bus_clocks[bus.0 as usize];
         if let Some(beat) = self.bus_beats[bus.0 as usize] {
             for r in [ingress, egress].into_iter().flatten() {
                 self.res.set_beat(r, beat);
             }
+        }
+        for r in [ingress, egress].into_iter().flatten() {
+            self.res.set_clock(r, clock);
         }
         // The write channel (`wr_bytes`), after the read channel.
         let wr_rate = self.bus_wr_rates[bus.0 as usize].filter(|_| port);
@@ -666,6 +701,9 @@ impl Sim {
             for r in [ingress_wr, egress_wr].into_iter().flatten() {
                 self.res.set_beat(r, beat);
             }
+        }
+        for r in [ingress_wr, egress_wr].into_iter().flatten() {
+            self.res.set_clock(r, clock);
         }
         self.topo.add_attachment(Attachment {
             bus,
@@ -1284,20 +1322,51 @@ impl Sim {
     }
 
     /// Reserves a transfer chunk along `path` in route order (Section 5.4,
-    /// data-path rule) for `who`, starting at or after `earliest`, at most
-    /// at the master's `rate`.
+    /// data-path rule) for `who`, starting at or after `earliest`, for a
+    /// master that moves one beat of `beat` bytes per cycle.
     fn reserve_path(
         &mut self,
         path: &[PathHop],
+        beat: u64,
+        earliest: Cycle,
+        admit: crate::resource::Admit,
+        who: Who,
+    ) -> Reserved {
+        self.reserve_path_at(path, beat, Ratio::int(beat), earliest, admit, who)
+    }
+
+    /// [`Sim::reserve_path`] for a master that moves `rate` bytes per core
+    /// cycle in beats of `beat` bytes.
+    fn reserve_path_at(
+        &mut self,
+        path: &[PathHop],
+        beat: u64,
         rate: Ratio,
+        earliest: Cycle,
+        admit: crate::resource::Admit,
+        who: Who,
+    ) -> Reserved {
+        if self.zero_time {
+            return Reserved::at(self.now);
+        }
+        let g = self.res.reserve_path_at(path, beat, rate, earliest, admit);
+        self.granted(g, earliest, who)
+    }
+
+    /// Reserves a protocol message on one hop for `who` (Section 5.4,
+    /// details), its sender moving beats of `beat` bytes.
+    pub(crate) fn reserve_message(
+        &mut self,
+        hop: PathHop,
+        beat: u64,
         earliest: Cycle,
         who: Who,
     ) -> Reserved {
         if self.zero_time {
             return Reserved::at(self.now);
         }
-        let g = self.res.reserve_path(path, rate, earliest);
-        self.granted(g, earliest, who)
+        let g = self.res.reserve_message(hop, beat, earliest);
+        self.granted(Some(g), earliest, who)
     }
 
     /// The reservation of `g` (none: an empty one at `earliest`); the
@@ -1514,33 +1583,47 @@ impl Sim {
         let (Some(to_block), Some(from_block)) = (to_block, from_block) else {
             return Err(format!("no data route between {:?} and {}", nu, mem.name));
         };
-        let hop = |resource, latency| PathHop {
+        let hop = |resource, latency, pool| PathHop {
             resource,
             amount: n,
             dir,
             latency,
+            pool,
+        };
+        // The in-flight pools (Section 5.4, rule 7): a load's source is the
+        // block; a store's is the Neutrino (no source latency).
+        let mut admit = crate::resource::Admit {
+            issue: self.now,
+            src_latency: if load { block_latency } else { 0 },
+            tail: None,
         };
         let (path, lead, tail): (Vec<PathHop>, Cycle, Cycle) = if load {
-            let mut p = vec![hop(port, from_block.lead)];
-            p.extend(from_block.hops.iter().map(|h| hop(h.lane, h.latency)));
+            let mut p = vec![hop(port, from_block.lead, None)];
+            p.extend(
+                from_block
+                    .hops
+                    .iter()
+                    .map(|h| hop(h.lane, h.latency, h.pool)),
+            );
+            admit.tail = from_block.pool_after;
             (p, to_block.latency + block_latency, 0)
         } else {
             let mut p: Vec<PathHop> = to_block
                 .hops_for(Dir::Write)
                 .iter()
-                .map(|h| hop(h.lane, h.latency))
+                .map(|h| hop(h.lane, h.latency, h.pool))
                 .collect();
-            p.push(hop(port, 0));
+            p.push(hop(port, 0, to_block.pool_after));
             (p, to_block.lead, block_latency)
         };
         let earliest = self.now + if self.zero_time { 0 } else { lead };
-        let rate = Ratio::int(self.nus[nu.0 as usize].cfg.beat_bytes);
+        let beat = self.nus[nu.0 as usize].cfg.beat_bytes;
         let pair = self
             .tracer
             .is_some()
             .then(|| self.topo.best_pair(hub, attach))
             .flatten();
-        let mut g = self.reserve_path(&path, rate, earliest, Who::Program(nu));
+        let mut g = self.reserve_path(&path, beat, earliest, admit, Who::Program(nu));
         if !self.zero_time {
             g.end += tail;
         }
@@ -2142,6 +2225,7 @@ impl Sim {
 
             let nchunks = profile.chunks.len();
             let stream = profile.chunks.iter().any(|c| c.transfer.is_some());
+            let fill = if self.zero_time { 0 } else { profile.fill };
             let p = &mut self.pes[pe.0 as usize];
             p.running.push(Running {
                 nu,
@@ -2153,6 +2237,8 @@ impl Sim {
                 stream,
                 held: false,
                 last_end: 0,
+                fill: self.now + fill,
+                src_latency: fill,
             });
             if nchunks == 0 {
                 self.finish_task(pe, nu, t);
@@ -2228,7 +2314,8 @@ impl Sim {
         let i = r.next;
         r.next += 1;
         let chunk = &r.profile.chunks[i];
-        let earliest = self.now + chunk.latency;
+        let earliest = self.now.max(r.fill) + chunk.latency;
+        let src_latency = r.src_latency;
         let gid = r.gid;
         // The profile lives in the PE; a moved-out demand avoids a borrow of
         // `self.pes` across the reservation.
@@ -2241,7 +2328,12 @@ impl Sim {
                 // The hops into a buffer kept across chunks.
                 let mut hops = std::mem::take(&mut self.hop_buf);
                 tc.hops_into(&mut hops);
-                let g = self.reserve_path(&hops, rate, earliest, Who::Task(gid));
+                let admit = crate::resource::Admit {
+                    issue: self.now,
+                    src_latency,
+                    tail: None,
+                };
+                let g = self.reserve_path_at(&hops, tc.beat, rate, earliest, admit, Who::Task(gid));
                 self.hop_buf = hops;
                 g
             }

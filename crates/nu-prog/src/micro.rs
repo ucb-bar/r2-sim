@@ -864,7 +864,7 @@ pub fn result(r: &Report, stats: &Stats) -> Value {
                 let port = res.get(format!("{}.smem.port", sm.path).as_str());
                 let share = port.map(|x| {
                     // The port's lane-cycles over the task's window.
-                    x.busy_cycles as f64 / (x.lanes.max(1) as u64 * cycles.max(1)) as f64
+                    x.busy_slot_cycles / (x.slots.max(1e-9) * cycles.max(1) as f64)
                 });
                 let mut row = json!({
                     "sm": sm.path,
