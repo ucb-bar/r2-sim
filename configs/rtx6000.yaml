@@ -9,10 +9,15 @@
 # 256 B granule, slice chosen by an XOR hash of address bits 8 to 20 (the
 # `hash` of sbus_to_l2bus); 52 B/cycle read and 28 B/cycle write per
 # slice achieved against 64 and 32 nominal; hit latency 339 cycles on
-# average.
+# average. Tuned 2026-10-12 against targeted microbenchmarks (r2-sim
+# scratch/corr/ubench: each kernel measures its own clock, so every rate
+# is per SM cycle): the device crossbar, the GPC links, the GDDR7
+# channels, the SM link's lanes, the DMA latency and a device copy engine.
 #
-# Clock: 2617 MHz boost (the whitepaper peak rates are quoted at it; the
-# card ran at 2835 under load). All B/cycle values are at that clock.
+# Clock: 2617 MHz boost (the whitepaper peak rates are quoted at it). The
+# card runs at 2.82 to 2.86 GHz on the microbenchmarks and drops to 1.8 to
+# 2.0 GHz on long dense GEMMs at its 600 W limit; the rates here are per
+# cycle and match the card per cycle (the tensor rates exactly).
 #
 # Ownership: the root owns the L2 and the GDDR7 (the GPU has one crossbar
 # and no NUMA), so every dependency on them registers at the root Neutrino;
@@ -26,10 +31,13 @@
 #   gpc g, SM s   ((g + 1) << 43) | ((s + 1) << 38): its smem and sync space
 #
 # Not yet modeled (recorded): DRAM traffic does not pass through the L2
-# slice ports (each slice fronts its channel on the card: 10.7 B/cycle of a
-# slice's 64 when streaming at the full 1.79 TB/s); the GDDR7 channel
-# interleave is a plain 256 B stripe over 16 channels (the card hashes it;
-# unmeasured); MIG is off; 192 SMs stand for 188.
+# slice ports (each slice fronts its channels on the card); the GDDR7
+# channel interleave is a plain 256 B stripe (the card hashes it;
+# unmeasured); the card's L2 hides DRAM latency on sequential streams (a
+# TMA copy from GDDR7 takes the same 550 cycles as from the L2), the model
+# does not; the card's remote SMEM in a cluster (DSMEM) moves 1.9 B/cycle
+# per SM at 220 cycles, the model's path to another SM's smem 32 B/cycle;
+# MIG is off; 192 SMs stand for 188.
 
 global:
   neutrino_granule: 512
@@ -44,11 +52,13 @@ global:
 device:
   name: root
   fabric:
-    # The device crossbar: GPC links and the two hash links as ports, 512
-    # B/cycle per port (a slice's own port, 64 B/cycle, is the limit on its
-    # side). l2bus and mbus carry the physical traffic to the slices and the
-    # channels; they are unlimited.
-    - {name: sbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
+    # The device crossbar: the GPC links, the two hash links and the
+    # Neutrino as ports. Unlimited: the limits are the GPC links (272
+    # B/cycle each), the L2 slices and the GDDR7 channels (2026-10-12: a 512
+    # B/cycle port in front of the L2 held the model's L2 at 511 B/cycle
+    # against the card's 3,154). l2bus and mbus carry the physical traffic
+    # to the slices and the channels; they are unlimited.
+    - {name: sbus, topology: xbar}
     - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
     - {name: l2bus, topology: xbar}
     - {name: mbus, topology: xbar}
@@ -62,26 +72,44 @@ device:
        hash: {range: [0x0, 0x8000000], to_range: [0x100000000, 0x108000000],
               index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000, 0x1A8000],
               drop: [8, 10, 11, 12, 13, 15]}}
-    # The GDDR7 channel interleave: linear [32 GiB, 128 GiB) to 16 channels
-    # of 6 GiB at 128 GiB, 256 B per channel in turn (the card hashes the
-    # channel too; unmeasured, so a plain stripe over bits 8 to 11).
+    # The GDDR7 channel interleave: linear [32 GiB, 128 GiB) to 64 channels
+    # of 1.5 GiB at 128 GiB, 256 B per channel in turn (the card hashes the
+    # channel too; unmeasured, so a plain stripe over bits 8 to 13).
     - {name: sbus_to_mbus, topology: link, from: $this.sbus, to: $this.mbus, latency: 0,
        hash: {range: [0x800000000, 0x2000000000], to_range: [0x2000000000, 0x3800000000],
-              index: [0x100, 0x200, 0x400, 0x800]}}
+              index: [0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000]}}
   memory:
     # L2: 64 contiguous physical slices (banks) of 2 MiB, one port each.
-    # Read 64 and write 32 B/cycle per slice (nominal; achieved 52 / 28),
-    # 32 B beats (one sector), latency 180 cycles at the slice so that an
-    # SM's dependent load sees 40 + 20 + 40 + 180 + 40 + 20 = 340 cycles.
+    # Read 64 and write 32 B/cycle per slice (nominal; one slice alone
+    # achieves 52 / 28). The aggregate is set by the GPC links: 3,154 B/cycle
+    # read and 1,685 write over all SMs on the card, 3,005 and 1,668 in the
+    # model (2026-10-12). A slice at 52 would serve one 32 B/cycle SM flow at
+    # a time (transfers hold whole lanes), so the nominal 64 stays. 32 B
+    # beats (one sector); latency 180 cycles at the slice, so that an SM's
+    # dependent load sees 40 + 20 + 40 + 180 + 40 + 20 = 340 cycles (card:
+    # 282 through L1, 357 for a volatile load).
     - {name: l2, type: scratch, addr: [[0x100000000, 0x108000000]], banks: 64,
        bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, latency: 180, slave: $this.l2bus}
-    # GDDR7: 96 GiB over sixteen 32-bit channels at 28 Gbps = 1792 GB/s =
-    # 685 B/cycle, 43 per channel, read and write on one port; latency 500
-    # cycles at the channel. Named hbm for the builders; programs use the
-    # linear range of sbus_to_mbus.
-    - {name: hbm, type: dram, addr: [[0x2000000000, 0x3800000000]], banks: 16,
-       bw_bytes: 43, beat_bytes: 32, latency: 500, slave: $this.mbus}
+    # GDDR7: 96 GiB over 16 devices of 32 bits at 28 Gbps (1792 GB/s, 685
+    # B/cycle), each device four independent 8-bit channels: 64 channels of
+    # 10.7 B/cycle nominal, set to 9.5 so that the aggregate matches the
+    # card (2026-10-12: read 575 B/cycle = 1,625 GB/s, write 558; model 585
+    # and 606; 1 SM 28, 16 SMs 431 against the card's 28 and 432). Narrow
+    # channels let many SMs' flows interleave as the card's banks do; 16
+    # channels of 43 served one 32 B/cycle flow each at a time (480 B/cycle
+    # in all). Read and write on one port, 4 B beats. Latency 830 cycles at
+    # the channel, so that an SM's dependent load sees about 950 cycles
+    # (card: 942 to 950 cycles, 330 ns, random access up to 16 GB). Named hbm
+    # for the builders; programs use the linear range of sbus_to_mbus.
+    - {name: hbm, type: dram, addr: [[0x2000000000, 0x3800000000]], banks: 64,
+       bw_bytes: 9.5, beat_bytes: 4, latency: 830, slave: $this.mbus}
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  compute:
+    # A copy engine at the device. In Radiance 2 a write into the L2 or the
+    # GDDR7 is a pull by the owner's engine; on the card the SMs store
+    # directly. This engine stands for those stores and must not be a
+    # limit: 64 transfers in flight, 512 B beats, latency 40.
+    - {name: dma, type: dma, latency: 40, inflight: 64, beat_bytes: 512, master: [$this.sbus]}
   neutrino: {scoreboard: 1024, pending: 4096, execution: 4096, versions: 16384, inbound_refs: 1024, inbound_invokes: 256, outbound_deps: 256, outbound_invokes: 64}
   children:
     - {name: gpc0, config: rtx6000-gpc.yaml}

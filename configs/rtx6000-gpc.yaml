@@ -4,17 +4,19 @@
 # has 192 SMs of which 188 are enabled; the model keeps 16 per GPC (+2 %).
 #
 # * clsbus: the GPC crossbar, 512 B/cycle per port (16 SM links at 32).
-# * Link to the device crossbar: 512 B/cycle per direction (the GPC's share
-#   when every SM pulls at once; the NoC literature finds GPC ports
-#   provisioned near full read bandwidth), latency 40 cycles. The control
-#   link at 64 B/cycle, one message beat per cycle.
+# * Link to the device crossbar: 272 B/cycle per direction (measured
+#   2026-10-12: the 14 SMs of one GPC read the L2 at 272 B/cycle together,
+#   19 each, while 14 SMs spread over other GPCs reach 462, 33 each), in 4 B
+#   lanes so that eight 32 B/cycle SM flows share it (256 B/cycle).
+#   Latency 40 cycles. The control link at 64 B/cycle, one message beat per
+#   cycle.
 # * No copy engine: SM transfers are the SMs' own (rtx6000-sm.yaml).
 
 fidelity: numeric
 fabric:
   - {name: clsbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
   - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}
-  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 512, beat_bytes: 32, latency: 40}
+  - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 272, beat_bytes: 4, latency: 40}
   - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 64, latency: 40, control: true}
 memory:
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}

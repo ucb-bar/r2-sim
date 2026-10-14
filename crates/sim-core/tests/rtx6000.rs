@@ -18,8 +18,8 @@ fn config(name: &str) -> Built {
 #[test]
 fn the_rtx6000_configurations_build() {
     for (name, gpcs, l2, channels) in [
-        ("rtx6000.yaml", 12, 64, 16),
-        ("rtx6000-half.yaml", 6, 32, 8),
+        ("rtx6000.yaml", 12, 64, 64),
+        ("rtx6000-half.yaml", 6, 32, 32),
     ] {
         let b = config(name);
         let sim = &b.sim;
@@ -157,9 +157,10 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
     // rtx6000-half.yaml: sm0 of gpc0 copies 4 MiB from the linear GDDR7
     // range into its smem in 64 KiB transfers, two buffers in turn. Each
     // chunk is one 256 B granule (the channel stripe), so the transfers
-    // touch all 8 channels and no L2 slice. The SM link (32 B/cycle) is
-    // the bottleneck: 4 MiB / 32 = 131072 cycles plus a pipeline fill per
-    // pair of transfers.
+    // touch all 32 channels and no L2 slice. A chunk runs at its channel's
+    // 9.5 B/cycle and takes one of the SM link's three lanes, so three
+    // overlap: 28.5 B/cycle, 4 MiB in 147,169 cycles plus a pipeline fill
+    // (the engine's 490 cycles and the links) per pair of transfers.
     let b = config("rtx6000-half.yaml");
     let sm = b.nu("root.gpc0.sm0");
     let (hbm, smem) = (
@@ -217,13 +218,12 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
         s.end_time
     );
     assert_eq!(chunks, (4 << 20) / 256);
-    assert_eq!((channels, slices), (8, 0));
+    assert_eq!((channels, slices), (32, 0));
     // The two transfers in flight interleave chunk by chunk and end
-    // together, so each of the 32 pairs starts on an empty pipeline (the
-    // engine's 40 cycles and the links' 60, about 96 to the SM link):
-    // 131072 + 32 x 96 = 134144.
+    // together, so each of the 32 pairs starts on a pipeline that is partly
+    // empty (156,019 cycles measured 2026-10-12, at most 32 fills of 560).
     assert!(
-        s.end_time >= 131_072 && s.end_time <= 131_072 + 32 * 100,
+        s.end_time >= 147_169 && s.end_time <= 147_169 + 32 * 560,
         "{}",
         s.end_time
     );

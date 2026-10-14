@@ -2,22 +2,29 @@
 # (architecture Section 8.3). Numbers are per SM clock cycle at the boost
 # clock of 2617 MHz (global.clock_ghz in rtx6000.yaml).
 #
-# * Link to the gpc crossbar: 32 B/cycle per direction, the L2-to-SM read
-#   rate one SM reaches on the card (2026-10-08, 32 B/cycle per block
-#   of 1024 threads with eight loads in flight; measured on a shared card, to
-#   confirm on a quiet one). Latency 20 cycles.
-# * smem: the SM's 128 KB L1/shared block at 128 B/cycle (measured 128), of
-#   which 100 KB can be shared memory (99 KB per block): a placement limit
-#   for the builders, not a model limit. Latency 30 cycles.
+# * Link to the gpc crossbar: 32 B/cycle per direction (measured 2026-10-12:
+#   one SM reaches exactly 32.0 B/cycle from the L2 and from the GDDR7 with
+#   16 KB or more in flight), in three lanes of 10.7 B/cycle (11 B beats) so
+#   that three chunks narrowed to a GDDR7 channel's 9.5 B/cycle overlap
+#   (28.5 B/cycle). Latency 20 cycles.
+# * smem: the SM's 128 KB L1/shared block at 128 B/cycle (measured 128 for
+#   stores, 2026-10-12), of which 100 KB can be shared memory (99 KB per
+#   block): a placement limit for the builders, not a model limit. Latency
+#   34 cycles (a dependent ld.shared on the card).
 # * atlas: the four fifth-generation tensor cores as one unit, dense MAC per
-#   cycle from the whitepaper peaks at 2617 MHz over 188 SMs: bf16 512, fp8
-#   1024, fp4 2048 (mxfp4 is block-scaled fp4 at the fp4 rate). The Pro
-#   part keeps full-rate FP32 accumulate.
-# * muon: the 128 CUDA cores as a 128-lane vector unit; overhead 20 cycles
-#   per task (warp launch, reduction tail).
-# * dma: the SM's asynchronous copy path (cp.async, TMA); latency 40 cycles
-#   before the first hop, 8 transfers in flight, chunks issued at the beat
-#   rate (Section 5.3). The L2 slice granule (256 B) sets the chunk size.
+#   cycle: bf16 512, fp8 1024, fp4 2048 (measured 2026-10-12 with mma.sync
+#   from registers: 511.8, 1023.6 and 2047, block-scaled fp4 for mxfp4).
+#   The Pro part keeps full-rate FP32 accumulate.
+# * muon: the 128 CUDA cores as a 128-lane vector unit (measured 125 fp32
+#   FMA per cycle; ex2, rsqrt and tanh 16 per cycle, bf16x2 FMA and integer
+#   multiply-add 63.5); overhead 20 cycles per task (warp launch, reduction
+#   tail).
+# * dma: the SM's asynchronous copy path (cp.async, TMA); latency 490 cycles
+#   before the first hop, so that a 1 KiB copy from the L2 takes about 550
+#   cycles from issue to done as a TMA bulk copy does on the card (16 KiB:
+#   1,020; 32 KiB: 1,620; 2026-10-12); 8 transfers in flight, chunks issued
+#   at the beat rate (Section 5.3). The L2 slice granule (256 B) sets the
+#   chunk size.
 # * neutrino: the Radiance 2 tables as in sm.yaml; the GPU has no such unit,
 #   so this is the superset's cost on top of the GPU's data path.
 
@@ -25,16 +32,16 @@ fabric:
   - {name: smsbus, topology: xbar}
   - {name: smcbus, topology: xbar, control: true}
   - {name: lbus, topology: xbar}
-  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 32, beat_bytes: 32, latency: 20}
+  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 32, beat_bytes: 11, latency: 20}
   - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 32, beat_bytes: 32, latency: 20, control: true}
 memory:
-  - {name: smem, type: scratch, addr: [[0x0, 0x20000]], bw_bytes: 128, beat_bytes: 32, latency: 30,
+  - {name: smem, type: scratch, addr: [[0x0, 0x20000]], bw_bytes: 128, beat_bytes: 32, latency: 34,
      slave: [$this.lbus, $this.smsbus]}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 compute:
   - {name: atlas, type: tensor, rate: {bf16: 512, fp8: 1024, mxfp4: 2048},
      quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 128}, overhead: 20, master: [$this.lbus, $this.smsbus]}
-  - {name: dma, type: dma, latency: 40, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
+  - {name: dma, type: dma, latency: 490, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
            c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}

@@ -1,7 +1,9 @@
 # The MIG 2g.48gb half of the RTX PRO 6000 Blackwell (rtx6000.yaml): the
 # instance we correlate against. Half the SMs (94 on the card; 6 GPCs x 16
-# here), half the memory controllers (8 channels, 896 GB/s = 343 B/cycle,
-# 43 per channel), half the L2 (64 MB, 32 slices), 48 GB. The slice hash
+# here), half the memory controllers (8 devices, 896 GB/s = 343 B/cycle;
+# 32 GDDR7 channels of 9.5 B/cycle as tuned in rtx6000.yaml), half the L2
+# (64 MB, 32 slices), 48 GB. The device crossbar, the copy engine at the
+# device and the channel latency as rtx6000.yaml (tuned 2026-10-12). The slice hash
 # of a MIG instance is unmeasured: the full card's hash with the top index
 # bit (address bit 15) dropped is assumed. Everything else as rtx6000.yaml
 # (hash links, physical slices and channels).
@@ -19,7 +21,7 @@ global:
 device:
   name: root
   fabric:
-    - {name: sbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
+    - {name: sbus, topology: xbar}
     - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
     - {name: l2bus, topology: xbar}
     - {name: mbus, topology: xbar}
@@ -31,13 +33,15 @@ device:
     # 8 channels of 6 GiB: linear [32 GiB, 80 GiB) to physical at 128 GiB.
     - {name: sbus_to_mbus, topology: link, from: $this.sbus, to: $this.mbus, latency: 0,
        hash: {range: [0x800000000, 0x1400000000], to_range: [0x2000000000, 0x2C00000000],
-              index: [0x100, 0x200, 0x400]}}
+              index: [0x100, 0x200, 0x400, 0x800, 0x1000]}}
   memory:
     - {name: l2, type: scratch, addr: [[0x100000000, 0x104000000]], banks: 32,
        bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, latency: 180, slave: $this.l2bus}
-    - {name: hbm, type: dram, addr: [[0x2000000000, 0x2C00000000]], banks: 8,
-       bw_bytes: 43, beat_bytes: 32, latency: 500, slave: $this.mbus}
+    - {name: hbm, type: dram, addr: [[0x2000000000, 0x2C00000000]], banks: 32,
+       bw_bytes: 9.5, beat_bytes: 4, latency: 830, slave: $this.mbus}
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  compute:
+    - {name: dma, type: dma, latency: 40, inflight: 64, beat_bytes: 512, master: [$this.sbus]}
   neutrino: {scoreboard: 1024, pending: 4096, execution: 4096, versions: 16384, inbound_refs: 1024, inbound_invokes: 256, outbound_deps: 256, outbound_invokes: 64}
   children:
     - {name: gpc0, config: rtx6000-gpc.yaml}
