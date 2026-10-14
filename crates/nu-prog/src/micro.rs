@@ -1,0 +1,950 @@
+//! Micro-benchmarks: targeted tests that isolate a few parameters each, to
+//! compare the model with measurements on a card (the RTX PRO 6000
+//! configurations, architecture Section 8.3).
+//!
+//! One mode per run (`mode`):
+//!
+//! * `stream`: each of `sms` SMs moves `bytes` between its SMEM and
+//!   `mem` in transfers of `chunk` bytes, at most `inflight` at once per
+//!   SM. `dir = read` moves `mem` into the SM's SMEM, `write` the SM's
+//!   SMEM into `mem`. A write into the device's memories (`l2`, `dram`) is
+//!   a task of the device's copy engine (`root.dma`), as every write into
+//!   another node's memory is a pull by its owner's engine.
+//! * `latency`: one transfer of `bytes` from `mem` into the first SM's
+//!   SMEM.
+//! * `atlas`: one matmul (`m`, `n`, `k`, `dtype`) per SM, operands in SMEM.
+//! * `muon`: one vector task (`lane_ops`, `bytes` read, `bytes_out`
+//!   written) per SM.
+//! * `pingpong`: two SMs (`pair = same_gpc | other_gpc`); `rounds` round
+//!   trips of a dependency: a task on A writes a flag, a task on B depends
+//!   on it and writes the next flag, and so on.
+//! * `barrier`: `sms` SMs each run an empty task, then a join on the
+//!   device depends on all of them.
+//! * `invoke`: the driver invokes `tasks` empty tasks on one SM (`targets =
+//!   one`) or round-robin over `sms` SMs (`targets = many`).
+//!
+//! `mem`: `l2` and `dram` (the linear ranges of the memories named by `l2`
+//! and `dram`), `smem` (the SM's own SMEM), `rsmem_gpc` (another SM's SMEM
+//! in the same gpc), `rsmem_far` (an SM's SMEM in another gpc). SMs are
+//! taken `packed` (gpc0's first) or `spread` (round-robin over the gpcs).
+//! The driver: `root` (one program on the device invokes every task, its
+//! invokes forwarded to the SMs), `sm` (one program on the first SM;
+//! single-SM modes), or `sms` (the device starts a program on each gpc
+//! that starts one on each of its SMs, and each SM invokes its own tasks,
+//! as a card's SMs issue their own copies). The default is `sms` for
+//! `stream` and `root` for the other modes.
+//!
+//! Every task writes a versioned range, so a task retires when the next
+//! version of its range is invoked; the program infers the versions. A
+//! transfer writes one of `inflight` slots of `chunk` bytes per SM, so
+//! writes into `mem` reuse `inflight x chunk` bytes per SM; reads take
+//! `bytes` of contiguous source per SM.
+//!
+//! [`result`] turns the run's task timeline and resource totals into the
+//! measured quantities of the mode (the `micro` object of `--stats`).
+
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
+
+use nu_model::{Addr, Dep, NeutrinoId, Range};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sim_core::{Args, Built, Descriptor, Dtype, NuCtx, PeId, Stats};
+
+use crate::machine::parse_dtype;
+
+/// The alignment of every range a task writes (the Neutrino granule).
+const GRANULE: u64 = 512;
+
+/// Parameters of a micro-benchmark run (TOML, or `--param key=value`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Params {
+    pub mode: String,
+    pub sms: usize,
+    pub placement: String,
+    pub mem: String,
+    pub dir: String,
+    pub bytes: u64,
+    pub chunk: u64,
+    pub inflight: usize,
+    pub m: u64,
+    pub n: u64,
+    pub k: u64,
+    pub dtype: String,
+    /// Output tile of a matmul `[rows, columns]`.
+    pub tile: [u64; 2],
+    pub lane_ops: u64,
+    pub bytes_out: u64,
+    pub pair: String,
+    pub rounds: usize,
+    pub tasks: usize,
+    pub targets: String,
+    pub driver: String,
+    /// The memories `mem = l2` and `mem = dram` name.
+    pub l2: String,
+    pub dram: String,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self {
+            mode: "stream".into(),
+            sms: 1,
+            placement: "packed".into(),
+            mem: "l2".into(),
+            dir: "read".into(),
+            bytes: 1 << 20,
+            chunk: 16 << 10,
+            inflight: 4,
+            m: 128,
+            n: 128,
+            k: 1024,
+            dtype: "bf16".into(),
+            tile: [128, 128],
+            lane_ops: 1 << 16,
+            bytes_out: 0,
+            pair: "same_gpc".into(),
+            rounds: 16,
+            tasks: 64,
+            targets: "one".into(),
+            driver: String::new(),
+            l2: "root.l2".into(),
+            dram: "root.hbm".into(),
+        }
+    }
+}
+
+/// One SM of the machine.
+#[derive(Debug, Clone)]
+struct Sm {
+    path: String,
+    nu: NeutrinoId,
+    gpc: usize,
+    dma: PeId,
+    atlas: Option<PeId>,
+    muon: Option<PeId>,
+    smem: Range,
+}
+
+/// What a task of the run is for.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Role {
+    /// A transfer of `bytes` for SM `sm`.
+    Data,
+    /// A flag or empty task on SM `sm` (`usize::MAX`: the device).
+    Flag,
+    /// The join of `barrier`.
+    Join,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Meta {
+    role: Role,
+    /// Index into the run's SMs.
+    sm: usize,
+    bytes: u64,
+}
+
+/// What the program records, read by [`result`] after the run.
+#[derive(Debug, Default)]
+pub struct Report {
+    params: Option<Params>,
+    sms: Vec<Sm>,
+    /// By task label (the index of the task in the run).
+    metas: Vec<Meta>,
+    driver_start: u64,
+    driver_end: u64,
+    /// The driver's cycle after each invoke call returned.
+    invoked_at: Vec<u64>,
+}
+
+/// One task of the program: its descriptor, the window it counts in (at
+/// most `limit` open per window) and the version it completes.
+struct Item {
+    desc: Descriptor,
+    window: usize,
+    done: (u64, u64),
+}
+
+/// A gpc of a `driver = sms` run: its Neutrino, its sync range (the
+/// `done` of its SMs' spawns) and its SMs (index into the run's SMs,
+/// Neutrino).
+type Gpc = (NeutrinoId, Range, Vec<(usize, NeutrinoId)>);
+
+/// A built run: the tasks and how the driver issues them.
+pub struct Run {
+    items: Vec<Item>,
+    /// Open tasks per window before the driver waits for the oldest
+    /// (`usize::MAX`: no limit).
+    limit: usize,
+    /// The driver waits for these at the end (all tasks when empty).
+    last: Vec<(u64, u64)>,
+    pub report: Rc<RefCell<Report>>,
+    /// The Neutrino that runs the driver.
+    pub driver: NeutrinoId,
+    /// `driver = sms`: the gpcs (each with its sync range for the spawns'
+    /// `done`) and their SMs (index into the run's SMs, Neutrino); the
+    /// device's sync range.
+    tree: Option<(Range, Vec<Gpc>)>,
+}
+
+/// The SMs of `b`: nodes with an SMEM block and a DMA engine, ordered by
+/// gpc and then by SM.
+fn sms_of(b: &Built) -> Vec<Sm> {
+    let topo = b.sim.topology();
+    let mut out = Vec::new();
+    for i in 0..topo.len() {
+        let nu = NeutrinoId(i as u32);
+        let path = topo.path_name(nu);
+        let (Some(smem), Some(dma)) = (
+            b.try_memory(&format!("{path}.smem")),
+            b.try_pe(&format!("{path}.dma")),
+        ) else {
+            continue;
+        };
+        let gpc = topo.node(nu).parent.map_or(0, |p| p.0 as usize);
+        out.push(Sm {
+            atlas: b.try_pe(&format!("{path}.atlas")),
+            muon: b.try_pe(&format!("{path}.muon")),
+            path,
+            nu,
+            gpc,
+            dma,
+            smem,
+        });
+    }
+    out.sort_by_key(|s| (s.gpc, s.nu));
+    out
+}
+
+/// `count` SMs, packed (in order) or spread round-robin over the gpcs.
+fn pick(all: &[Sm], count: usize, placement: &str) -> Result<Vec<Sm>, String> {
+    if count == 0 || count > all.len() {
+        return Err(format!("sms = {count}: the machine has {} SMs", all.len()));
+    }
+    match placement {
+        "packed" => Ok(all[..count].to_vec()),
+        "spread" => {
+            let mut gpcs: Vec<usize> = all.iter().map(|s| s.gpc).collect();
+            gpcs.dedup();
+            let by: Vec<Vec<&Sm>> = gpcs
+                .iter()
+                .map(|g| all.iter().filter(|s| s.gpc == *g).collect())
+                .collect();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while out.len() < count {
+                let g = &by[i % by.len()];
+                if let Some(s) = g.get(i / by.len()) {
+                    out.push((*s).clone());
+                }
+                i += 1;
+            }
+            Ok(out)
+        }
+        p => Err(format!("unknown placement {p:?} (packed, spread)")),
+    }
+}
+
+/// The range a task writes for `bytes` at `base`: at least one granule.
+fn dst_range(base: u64, bytes: u64) -> Range {
+    Range::from_len(base, bytes.max(1).div_ceil(GRANULE) * GRANULE)
+}
+
+/// Builds the run of `p` on `b`.
+pub fn build(b: &Built, p: Params) -> Result<Run, String> {
+    let all = sms_of(b);
+    if all.is_empty() {
+        return Err("micro: no SM (a node with smem and dma)".into());
+    }
+    let profiles = b.sim.profiles();
+    let op = |name: &str| {
+        profiles
+            .lookup(name)
+            .ok_or_else(|| format!("micro: no {name} profile"))
+    };
+    let mut versions: HashMap<u64, u64> = HashMap::new();
+    let mut items: Vec<Item> = Vec::new();
+    let mut metas: Vec<Meta> = Vec::new();
+    // A task on a versioned range: its version is the next of the range.
+    let mut push = |items: &mut Vec<Item>,
+                    metas: &mut Vec<Meta>,
+                    mut desc: Descriptor,
+                    window: usize,
+                    meta: Meta| {
+        let base = desc.dst.base;
+        let v = versions.entry(base).or_insert(0);
+        *v += 1;
+        desc.versioned = true;
+        desc.inferred_version = Some(*v);
+        desc.label = Some(items.len() as u64);
+        items.push(Item {
+            desc,
+            window,
+            done: (base, *v),
+        });
+        metas.push(meta);
+    };
+    let region = |name: &str| {
+        b.try_memory(name)
+            .ok_or_else(|| format!("micro: no memory {name:?}"))
+    };
+    let root_dma = b.try_pe("root.dma");
+    let half = |s: &Sm| s.smem.len() / 2;
+    let mut limit = usize::MAX;
+    let mut last = Vec::new();
+    let sms;
+    let mut p = p;
+    if p.driver.is_empty() {
+        p.driver = if p.mode == "stream" { "sms" } else { "root" }.into();
+    }
+    let per_sm = matches!(p.mode.as_str(), "stream" | "latency" | "atlas" | "muon");
+    let driver = match p.driver.as_str() {
+        "root" | "sms" if p.driver == "root" || per_sm => NeutrinoId(0),
+        "sm" => {
+            if p.sms != 1 && p.mode != "latency" {
+                return Err("driver = sm runs one SM's tasks (sms = 1)".into());
+            }
+            pick(&all, 1, &p.placement)?[0].nu
+        }
+        d => {
+            return Err(format!(
+                "driver {d:?} for mode {:?} (root, sm, sms)",
+                p.mode
+            ))
+        }
+    };
+    match p.mode.as_str() {
+        "stream" | "latency" => {
+            let (count, bytes, chunk, inflight) = if p.mode == "latency" {
+                (1, p.bytes, p.bytes, 1)
+            } else {
+                (p.sms, p.bytes, p.chunk, p.inflight)
+            };
+            if chunk == 0 || bytes == 0 || inflight == 0 {
+                return Err("bytes, chunk and inflight are positive".into());
+            }
+            sms = pick(&all, count, &p.placement)?;
+            let slot = chunk.div_ceil(GRANULE) * GRANULE;
+            let dma = op("dma")?;
+            // The slots: all of the SMEM against a device memory, its first
+            // half when the other half is the far side (smem, rsmem_*).
+            let device = p.mem == "l2" || p.mem == "dram";
+            for (j, s) in sms.iter().enumerate() {
+                let room = if device { s.smem.len() } else { half(s) };
+                if slot * inflight as u64 > room {
+                    return Err(format!(
+                        "{}: {inflight} slots of {chunk} B exceed {room} B of its SMEM",
+                        s.path
+                    ));
+                }
+                // The peer of a remote SMEM: the next SM of the gpc, or the
+                // same SM of the next gpc.
+                let peer = || -> Result<&Sm, String> {
+                    let same: Vec<&Sm> = all.iter().filter(|x| x.gpc == s.gpc).collect();
+                    let k = same.iter().position(|x| x.nu == s.nu).expect("own SM");
+                    match p.mem.as_str() {
+                        "rsmem_gpc" if same.len() > 1 => Ok(same[(k + 1) % same.len()]),
+                        "rsmem_far" => {
+                            let mut gpcs: Vec<usize> = all.iter().map(|x| x.gpc).collect();
+                            gpcs.dedup();
+                            let gi = gpcs.iter().position(|g| *g == s.gpc).expect("gpc");
+                            let other = gpcs[(gi + 1) % gpcs.len()];
+                            let far: Vec<&Sm> = all.iter().filter(|x| x.gpc == other).collect();
+                            if other == s.gpc {
+                                return Err("rsmem_far needs two gpcs".into());
+                            }
+                            Ok(far[k % far.len()])
+                        }
+                        m => Err(format!("{m}: no peer SM")),
+                    }
+                };
+                let n = bytes.div_ceil(chunk);
+                for i in 0..n {
+                    let len = chunk.min(bytes - i * chunk);
+                    let own_slot = s.smem.base + (i % inflight as u64) * slot;
+                    // The far side: (address, its owner's DMA engine).
+                    let (far_addr, far_dma, far_slot) = match p.mem.as_str() {
+                        "l2" | "dram" => {
+                            let r = region(if p.mem == "l2" { &p.l2 } else { &p.dram })?;
+                            let span = r.len() / slot * slot;
+                            let read = (j as u64 * bytes + i * chunk) % span;
+                            let write = ((j * inflight) as u64 * slot
+                                + (i % inflight as u64) * slot)
+                                % span;
+                            (r.base + read, root_dma, r.base + write)
+                        }
+                        "smem" => {
+                            let off = half(s) + (i % inflight as u64) * slot;
+                            (
+                                s.smem.base + half(s) + (i * chunk) % half(s),
+                                Some(s.dma),
+                                s.smem.base + off,
+                            )
+                        }
+                        "rsmem_gpc" | "rsmem_far" => {
+                            let q = peer()?;
+                            let off = half(q) + (i % inflight as u64) * slot;
+                            (
+                                q.smem.base + half(q) + (i * chunk) % half(q),
+                                Some(q.dma),
+                                q.smem.base + off,
+                            )
+                        }
+                        m => {
+                            return Err(format!(
+                                "unknown mem {m:?} (l2, dram, smem, rsmem_gpc, rsmem_far)"
+                            ))
+                        }
+                    };
+                    let (src, dst, pe) = match p.dir.as_str() {
+                        "read" => (far_addr, own_slot, s.dma),
+                        "write" => {
+                            let Some(e) = far_dma else {
+                                return Err(
+                                    "a write into the device's memory needs a copy engine root.dma \
+                                     (a dma on the device, master sbus)"
+                                        .into(),
+                                );
+                            };
+                            (own_slot, far_slot, e)
+                        }
+                        d => return Err(format!("unknown dir {d:?} (read, write)")),
+                    };
+                    let desc = Descriptor {
+                        opcode: dma,
+                        pe: Some(pe),
+                        dst: dst_range(dst, len),
+                        versioned: true,
+                        inferred_version: None,
+                        deps: Vec::new(),
+                        label: None,
+                        args: Args::Dma {
+                            src: Addr(src),
+                            dst: Addr(dst),
+                            bytes: len,
+                            tile_bytes: len,
+                        },
+                    };
+                    push(
+                        &mut items,
+                        &mut metas,
+                        desc,
+                        j,
+                        Meta {
+                            role: Role::Data,
+                            sm: j,
+                            bytes: len,
+                        },
+                    );
+                }
+            }
+            // Issue round-robin over the SMs (transfer i of every SM, then
+            // i + 1), so that the driver's wait on one SM's window does not
+            // hold back the others. Each range keeps its version order.
+            let per = bytes.div_ceil(chunk) as usize;
+            let mut order: Vec<usize> = (0..items.len()).collect();
+            order.sort_by_key(|&x| (x % per, x / per));
+            let mut slots: Vec<Option<(Item, Meta)>> =
+                items.drain(..).zip(metas.drain(..)).map(Some).collect();
+            for (l, x) in order.into_iter().enumerate() {
+                let (mut it, m) = slots[x].take().expect("each once");
+                it.desc.label = Some(l as u64);
+                items.push(it);
+                metas.push(m);
+            }
+            limit = inflight;
+        }
+        "atlas" | "muon" => {
+            sms = pick(&all, p.sms, &p.placement)?;
+            for (j, s) in sms.iter().enumerate() {
+                let desc = if p.mode == "atlas" {
+                    let d = parse_dtype(&p.dtype)?;
+                    let c = p.m * p.n * Dtype::Bf16.bytes();
+                    if c > s.smem.len() {
+                        return Err(format!("{}: C of {c} B exceeds its SMEM", s.path));
+                    }
+                    Descriptor {
+                        opcode: op("atlas.matmul")?,
+                        pe: Some(s.atlas.ok_or_else(|| format!("{}: no atlas", s.path))?),
+                        dst: dst_range(s.smem.base, c),
+                        versioned: true,
+                        inferred_version: None,
+                        deps: Vec::new(),
+                        label: None,
+                        args: Args::Matmul {
+                            a: Addr(s.smem.base),
+                            b: Addr(s.smem.base),
+                            a2: None,
+                            b2: None,
+                            lda: p.k,
+                            ldb: p.n,
+                            ldc: p.n,
+                            m: p.m,
+                            n: p.n,
+                            k: p.k,
+                            in_dtype: d,
+                            b_dtype: d,
+                            out_dtype: Dtype::Bf16,
+                            accumulate: false,
+                            keep: false,
+                            tile: p.tile,
+                        },
+                    }
+                } else {
+                    Descriptor {
+                        opcode: op("muon.vector")?,
+                        pe: Some(s.muon.ok_or_else(|| format!("{}: no muon", s.path))?),
+                        dst: dst_range(s.smem.base, p.bytes_out),
+                        versioned: true,
+                        inferred_version: None,
+                        deps: Vec::new(),
+                        label: None,
+                        args: Args::Vector {
+                            ops: p.lane_ops,
+                            bytes_in: p.bytes,
+                            bytes_out: p.bytes_out,
+                            src: None,
+                        },
+                    }
+                };
+                let bytes = if p.mode == "muon" {
+                    p.bytes + p.bytes_out
+                } else {
+                    0
+                };
+                push(
+                    &mut items,
+                    &mut metas,
+                    desc,
+                    j,
+                    Meta {
+                        role: Role::Data,
+                        sm: j,
+                        bytes,
+                    },
+                );
+            }
+        }
+        "pingpong" => {
+            let a = all[0].clone();
+            let b2 = match p.pair.as_str() {
+                "same_gpc" => all.iter().find(|s| s.gpc == a.gpc && s.nu != a.nu),
+                "other_gpc" => all.iter().find(|s| s.gpc != a.gpc),
+                x => return Err(format!("unknown pair {x:?} (same_gpc, other_gpc)")),
+            }
+            .ok_or("pingpong: no second SM for this pair")?
+            .clone();
+            sms = vec![a, b2];
+            let mut prev: Option<(u64, u64)> = None;
+            for step in 0..2 * p.rounds.max(1) {
+                let j = step % 2;
+                let flag = sms[j].smem.base;
+                let deps: Vec<Dep> = prev
+                    .iter()
+                    .map(|&(addr, version)| Dep::Versioned { addr, version })
+                    .collect();
+                let mut desc = Descriptor::join(dst_range(flag, GRANULE), deps);
+                desc.pe = None;
+                let v = versions_peek(&items, flag) + 1;
+                push(
+                    &mut items,
+                    &mut metas,
+                    desc,
+                    0,
+                    Meta {
+                        role: Role::Flag,
+                        sm: j,
+                        bytes: 0,
+                    },
+                );
+                prev = Some((flag, v));
+            }
+            last = prev.into_iter().collect();
+        }
+        "barrier" => {
+            sms = pick(&all, p.sms, &p.placement)?;
+            let mut deps = Vec::new();
+            for (j, s) in sms.iter().enumerate() {
+                let flag = s.smem.base;
+                let v = versions_peek(&items, flag) + 1;
+                push(
+                    &mut items,
+                    &mut metas,
+                    Descriptor::join(dst_range(flag, GRANULE), Vec::new()),
+                    0,
+                    Meta {
+                        role: Role::Flag,
+                        sm: j,
+                        bytes: 0,
+                    },
+                );
+                deps.push(Dep::Versioned {
+                    addr: flag,
+                    version: v,
+                });
+            }
+            let sync = b
+                .sync_only(NeutrinoId(0))
+                .ok_or("barrier: the device has no sync space")?;
+            let mut join = Descriptor::join(dst_range(sync.base, GRANULE), deps);
+            join.versioned = false;
+            let label = items.len() as u64;
+            join.label = Some(label);
+            metas.push(Meta {
+                role: Role::Join,
+                sm: usize::MAX,
+                bytes: 0,
+            });
+            items.push(Item {
+                desc: join,
+                window: 0,
+                done: (sync.base, 0),
+            });
+            last = vec![(sync.base, 0)];
+        }
+        "invoke" => {
+            let targets = match p.targets.as_str() {
+                "one" => 1,
+                "many" => p.sms,
+                t => return Err(format!("unknown targets {t:?} (one, many)")),
+            };
+            sms = pick(&all, targets, &p.placement)?;
+            for i in 0..p.tasks {
+                let j = i % sms.len();
+                let flag = sms[j].smem.base;
+                push(
+                    &mut items,
+                    &mut metas,
+                    Descriptor::join(dst_range(flag, GRANULE), Vec::new()),
+                    0,
+                    Meta {
+                        role: Role::Flag,
+                        sm: j,
+                        bytes: 0,
+                    },
+                );
+            }
+        }
+        m => {
+            return Err(format!(
+                "unknown mode {m:?} (stream, latency, atlas, muon, pingpong, barrier, invoke)"
+            ))
+        }
+    }
+    // driver = sms: the spawn tree over the gpcs of the run's SMs.
+    let tree = if p.driver == "sms" {
+        let topo = b.sim.topology();
+        let root_sync = b
+            .sync_only(NeutrinoId(0))
+            .ok_or("driver = sms: the device has no sync space")?;
+        let mut gpcs: Vec<Gpc> = Vec::new();
+        for (j, s) in sms.iter().enumerate() {
+            let g = topo
+                .node(s.nu)
+                .parent
+                .ok_or("driver = sms: an SM without a gpc")?;
+            if topo.node(g).parent != Some(NeutrinoId(0)) {
+                return Err("driver = sms: an SM's parent is not a child of the device".into());
+            }
+            match gpcs.iter_mut().find(|x| x.0 == g) {
+                Some(x) => x.2.push((j, s.nu)),
+                None => {
+                    let sync = b.sync_only(g).ok_or_else(|| {
+                        format!("driver = sms: {} has no sync space", topo.path_name(g))
+                    })?;
+                    gpcs.push((g, sync, vec![(j, s.nu)]));
+                }
+            }
+        }
+        Some((root_sync, gpcs))
+    } else {
+        None
+    };
+    let report = Rc::new(RefCell::new(Report {
+        params: Some(p),
+        sms,
+        metas,
+        ..Report::default()
+    }));
+    Ok(Run {
+        items,
+        limit,
+        last,
+        report,
+        driver,
+        tree,
+    })
+}
+
+/// The latest version of `base` among `items` (0: none).
+fn versions_peek(items: &[Item], base: u64) -> u64 {
+    items
+        .iter()
+        .rev()
+        .find(|i| i.done.0 == base)
+        .map_or(0, |i| i.done.1)
+}
+
+/// Invokes `items` in order, at most `limit` open per window, then waits
+/// for `last` (the latest version of every range when empty); returns the
+/// cycle after each invoke call.
+async fn issue(ctx: &NuCtx, items: Vec<Item>, limit: usize, last: Vec<(u64, u64)>) -> Vec<u64> {
+    let mut open: HashMap<usize, VecDeque<(u64, u64)>> = HashMap::new();
+    let mut invoked_at = Vec::with_capacity(items.len());
+    let mut latest: HashMap<u64, u64> = HashMap::new();
+    for it in items {
+        let q = open.entry(it.window).or_default();
+        if q.len() >= limit {
+            let (a, v) = q.pop_front().expect("open task");
+            ctx.wait(a, v).await;
+        }
+        ctx.invoke(it.desc).await;
+        invoked_at.push(ctx.now());
+        open.entry(it.window).or_default().push_back(it.done);
+        latest.insert(it.done.0, it.done.1);
+    }
+    let waits = if last.is_empty() {
+        let mut w: Vec<(u64, u64)> = latest.into_iter().collect();
+        w.sort_unstable();
+        w
+    } else {
+        last
+    };
+    for (a, v) in waits {
+        if v == 0 {
+            ctx.wait_unversioned(a).await;
+        } else {
+            ctx.wait(a, v).await;
+        }
+    }
+    invoked_at
+}
+
+impl Run {
+    /// The driver program: one program issues every task, or (`driver =
+    /// sms`) the device starts the gpcs' programs, which start the SMs'.
+    pub async fn run(self, ctx: NuCtx) {
+        let start = ctx.now();
+        let invoked_at = match self.tree {
+            None => issue(&ctx, self.items, self.limit, self.last).await,
+            Some((root_sync, gpcs)) => {
+                // Each SM's tasks (its window), in order.
+                let mut per: HashMap<usize, Vec<Item>> = HashMap::new();
+                for it in self.items {
+                    per.entry(it.window).or_default().push(it);
+                }
+                let limit = self.limit;
+                let mut gpc_dones = Vec::new();
+                for (k, (g, sync, sms)) in gpcs.into_iter().enumerate() {
+                    let lists: Vec<(NeutrinoId, Vec<Item>)> = sms
+                        .into_iter()
+                        .map(|(j, nu)| (nu, per.remove(&j).unwrap_or_default()))
+                        .collect();
+                    let done = Range::from_len(root_sync.base + k as u64 * GRANULE, GRANULE);
+                    let gpc = move |gctx: NuCtx| async move {
+                        let mut dones = Vec::new();
+                        for (i, (nu, items)) in lists.into_iter().enumerate() {
+                            let d = Range::from_len(sync.base + i as u64 * GRANULE, GRANULE);
+                            let sm = move |sctx: NuCtx| async move {
+                                issue(&sctx, items, limit, Vec::new()).await;
+                            };
+                            gctx.spawn_named(nu, "micro_sm", d, vec![], sm).await;
+                            dones.push(d.base);
+                        }
+                        for d in dones {
+                            gctx.wait_unversioned(d).await;
+                        }
+                    };
+                    ctx.spawn_named(g, "micro_gpc", done, vec![], gpc).await;
+                    gpc_dones.push(done.base);
+                }
+                for d in gpc_dones {
+                    ctx.wait_unversioned(d).await;
+                }
+                Vec::new()
+            }
+        };
+        let mut r = self.report.borrow_mut();
+        r.driver_start = start;
+        r.driver_end = ctx.now();
+        r.invoked_at = invoked_at;
+    }
+}
+
+/// The measured quantities of the run (the `micro` object of `--stats`);
+/// `stats` needs the task timeline.
+pub fn result(r: &Report, stats: &Stats) -> Value {
+    let p = r.params.clone().unwrap_or_default();
+    let by_label: HashMap<u64, &sim_core::TaskTimeline> = stats
+        .tasks
+        .iter()
+        .filter_map(|t| t.label.map(|l| (l, t)))
+        .collect();
+    let task = |i: usize| by_label.get(&(i as u64)).copied();
+    let first_start = |t: &sim_core::TaskTimeline| t.chunks.first().map(|c| c.start);
+    let last_end = |t: &sim_core::TaskTimeline| t.chunks.last().map(|c| c.end);
+    let driver_cycles = r.driver_end - r.driver_start;
+    let res: HashMap<&str, &sim_core::ResourceStats> = stats
+        .resources
+        .iter()
+        .map(|x| (x.name.as_str(), x))
+        .collect();
+    let mut culprits: Vec<(&str, u64)> = stats
+        .resources
+        .iter()
+        .filter(|x| x.culprit_cycles > 0)
+        .map(|x| (x.name.as_str(), x.culprit_cycles))
+        .collect();
+    culprits.sort_by_key(|c| std::cmp::Reverse(c.1));
+    culprits.truncate(5);
+    let sm_paths: Vec<&str> = r.sms.iter().map(|s| s.path.as_str()).collect();
+    let mut out = json!({
+        "mode": p.mode,
+        "params": p,
+        "sms": sm_paths,
+        "driver_cycles": driver_cycles,
+        "culprits": culprits,
+    });
+    let data: Vec<(usize, &Meta)> = r
+        .metas
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::Data)
+        .collect();
+    match p.mode.as_str() {
+        "stream" => {
+            let (mut lo, mut hi, mut total) = (u64::MAX, 0u64, 0u64);
+            let mut per: Vec<(u64, u64, u64)> = vec![(u64::MAX, 0, 0); r.sms.len()];
+            for &(i, m) in &data {
+                let Some(t) = task(i) else { continue };
+                let (Some(s), Some(e)) = (first_start(t), last_end(t)) else {
+                    continue;
+                };
+                lo = lo.min(s);
+                hi = hi.max(e);
+                total += m.bytes;
+                let q = &mut per[m.sm];
+                *q = (q.0.min(s), q.1.max(e), q.2 + m.bytes);
+            }
+            let cycles = hi.saturating_sub(lo);
+            let per_sm: Vec<f64> = per
+                .iter()
+                .map(|&(s, e, b)| b as f64 / e.saturating_sub(s).max(1) as f64)
+                .collect();
+            out["bytes"] = json!(total);
+            out["cycles"] = json!(cycles);
+            out["bytes_per_cycle"] = json!(total as f64 / cycles.max(1) as f64);
+            out["bytes_per_cycle_per_sm"] = json!(per_sm);
+            out["bytes_per_cycle_per_sm_mean"] =
+                json!(per_sm.iter().sum::<f64>() / per_sm.len().max(1) as f64);
+            out["driver_bytes_per_cycle"] = json!(total as f64 / driver_cycles.max(1) as f64);
+        }
+        "latency" => {
+            if let Some(t) = data.first().and_then(|&(i, _)| task(i)) {
+                out["bytes"] = json!(p.bytes);
+                out["invoke_to_complete"] = json!(t.complete.map(|c| c - t.invoke));
+                out["issue_to_last_chunk_end"] =
+                    json!(t.issue.zip(last_end(t)).map(|(i, e)| e - i));
+                out["driver_cycles"] = json!(driver_cycles);
+            }
+        }
+        "atlas" | "muon" => {
+            let mut rows = Vec::new();
+            for &(i, m) in &data {
+                let Some(t) = task(i) else { continue };
+                let (Some(s), Some(e)) = (first_start(t), last_end(t)) else {
+                    continue;
+                };
+                let cycles = e - s;
+                let sm = &r.sms[m.sm];
+                let port = res.get(format!("{}.smem.port", sm.path).as_str());
+                let share = port.map(|x| {
+                    // The port's lane-cycles over the task's window.
+                    x.busy_cycles as f64 / (x.lanes.max(1) as u64 * cycles.max(1)) as f64
+                });
+                let mut row = json!({
+                    "sm": sm.path,
+                    "cycles": cycles,
+                    "invoke_to_complete": t.complete.map(|c| c - t.invoke),
+                    "smem_port_share": share,
+                });
+                if p.mode == "atlas" {
+                    row["mac_per_cycle"] = json!((p.m * p.n * p.k) as f64 / cycles.max(1) as f64);
+                }
+                rows.push(row);
+            }
+            let mean = |k: &str| {
+                rows.iter().filter_map(|x| x[k].as_f64()).sum::<f64>() / rows.len().max(1) as f64
+            };
+            if p.mode == "atlas" {
+                out["mac_per_cycle_per_sm"] = json!(mean("mac_per_cycle"));
+            }
+            out["cycles_mean"] = json!(mean("cycles"));
+            out["smem_port_share_mean"] = json!(mean("smem_port_share"));
+            out["per_sm"] = Value::Array(rows);
+        }
+        "pingpong" => {
+            let steps: Vec<&sim_core::TaskTimeline> = (0..r.metas.len()).filter_map(task).collect();
+            // One way: from a flag's completion to the next task's issue
+            // (its dependency resolved at the other SM), and the mean step.
+            let hops: Vec<u64> = steps
+                .windows(2)
+                .filter_map(|w| Some(w[1].issue? - w[0].complete?))
+                .collect();
+            let span = steps
+                .last()
+                .and_then(|l| l.complete)
+                .zip(steps.first().and_then(|f| f.complete))
+                .map(|(l, f)| l - f);
+            out["rounds"] = json!(p.rounds);
+            out["one_way_cycles"] =
+                json!(hops.iter().sum::<u64>() as f64 / hops.len().max(1) as f64);
+            out["step_cycles"] = json!(span.map(|s| s as f64 / (steps.len().max(2) - 1) as f64));
+        }
+        "barrier" => {
+            let flags: Vec<&sim_core::TaskTimeline> = r
+                .metas
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.role == Role::Flag)
+                .filter_map(|(i, _)| task(i))
+                .collect();
+            let last = flags.iter().filter_map(|t| t.complete).max();
+            let join = r
+                .metas
+                .iter()
+                .position(|m| m.role == Role::Join)
+                .and_then(task);
+            out["n"] = json!(flags.len());
+            out["last_task_end"] = json!(last);
+            if let (Some(l), Some(j)) = (last, join) {
+                out["to_join_ready"] = json!(j.ready.map(|x| x.saturating_sub(l)));
+                out["to_join_complete"] = json!(j.complete.map(|x| x.saturating_sub(l)));
+            }
+        }
+        "invoke" => {
+            let entries: Vec<u64> = (0..r.metas.len())
+                .filter_map(task)
+                .map(|t| t.invoke)
+                .collect();
+            let n = entries.len() as u64;
+            let (lo, hi) = (entries.iter().min(), entries.iter().max());
+            out["tasks"] = json!(n);
+            out["driver_cycles_per_task"] = json!(driver_cycles as f64 / n.max(1) as f64);
+            out["entry_cycles_per_task"] = json!(lo
+                .zip(hi)
+                .map(|(l, h)| (h - l) as f64 / (n.max(2) - 1) as f64));
+            let calls = &r.invoked_at;
+            if calls.len() > 1 {
+                out["call_cycles_per_task"] =
+                    json!((calls[calls.len() - 1] - calls[0]) as f64 / (calls.len() - 1) as f64);
+            }
+        }
+        _ => {}
+    }
+    out
+}

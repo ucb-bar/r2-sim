@@ -233,7 +233,7 @@ fn load_does_not_wait_for_unrelated_ops() {
                 row_panel: false,
                 acc_buffer: 0,
                 array: n.array,
-                smem_port: n.smem_port,
+                smem_port: Some(n.smem_port),
                 smem_wport: None,
                 utilization: Ratio::ONE,
                 quantize: true,

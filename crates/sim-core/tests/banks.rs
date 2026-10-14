@@ -279,16 +279,133 @@ fn a_store_through_a_hash_link_is_one_piece_per_granule() {
     }
 }
 
+/// The Atlas of `atlas_node` (a 4096 MAC/cycle bf16 array) on an SMEM of
+/// four 16 KiB banks of 64 B/cycle per port.
+const ATLAS: &str = "        - {name: atlas, type: tensor, rate: {bf16: 4096}, quantize: none, master: [$this.lbus]}";
+
+fn atlas_node(fabric: &str, mems: &str) -> Built {
+    let sets = [
+        "root.sm0.smem.banks=4",
+        "root.sm0.smem.bw_bytes=64",
+        "root.sm0.smem.wr_bytes=64",
+    ];
+    node_with(fabric, mems, ATLAS, &sets).unwrap()
+}
+
+/// A 64 x 64 x 64 bf16 matmul (one 64 x 64 tile) with A at `a`
+/// (`a2`), B at `b` (`b2`) and C at `c`, offsets in the SMEM.
+fn atlas_mm(b: Built, a: u64, a2: Option<u64>, bb: u64, b2: Option<u64>, c: u64) -> Stats {
+    let sm0 = b.nu("root.sm0");
+    let smem = b.memory("root.sm0.smem").base;
+    let at = |o: u64| Addr(smem + o);
+    let d = Descriptor {
+        opcode: b.sim.profiles().lookup("atlas.matmul").unwrap(),
+        pe: Some(b.pe("root.sm0.atlas")),
+        dst: Range::from_len(smem + c, 8192),
+        versioned: false,
+        inferred_version: None,
+        deps: vec![],
+        label: None,
+        args: Args::Matmul {
+            a: at(a),
+            b: at(bb),
+            a2: a2.map(at),
+            b2: b2.map(at),
+            lda: 64,
+            ldb: if b2.is_some() { 32 } else { 64 },
+            ldc: 64,
+            m: 64,
+            n: 64,
+            k: 64,
+            in_dtype: sim_core::Dtype::Bf16,
+            b_dtype: sim_core::Dtype::Bf16,
+            out_dtype: sim_core::Dtype::Bf16,
+            accumulate: false,
+            keep: false,
+            tile: [64, 64],
+        },
+    };
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(d).await;
+        ctx.wait_unversioned(h.addr).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    s
+}
+
+#[test]
+fn an_atlas_chunk_charges_the_banks_of_its_operands() {
+    // One SMEM block on lbus as four banks: the Atlas builds and charges
+    // each operand range on the bank that holds it. A (8 KiB) in bank 0,
+    // B in bank 2, C written in bank 1: 128 cycles on each of the three
+    // ports at 64 B/cycle; bank 3 idle.
+    let s = atlas_mm(atlas_node("", ""), 0, None, 0x8000, None, 0x4000);
+    assert_eq!(busy(&s, "root.sm0.smem.b0.port"), 128);
+    assert_eq!(busy(&s, "root.sm0.smem.b2.port"), 128);
+    assert_eq!(busy(&s, "root.sm0.smem.b1.wport"), 128);
+    assert_eq!(busy(&s, "root.sm0.smem.b1.port"), 0);
+    assert_eq!(busy(&s, "root.sm0.smem.b3.port"), 0);
+    // Split operands: rows 0 to 31 of A in bank 0 and 32 to 63 in bank 1,
+    // columns of B over banks 2 and 3: 4 KiB and 64 cycles on each read
+    // port, as long as the array (64^3 / 4096).
+    let s = atlas_mm(
+        atlas_node("", ""),
+        0,
+        Some(0x4000),
+        0x8000,
+        Some(0xC000),
+        0x6000,
+    );
+    for i in 0..4 {
+        assert_eq!(busy(&s, &format!("root.sm0.smem.b{i}.port")), 64, "b{i}");
+    }
+    assert_eq!(busy(&s, "root.sm0.smem.b1.wport"), 128);
+    assert_eq!(busy(&s, "root.sm0.atlas.array"), 64);
+}
+
 #[test]
 fn a_compute_pe_does_not_use_a_hashed_range() {
-    // An Atlas reads the one SMEM on its bus: a banked SMEM is two
-    // scratch blocks there, an error.
-    let atlas = "        - {name: atlas, type: tensor, rate: {bf16: 4096}, quantize: none, master: [$this.lbus]}";
-    let e = node_with(LINK, BANKS, atlas, &["root.sm0.smem.banks=4"])
-        .err()
-        .unwrap()
-        .0;
-    assert!(e.contains("are slaves on"), "{e}");
+    // An Atlas operand in the linear range of a hash link stops the run.
+    let b = atlas_node(LINK, BANKS);
+    let sm0 = b.nu("root.sm0");
+    let smem = b.memory("root.sm0.smem").base;
+    let d = Descriptor {
+        opcode: b.sim.profiles().lookup("atlas.matmul").unwrap(),
+        pe: Some(b.pe("root.sm0.atlas")),
+        dst: Range::from_len(smem, 8192),
+        versioned: false,
+        inferred_version: None,
+        deps: vec![],
+        label: None,
+        args: Args::Matmul {
+            a: Addr(0x1000),
+            b: Addr(smem),
+            a2: None,
+            b2: None,
+            lda: 64,
+            ldb: 64,
+            ldc: 64,
+            m: 64,
+            n: 64,
+            k: 64,
+            in_dtype: sim_core::Dtype::Bf16,
+            b_dtype: sim_core::Dtype::Bf16,
+            out_dtype: sim_core::Dtype::Bf16,
+            accumulate: false,
+            keep: false,
+            tile: [64, 64],
+        },
+    };
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(d).await;
+        ctx.wait_unversioned(h.addr).await;
+    });
+    let s = sim.run();
+    let f = format!("{:?}", s.fatal.expect("fatal"));
+    assert!(f.contains("linear range"), "{f}");
     // A Muon task whose source is in the linear range stops the run.
     let muon = "        - {name: muon, type: vector, rate: {lane_op: 64}, master: [$this.lbus, $this.smsbus]}";
     let b = node_with(LINK, BANKS, muon, &[]).unwrap();
@@ -317,6 +434,46 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
     let s = sim.run();
     let f = format!("{:?}", s.fatal.expect("fatal"));
     assert!(f.contains("linear range"), "{f}");
+}
+
+#[test]
+fn a_muon_task_spreads_over_the_banks_of_its_range() {
+    // 8 KiB read from 4 KiB below the end of bank 0: 4 KiB on bank 0 and
+    // 4 KiB on bank 1, 64 cycles each at 64 B/cycle.
+    let muon = "        - {name: muon, type: vector, rate: {lane_op: 64}, master: [$this.lbus, $this.smsbus]}";
+    let sets = [
+        "root.sm0.smem.banks=4",
+        "root.sm0.smem.bw_bytes=64",
+        "root.sm0.smem.wr_bytes=64",
+    ];
+    let b = node_with("", "", muon, &sets).unwrap();
+    let sm0 = b.nu("root.sm0");
+    let smem = b.memory("root.sm0.smem").base;
+    let d = Descriptor {
+        opcode: b.sim.profiles().lookup("muon.vector").unwrap(),
+        pe: Some(b.pe("root.sm0.muon")),
+        dst: Range::from_len(smem + 0x8000, 1024),
+        versioned: false,
+        inferred_version: None,
+        deps: vec![],
+        label: None,
+        args: Args::Vector {
+            ops: 64,
+            bytes_in: 8192,
+            bytes_out: 1024,
+            src: Some(Addr(smem + 0x3000)),
+        },
+    };
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(d).await;
+        ctx.wait_unversioned(h.addr).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert_eq!(busy(&s, "root.sm0.smem.b0.port"), 64);
+    assert_eq!(busy(&s, "root.sm0.smem.b1.port"), 64);
+    assert_eq!(busy(&s, "root.sm0.smem.b2.wport"), 16);
 }
 
 #[test]

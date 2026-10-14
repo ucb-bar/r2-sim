@@ -39,6 +39,8 @@ fn matmul(b: &Built, pe: &str, c: Range, label: u64) -> Descriptor {
         args: Args::Matmul {
             a: Addr(c.base),
             b: Addr(c.base),
+            a2: None,
+            b2: None,
             lda: 64,
             ldb: 64,
             ldc: 64,

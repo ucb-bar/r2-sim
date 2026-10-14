@@ -6,6 +6,8 @@
 //!   HBM map.
 //! * [`machine`]: the SMs, memories and allocators of a built
 //!   configuration.
+//! * [`micro`]: micro-benchmarks, one mode per run, to compare the model
+//!   with measurements on a card.
 //! * [`kv`]: the layout of the prefix KV cache in HBM.
 //! * [`label`]: the task label scheme.
 //! * [`synthetic`]: synthetic router traces.
@@ -20,6 +22,7 @@ mod graph;
 pub mod kv;
 pub mod label;
 pub mod machine;
+pub mod micro;
 pub mod prefill;
 pub mod synthetic;
 pub mod versions;
@@ -58,6 +61,8 @@ pub struct Launch {
     pub prefill: Option<Rc<RefCell<prefill::Report>>>,
     /// The forward pass's per-stage report (`report` is its action stage).
     pub forward: Option<Rc<RefCell<forward::Report>>>,
+    /// A micro-benchmark's record, for [`micro::result`] after the run.
+    pub micro: Option<Rc<RefCell<micro::Report>>>,
 }
 
 /// Parses program parameters: TOML text, then `key=value` overrides
@@ -81,7 +86,7 @@ pub fn params<T: serde::de::DeserializeOwned>(
         .map_err(|e: toml::de::Error| e.to_string())
 }
 
-/// The programs known by name: `adamoe`, `prefill`, `forward`.
+/// The programs known by name: `adamoe`, `prefill`, `forward`, `micro`.
 pub fn launch(
     name: &str,
     built: &Built,
@@ -105,6 +110,7 @@ pub fn launch(
                 report,
                 prefill: None,
                 forward: None,
+                micro: None,
             })
         }
         "forward" => {
@@ -122,6 +128,7 @@ pub fn launch(
                 report,
                 prefill: None,
                 forward: Some(fwd),
+                micro: None,
             })
         }
         "prefill" => {
@@ -139,10 +146,27 @@ pub fn launch(
                 report: Default::default(),
                 prefill: Some(report),
                 forward: None,
+                micro: None,
+            })
+        }
+        "micro" => {
+            let p: micro::Params = params(params_text, overrides)?;
+            let run = micro::build(built, p)?;
+            let (nu, report) = (run.driver, run.report.clone());
+            Ok(Launch {
+                nu,
+                drivers: vec![nu],
+                home: nu,
+                program: Box::new(move |ctx| Box::pin(run.run(ctx))),
+                name: "micro",
+                report: Default::default(),
+                prefill: None,
+                forward: None,
+                micro: Some(report),
             })
         }
         _ => Err(format!(
-            "unknown program {name:?} (known: adamoe, prefill, forward)"
+            "unknown program {name:?} (known: adamoe, prefill, forward, micro)"
         )),
     }
 }

@@ -919,11 +919,12 @@ impl Sim {
         if matches!(p.params, crate::config::PeParams::Dma { .. }) {
             return None;
         }
-        let src = match desc.args {
-            Args::Vector { src, .. } => src,
-            _ => None,
+        let ops = match desc.args {
+            Args::Vector { src, .. } => [src, None, None, None],
+            Args::Matmul { a, b, a2, b2, .. } => [Some(a), Some(b), a2, b2],
+            _ => [None; 4],
         };
-        let addrs = [Some(Addr(desc.dst.base)), src];
+        let addrs = std::iter::once(Some(Addr(desc.dst.base))).chain(ops);
         addrs.into_iter().flatten().find_map(|a| {
             self.hashes
                 .iter()

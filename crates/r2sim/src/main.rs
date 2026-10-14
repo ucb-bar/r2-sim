@@ -46,6 +46,10 @@ struct Args {
     cocharge: Option<sim_core::CoCharge>,
     flow: Option<sim_core::Flow>,
     diagnostics: bool,
+    /// The flags that change the model besides `--set` (`--acc-buffer`,
+    /// `--operand-reuse`, `--quantize`, `--cocharge`, `--flow`), as
+    /// `"--flag value"` in command-line order, for the raw manifest.
+    model_flags: Vec<String>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -58,7 +62,19 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some("run") => {}
         _ => return Err(USAGE.into()),
     }
+    const MODEL_FLAGS: [&str; 5] = [
+        "--acc-buffer",
+        "--operand-reuse",
+        "--quantize",
+        "--cocharge",
+        "--flow",
+    ];
     while let Some(k) = it.next() {
+        if MODEL_FLAGS.contains(&k.as_str()) {
+            if let Some(v) = it.clone().next() {
+                a.model_flags.push(format!("{k} {v}"));
+            }
+        }
         let mut val = || it.next().cloned().ok_or(format!("{k} needs a value"));
         match k.as_str() {
             "--config" => a.config = Some(val()?.into()),
@@ -279,6 +295,10 @@ struct Out<'a> {
     report: &'a nu_prog::adamoe::Report,
     prefill: Option<&'a nu_prog::prefill::Report>,
     forward: Option<&'a nu_prog::forward::Report>,
+    /// A micro-benchmark's measured quantities (absent for the other
+    /// programs, so their JSON does not change).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    micro: Option<serde_json::Value>,
     stats: &'a Stats,
 }
 
@@ -356,7 +376,7 @@ fn run(argv: &[String]) -> Result<(), String> {
             r.num as f64 / r.den as f64
         })
         .sum();
-    if rate_f == 0.0 {
+    if rate_f == 0.0 && launch.micro.is_none() {
         return Err("no memory named hbm".into());
     }
 
@@ -368,7 +388,9 @@ fn run(argv: &[String]) -> Result<(), String> {
     let home_path = b.sim.topology().path_name(launch.home);
     // The tracer export needs the timeline, the marks and the resource logs.
     let tracing = a.trace_out.is_some();
-    b.sim.set_timeline(a.timeline || tracing);
+    // A micro-benchmark measures from the task timeline.
+    b.sim
+        .set_timeline(a.timeline || tracing || launch.micro.is_some());
     b.sim.set_marks(a.phase_stats || tracing);
     b.sim.set_log(tracing);
     if !a.diagnostics {
@@ -414,7 +436,7 @@ fn run(argv: &[String]) -> Result<(), String> {
                 program: program.clone(),
                 params_file: a.params.as_ref().map(|p| p.display().to_string()),
                 params: a.overrides.clone(),
-                overrides: a.sets.clone(),
+                overrides: a.sets.iter().chain(&a.model_flags).cloned().collect(),
                 granule,
             };
             let (t, out) = traceraw::RawTracer::create(&opts, &b, &run)
@@ -429,6 +451,10 @@ fn run(argv: &[String]) -> Result<(), String> {
     let t0 = Instant::now();
     let stats = sim.run();
     let wall = t0.elapsed().as_secs_f64();
+    let micro = launch
+        .micro
+        .as_ref()
+        .map(|r| nu_prog::micro::result(&r.borrow(), &stats));
     let prefill = launch.prefill.as_ref().map(|r| r.borrow().clone());
     let forward = launch.forward.as_ref().map(|r| r.borrow().clone());
     if let Some((dir, out)) = &raw {
@@ -474,21 +500,50 @@ fn run(argv: &[String]) -> Result<(), String> {
     let warnings_total = stats.warnings.len();
 
     let res = resource_outs(&stats);
-    let home_port = format!("{}.smem.port", home_path);
-    let per_sm: Vec<(String, f64)> = res
+    // Per SM: its SMEM read port, or on a banked SMEM the mean over its
+    // banks' read ports (named `<sm>.smem.b*.port`).
+    let smem_key = |name: &str| -> Option<String> {
+        if name.ends_with(".smem.port") {
+            return Some(name.to_string());
+        }
+        let (head, bank) = name.strip_suffix(".port")?.rsplit_once(".smem.b")?;
+        bank.parse::<u32>()
+            .ok()
+            .map(|_| format!("{head}.smem.b*.port"))
+    };
+    let mut grouped: Vec<(String, f64, u32)> = Vec::new();
+    for r in &res {
+        let Some(k) = smem_key(&r.name) else { continue };
+        match grouped.iter_mut().find(|g| g.0 == k) {
+            Some(g) => {
+                g.1 += r.utilization;
+                g.2 += 1;
+            }
+            None => grouped.push((k, r.utilization, 1)),
+        }
+    }
+    let smem_util: Vec<(String, f64)> = grouped
+        .into_iter()
+        .map(|(k, u, n)| (k, u / n as f64))
+        .collect();
+    let home_port = [
+        format!("{}.smem.port", home_path),
+        format!("{}.smem.b*.port", home_path),
+    ];
+    let per_sm: Vec<(String, f64)> = smem_util
         .iter()
-        .filter(|r| r.name.ends_with(".smem.port") && r.name != home_port)
-        .map(|r| (r.name.clone(), r.utilization))
+        .filter(|r| !home_port.contains(&r.0))
+        .cloned()
         .collect();
     let us = || per_sm.iter().map(|x| x.1);
     let smem_port_util = Spread {
         min: us().fold(f64::INFINITY, f64::min),
         max: us().fold(0.0, f64::max),
         mean: us().sum::<f64>() / per_sm.len().max(1) as f64,
-        home: res
+        home: smem_util
             .iter()
-            .find(|r| r.name == home_port)
-            .map_or(0.0, |r| r.utilization),
+            .find(|r| home_port.contains(&r.0))
+            .map_or(0.0, |r| r.1),
         per_sm: per_sm.clone(),
     };
     let mut culprits: Vec<ResourceOut> = res
@@ -568,6 +623,7 @@ fn run(argv: &[String]) -> Result<(), String> {
         report: &report,
         prefill: prefill.as_ref(),
         forward: forward.as_ref(),
+        micro,
         stats: &stats_out,
     };
     print_summary(&out, &stats);

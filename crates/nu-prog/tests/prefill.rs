@@ -183,6 +183,10 @@ fn the_chosen_grid_is_within_the_margin_and_reads_the_least_hbm() {
     let e = CostEnv {
         workers: 7,
         budget: 1 << 20,
+        banks: 0,
+        whole: nu_prog::machine::Role::Act,
+        smem_per_role: false,
+        tile_rows: 128,
         granule: 512,
         kcs: vec![128, 256, 512, 1024],
         sm: nu_prog::machine::SmRates {
@@ -190,6 +194,7 @@ fn the_chosen_grid_is_within_the_margin_and_reads_the_least_hbm() {
             link_up: 128.0,
             smem: 256.0,
             mac: 16384.0,
+            mac_by_type: [0.0; 4],
             row_panel: false,
             acc_buffer: 0,
             execution: 256,

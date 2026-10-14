@@ -142,7 +142,7 @@ pub fn node(k: Knobs) -> Node {
                 acc_buffer: 0,
                 array,
                 rates: Vec::new(),
-                smem_port,
+                smem_port: Some(smem_port),
                 smem_wport: None,
                 utilization: Ratio::ONE,
                 quantize: true,
@@ -201,6 +201,8 @@ impl Node {
             args: Args::Matmul {
                 a: Addr(a),
                 b: Addr(b),
+                a2: None,
+                b2: None,
                 lda: e,
                 ldb: e,
                 ldc: e,

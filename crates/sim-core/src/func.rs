@@ -291,6 +291,8 @@ fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Chan> {
     shared.chan.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+// A transient value of the worker loop: the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 enum Work {
     Apply(FuncOp),
     Serve(LoadReq),

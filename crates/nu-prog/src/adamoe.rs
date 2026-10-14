@@ -41,7 +41,8 @@ use crate::graph::{excess_deps, with_deps, Graph, TaskIx, MAX_JOIN_DEPS};
 use crate::kv::KvLayout;
 use crate::label::{self, Kind};
 use crate::machine::{
-    parse_dtype, with_b_dtype, worker_list, Layout, Machine, SliceBump, SyncPool,
+    low_rows, parse_dtype, with_b_dtype, worker_list, Layout, Machine, Role, SliceBump, Split,
+    SyncPool,
 };
 
 /// Program parameters (a TOML file, every key optional).
@@ -242,7 +243,7 @@ enum Src {
 
 /// The weight stream of one SM: two staging slots.
 struct Stream {
-    slots: [Range; 2],
+    slots: [Split; 2],
     next: usize,
     /// Per slot: the outputs the next DMA into it must wait for (its last
     /// reader; under KV multicast also every puller's signal).
@@ -253,7 +254,7 @@ struct Stream {
 }
 
 struct SmBufs {
-    xc: Range,
+    xc: Split,
     p: Range,
     q: Vec<Range>,
     k: Vec<Range>,
@@ -265,6 +266,9 @@ struct SmBufs {
     u: [Range; 2],
     h: [Range; 2],
     resident: Layout,
+    /// On a banked SMEM: the resident region's high half, from its low
+    /// half (each resident block is split over the weight bank pair).
+    resident_hi: Option<u64>,
 }
 
 struct HomeBufs {
@@ -274,6 +278,11 @@ struct HomeBufs {
     gbuf: Vec<Range>,
     rout: Range,
     wr: Range,
+}
+
+/// An unsplit operand at `a` (for [`Machine::matmul_split`]).
+fn at(a: u64) -> Split {
+    Split::whole(Range::from_len(a, 0))
 }
 
 /// HBM addresses of the weights and the KV cache.
@@ -382,15 +391,18 @@ impl Driver {
         let mut bufs: Vec<Option<SmBufs>> = (0..n).map(|_| None).collect();
         let mut streams = Vec::with_capacity(n);
         for (i, sm) in m.sms.iter().enumerate() {
-            let mut lay = Layout::new(sm.smem, g);
+            let mut lay = Layout::of_sm(sm, g);
             // The home SM streams no weights (the router weights are
             // resident); its SMEM holds the residual stream and the gather
             // buffers.
             let slots = if i == p.home {
-                let none = Range::from_len(sm.smem.base, 0);
+                let none = Split::whole(Range::from_len(sm.smem.base, 0));
                 [none, none]
             } else {
-                [lay.take(bb)?, lay.take(bb)?]
+                [
+                    lay.take_split(Role::W, 1, bb, 1, 2)?,
+                    lay.take_split(Role::W, 1, bb, 1, 2)?,
+                ]
             };
             streams.push(Stream {
                 slots,
@@ -403,26 +415,46 @@ impl Driver {
             if i == p.home {
                 continue;
             }
-            let units = |lay: &mut Layout, k: u64| -> Result<Vec<Range>, String> {
-                (0..k).map(|_| lay.take(unit)).collect()
+            let units = |lay: &mut Layout, role: Role, k: u64| -> Result<Vec<Range>, String> {
+                (0..k).map(|_| lay.take_role(role, unit)).collect()
             };
-            let xc = lay.take(act)?;
-            let pp = lay.take(act)?;
-            let q = units(&mut lay, hpb)?;
-            let k = units(&mut lay, hpb)?;
-            let v = units(&mut lay, hpb)?;
+            let xc = lay.take_split(Role::Act, 1, act, low_rows(t, p.tile[0]), t)?;
+            // On a banked SMEM the operand buffers go first, so that the
+            // partial sum and the statistics are the buffers that move to
+            // the other bank group.
+            let banked = lay.banked();
+            let mut pp = if banked { None } else { Some(lay.take(act)?) };
+            // Matmul outputs that later matmuls read: Q, the scores, O
+            // and H as operand A, K and V as operand B; G and U are the
+            // Muon's inputs.
+            let q = units(&mut lay, Role::Act, hpb)?;
+            let k = units(&mut lay, Role::W, hpb)?;
+            let v = units(&mut lay, Role::W, hpb)?;
             let s = (0..=nkb)
-                .map(|_| lay.take(t * p.key_block * 2))
+                .map(|_| lay.take_role(Role::Act, t * p.key_block * 2))
                 .collect::<Result<Vec<_>, _>>()?;
-            let stats = lay.take(t * 8)?;
-            let o = lay.take(t * p.head_dim * 2)?;
-            let gg = [lay.take(unit)?, lay.take(unit)?];
-            let uu = [lay.take(unit)?, lay.take(unit)?];
-            let hh = [lay.take(unit)?, lay.take(unit)?];
-            let resident = if p.resident_bytes_per_sm > 0 {
-                Layout::new(lay.take(p.resident_bytes_per_sm)?, g)
+            let mut stats = if banked { None } else { Some(lay.take(t * 8)?) };
+            let o = lay.take_role(Role::Act, t * p.head_dim * 2)?;
+            let mut act2 = || -> Result<[Range; 2], String> {
+                Ok([
+                    lay.take_role(Role::Act, unit)?,
+                    lay.take_role(Role::Act, unit)?,
+                ])
+            };
+            let gg = act2()?;
+            let uu = act2()?;
+            let hh = act2()?;
+            if banked {
+                pp = Some(lay.take(act)?);
+                stats = Some(lay.take(t * 8)?);
+            }
+            let (pp, stats) = (pp.expect("partial sum"), stats.expect("statistics"));
+            let (resident, resident_hi) = if p.resident_bytes_per_sm > 0 {
+                let r = lay.take_split(Role::W, 1, p.resident_bytes_per_sm, 1, 2)?;
+                let hi = r.hi.map(|h| h.base - r.lo.base);
+                (Layout::new(r.lo, g), hi)
             } else {
-                Layout::new(Range::from_len(sm.smem.bound, 0), g)
+                (Layout::new(Range::from_len(sm.smem.bound, 0), g), None)
             };
             bufs[i] = Some(SmBufs {
                 xc,
@@ -437,18 +469,19 @@ impl Driver {
                 u: uu,
                 h: hh,
                 resident,
+                resident_hi,
             });
         }
-        let mut lay = Layout::new(m.sms[p.home].smem, g);
+        let mut lay = Layout::of_sm(&m.sms[p.home], g);
         let home = HomeBufs {
-            x: lay.take(act)?,
-            xn: lay.take(act)?,
-            xn2: lay.take(act)?,
+            x: lay.take_role(Role::Act, act)?,
+            xn: lay.take_role(Role::Act, act)?,
+            xn2: lay.take_role(Role::Act, act)?,
             gbuf: (0..p.gather_bufs.max(1))
                 .map(|_| lay.take(act))
                 .collect::<Result<Vec<_>, _>>()?,
             rout: lay.take(t)?,
-            wr: lay.take(p.d * p.experts * 2)?,
+            wr: lay.take_role(Role::W, p.d * p.experts * 2)?,
         };
 
         let nb = p.ffn / p.block_cols;
@@ -535,7 +568,12 @@ impl Driver {
                     if self.resident.contains_key(&(sm, blk)) {
                         continue;
                     }
-                    if let Ok(r) = b.resident.take(self.hbm.bb) {
+                    let bytes = if b.resident_hi.is_some() {
+                        self.hbm.bb / 2
+                    } else {
+                        self.hbm.bb
+                    };
+                    if let Ok(r) = b.resident.take(bytes) {
                         self.resident.insert((sm, blk), r.base);
                     }
                 }
@@ -696,7 +734,7 @@ impl Driver {
     /// Adds a task that `sm` owns (the owner follows from `dst`).
     fn add(&mut self, sm: usize, mut desc: Descriptor) -> TaskIx {
         // Deps beyond one message go through a join at the same SM.
-        let rest = excess_deps(&mut desc);
+        let rest = excess_deps(&mut desc, |d| self.g.chains(d));
         if !rest.is_empty() {
             let j = self.signal(sm, &rest, desc.label.unwrap_or(0));
             desc.deps.push(nu_model::Dep::Unversioned(j.base));
@@ -772,13 +810,8 @@ impl Driver {
             st.ready.push_back(Src::Slot(slot));
             let dst = st.slots[slot];
             let war: Vec<Option<Range>> = st.last_reader[slot].iter().map(|r| Some(*r)).collect();
-            let desc = self.m.dma(sm, b.from, dst, b.bytes, self.p.dma_chunk);
-            let desc = with_deps(
-                desc,
-                &war,
-                label::label(Kind::DmaW, step, l, sm as u32, (b.src >> 12) as u32),
-            );
-            self.add(sm, desc);
+            let lab = label::label(Kind::DmaW, step, l, sm as u32, (b.src >> 12) as u32);
+            self.dma_split(sm, b.from, dst, dst.halves(b.bytes), &war, lab);
             let mut r = self.report.borrow_mut();
             if b.cmem {
                 r.cmem_bytes += b.bytes;
@@ -789,16 +822,56 @@ impl Driver {
         }
     }
 
-    /// The next fetched block: its address and dep range (a slot) if
-    /// streamed.
-    fn take(&mut self, sm: usize) -> (Src, u64, Option<Range>) {
+    /// The next fetched block: where it is and its dep ranges (a slot's
+    /// halves) if streamed.
+    fn take(&mut self, sm: usize) -> (Src, Split, Option<Range>, Option<Range>) {
         match self.streams[sm].ready.pop_front().expect("fetched block") {
             Src::Slot(i) => {
                 let r = self.streams[sm].slots[i];
-                (Src::Slot(i), r.base, Some(r))
+                (Src::Slot(i), r, Some(r.lo), r.hi)
             }
-            Src::Resident(a) => (Src::Resident(a), a, None),
+            Src::Resident(a) => {
+                let w = match self.bufs(sm).resident_hi {
+                    None => Split::whole(Range::from_len(a, self.hbm.bb)),
+                    Some(d) => {
+                        let half = self.hbm.bb / 2;
+                        Split::pair(Range::from_len(a, half), Range::from_len(a + d, half), 1, 2)
+                    }
+                };
+                (Src::Resident(a), w, None, None)
+            }
         }
+    }
+
+    /// A DMA of `bytes.0` from `src` into the low half of `dst` and of
+    /// `bytes.1` after them into its high half (a half of 0 bytes is not
+    /// copied; one DMA into one range).
+    fn dma_split(
+        &mut self,
+        sm: usize,
+        src: u64,
+        dst: Split,
+        bytes: (u64, u64),
+        deps: &[Option<Range>],
+        lab: u64,
+    ) {
+        if bytes.0 > 0 || dst.hi.is_none() {
+            let d = self.m.dma(sm, src, dst.lo, bytes.0, self.p.dma_chunk);
+            self.add(sm, with_deps(d, deps, lab));
+        }
+        if let (Some(hi), true) = (dst.hi, bytes.1 > 0) {
+            let d = self.m.dma(sm, src + bytes.0, hi, bytes.1, self.p.dma_chunk);
+            self.add(sm, with_deps(d, deps, lab));
+        }
+    }
+
+    /// `bytes` of `rows` activation rows as the halves of `dst` hold them.
+    fn row_halves(&self, dst: &Split, bytes: u64, rows: u64) -> (u64, u64) {
+        if dst.hi.is_none() {
+            return (bytes, 0);
+        }
+        let lo = bytes * low_rows(rows, self.p.tile[0]) / rows;
+        (lo, bytes - lo)
     }
 
     fn read_done(&mut self, sm: usize, src: Src, reader_out: Range, l: u32, step: u32) {
@@ -887,11 +960,16 @@ impl Driver {
             };
             if first[sm] {
                 // The normed input, once per SM and layer.
-                let dma = self
-                    .m
-                    .dma(sm, self.home.xn.base, xc, t * p.d * 2, p.dma_chunk);
-                let dma = with_deps(dma, &[Some(sig_xn), pe], lab(Kind::DmaAct, 0));
-                self.add(sm, dma);
+                let halves = self.row_halves(&xc, t * p.d * 2, t);
+                let deps = [Some(sig_xn), pe];
+                self.dma_split(
+                    sm,
+                    self.home.xn.base,
+                    xc,
+                    halves,
+                    &deps,
+                    lab(Kind::DmaAct, 0),
+                );
             }
             // Q, K, V projections: one reader per weight block.
             let mut blocks = Vec::new();
@@ -914,12 +992,16 @@ impl Driver {
                 b.q.iter().chain(&b.k).chain(&b.v).copied().collect()
             };
             for (j, &out) in outs.iter().enumerate() {
-                let (src, addr, slot) = self.take(sm);
+                let (src, w, slot, slot_hi) = self.take(sm);
                 let mm = self
                     .m
-                    .matmul(sm, xc.base, addr, out, t, p.block_cols, p.d, false, p.tile);
+                    .matmul_split(sm, &xc, &w, out, t, p.block_cols, p.d, false, p.tile);
                 let mm = with_b_dtype(self.w_dtype, mm);
-                let mm = with_deps(mm, &[Some(xc), slot, pe], lab(Kind::Qkv, j as u32));
+                let mm = with_deps(
+                    mm,
+                    &[Some(xc.lo), xc.hi, slot, slot_hi, pe],
+                    lab(Kind::Qkv, j as u32),
+                );
                 let ix = self.add(sm, mm);
                 self.read_done(sm, src, self.g.dst(ix), l, step);
             }
@@ -953,11 +1035,15 @@ impl Driver {
             self.fetch(sm, &kblocks, l, step);
             for (j, &sj) in s.iter().take(nkb as usize).enumerate() {
                 let keys = p.key_block.min(p.prefix - j as u64 * p.key_block);
-                let (src, addr, slot) = self.take(sm);
-                let mm = self
-                    .m
-                    .matmul(sm, q0, addr, sj, t, keys, p.head_dim, false, p.tile);
-                let mm = with_deps(mm, &[Some(jq), slot, pe], lab(Kind::Attn, j as u32));
+                let (src, w, slot, slot_hi) = self.take(sm);
+                let mm =
+                    self.m
+                        .matmul_split(sm, &at(q0), &w, sj, t, keys, p.head_dim, false, p.tile);
+                let mm = with_deps(
+                    mm,
+                    &[Some(jq), slot, slot_hi, pe],
+                    lab(Kind::Attn, j as u32),
+                );
                 let ix = self.add(sm, mm);
                 self.read_done(sm, src, self.g.dst(ix), l, step);
             }
@@ -1001,15 +1087,23 @@ impl Driver {
             self.fetch(sm, &vblocks, l, step);
             for (j, &sj) in s.iter().take(nkb as usize).enumerate() {
                 let keys = p.key_block.min(p.prefix - j as u64 * p.key_block);
-                let (src, addr, slot) = self.take(sm);
+                let (src, w, slot, slot_hi) = self.take(sm);
                 let acc = j > 0;
-                let mm = self
-                    .m
-                    .matmul(sm, sj.base, addr, o, t, p.head_dim, keys, acc, p.tile);
+                let mm = self.m.matmul_split(
+                    sm,
+                    &Split::whole(sj),
+                    &w,
+                    o,
+                    t,
+                    p.head_dim,
+                    keys,
+                    acc,
+                    p.tile,
+                );
                 let prev_o = acc.then_some(o);
                 let mm = with_deps(
                     mm,
-                    &[Some(sj), slot, prev_o, pe],
+                    &[Some(sj), slot, slot_hi, prev_o, pe],
                     lab(Kind::Attn, 200 + j as u32),
                 );
                 let ix = self.add(sm, mm);
@@ -1026,15 +1120,19 @@ impl Driver {
                 .collect();
             self.fetch(sm, &wo, l, step);
             for j in 0..hpb {
-                let (src, addr, slot) = self.take(sm);
+                let (src, w, slot, slot_hi) = self.take(sm);
                 let acc = !first[sm] || j > 0;
                 let a = o.base + j * t * p.block_cols * 2;
-                let mm = self
-                    .m
-                    .matmul(sm, a, addr, pbuf, t, p.d, p.block_cols, acc, p.tile);
+                let mm =
+                    self.m
+                        .matmul_split(sm, &at(a), &w, pbuf, t, p.d, p.block_cols, acc, p.tile);
                 let mm = with_b_dtype(self.w_dtype, mm);
                 let chain = if acc { Some(pbuf) } else { self.prev_pull[sm] };
-                let mm = with_deps(mm, &[Some(o), slot, chain, pe], lab(Kind::Wo, j as u32));
+                let mm = with_deps(
+                    mm,
+                    &[Some(o), slot, slot_hi, chain, pe],
+                    lab(Kind::Wo, j as u32),
+                );
                 let ix = self.add(sm, mm);
                 self.read_done(sm, src, self.g.dst(ix), l, step);
             }
@@ -1055,7 +1153,7 @@ impl Driver {
 
     /// A staging slot of `sm` for a hand-driven block (KV multicast): the
     /// generic stream must be idle.
-    fn mc_slot(&mut self, sm: usize) -> (usize, Range) {
+    fn mc_slot(&mut self, sm: usize) -> (usize, Split) {
         let st = &mut self.streams[sm];
         assert!(st.in_flight == 0 && st.queue.is_empty(), "stream busy");
         let slot = st.next;
@@ -1075,7 +1173,7 @@ impl Driver {
         blocks: &[(u64, u64)],
         l: u32,
         step: u32,
-        reader: &mut dyn FnMut(&mut Self, usize, u64, usize, Range) -> Range,
+        reader: &mut dyn FnMut(&mut Self, usize, u64, usize, Split) -> Range,
     ) {
         let loader = group[0].1;
         for (j, &(src, bytes)) in blocks.iter().enumerate() {
@@ -1084,9 +1182,8 @@ impl Driver {
                 .iter()
                 .map(|r| Some(*r))
                 .collect();
-            let dma = self.m.dma(loader, src, lr, bytes, self.p.dma_chunk);
             let lab = label::label(Kind::DmaW, step, l, loader as u32, (src >> 12) as u32);
-            self.add(loader, with_deps(dma, &war, lab));
+            self.dma_split(loader, src, lr, lr.halves(bytes), &war, lab);
             {
                 let mut r = self.report.borrow_mut();
                 r.hbm_bytes += bytes;
@@ -1094,7 +1191,7 @@ impl Driver {
             }
             let sig = self.signal(
                 loader,
-                &[Some(lr)],
+                &lr.deps(),
                 label::label(Kind::Join, step, l, loader as u32, 30),
             );
             let mut loader_war = Vec::new();
@@ -1105,12 +1202,16 @@ impl Driver {
                     let (ms, mr) = self.mc_slot(sm);
                     let mut deps: Vec<Option<Range>> = vec![Some(sig)];
                     deps.extend(self.streams[sm].last_reader[ms].iter().map(|r| Some(*r)));
-                    let pull = self.m.dma(sm, lr.base, mr, bytes, self.p.dma_chunk);
                     let lab = label::label(Kind::DmaAct, step, l, sm as u32, 30 + j as u32);
-                    self.add(sm, with_deps(pull, &deps, lab));
+                    let (h0, h1) = mr.halves(bytes);
+                    self.dma_split(sm, lr.lo.base, mr, (h0, 0), &deps, lab);
+                    if let (Some(lh), true) = (lr.hi, h1 > 0) {
+                        let hi = Split::whole(mr.hi.expect("split like the loader's"));
+                        self.dma_split(sm, lh.base, hi, (h1, 0), &deps, lab);
+                    }
                     let back = self.signal(
                         sm,
-                        &[Some(mr)],
+                        &mr.deps(),
                         label::label(Kind::Join, step, l, sm as u32, 31),
                     );
                     loader_war.push(back);
@@ -1160,12 +1261,15 @@ impl Driver {
                 let pe = self.prev_end[sm];
                 let xc = self.bufs(sm).xc;
                 if first[sm] {
-                    let dma = self
-                        .m
-                        .dma(sm, self.home.xn.base, xc, t * p.d * 2, p.dma_chunk);
-                    self.add(
+                    let halves = self.row_halves(&xc, t * p.d * 2, t);
+                    let deps = [Some(sig_xn), pe];
+                    self.dma_split(
                         sm,
-                        with_deps(dma, &[Some(sig_xn), pe], lab(Kind::DmaAct, 0)),
+                        self.home.xn.base,
+                        xc,
+                        halves,
+                        &deps,
+                        lab(Kind::DmaAct, 0),
                     );
                 }
                 let blocks: Vec<(u64, u64)> = (0..hpb)
@@ -1174,14 +1278,18 @@ impl Driver {
                 self.fetch(sm, &blocks, l, step);
                 let qs = self.bufs(sm).q.clone();
                 for (j, &out) in qs.iter().enumerate() {
-                    let (src, addr, slot) = self.take(sm);
+                    let (src, w, slot, slot_hi) = self.take(sm);
                     let mm =
                         self.m
-                            .matmul(sm, xc.base, addr, out, t, p.block_cols, p.d, false, p.tile);
+                            .matmul_split(sm, &xc, &w, out, t, p.block_cols, p.d, false, p.tile);
                     let mm = with_b_dtype(self.w_dtype, mm);
                     let ix = self.add(
                         sm,
-                        with_deps(mm, &[Some(xc), slot, pe], lab(Kind::Qkv, j as u32)),
+                        with_deps(
+                            mm,
+                            &[Some(xc.lo), xc.hi, slot, slot_hi, pe],
+                            lab(Kind::Qkv, j as u32),
+                        ),
                     );
                     self.read_done(sm, src, self.g.dst(ix), l, step);
                 }
@@ -1227,11 +1335,11 @@ impl Driver {
                     b.k.iter().chain(&b.v).copied().collect()
                 };
                 for (j, &out) in kv.iter().enumerate() {
-                    let (src, addr, slot) = self.take(loader);
-                    let mm = self.m.matmul(
+                    let (src, w, slot, slot_hi) = self.take(loader);
+                    let mm = self.m.matmul_split(
                         loader,
-                        xl.base,
-                        addr,
+                        &xl,
+                        &w,
                         out,
                         t,
                         p.block_cols,
@@ -1241,7 +1349,10 @@ impl Driver {
                     );
                     let mm = with_b_dtype(self.w_dtype, mm);
                     let lab = label::label(Kind::Qkv, step, l, group[0].0 as u32, 10 + j as u32);
-                    let ix = self.add(loader, with_deps(mm, &[Some(xl), slot, pe_l], lab));
+                    let ix = self.add(
+                        loader,
+                        with_deps(mm, &[Some(xl.lo), xl.hi, slot, slot_hi, pe_l], lab),
+                    );
                     self.read_done(loader, src, self.g.dst(ix), l, step);
                 }
                 let deps: Vec<Option<Range>> = kv.iter().map(|r| Some(*r)).collect();
@@ -1293,12 +1404,12 @@ impl Driver {
                     })
                     .collect();
                 let jqc = jq.clone();
-                let mut qk = |d: &mut Self, j: usize, head: u64, sm: usize, slot: Range| -> Range {
+                let mut qk = |d: &mut Self, j: usize, head: u64, sm: usize, slot: Split| -> Range {
                     let (q0, sj, pe) = (d.bufs(sm).q[0].base, d.bufs(sm).s[j], d.prev_end[sm]);
-                    let mm = d.m.matmul(
+                    let mm = d.m.matmul_split(
                         sm,
-                        q0,
-                        slot.base,
+                        &at(q0),
+                        &slot,
                         sj,
                         t,
                         keys_of(j as u64),
@@ -1307,7 +1418,8 @@ impl Driver {
                         p.tile,
                     );
                     let lab = label::label(Kind::Attn, step, l, head as u32, j as u32);
-                    let ix = d.add(sm, with_deps(mm, &[Some(jqc[&sm]), Some(slot), pe], lab));
+                    let deps = [Some(jqc[&sm]), Some(slot.lo), slot.hi, pe];
+                    let ix = d.add(sm, with_deps(mm, &deps, lab));
                     d.g.dst(ix)
                 };
                 self.mc_blocks(group, &kblocks, l, step, &mut qk);
@@ -1358,13 +1470,13 @@ impl Driver {
                         )
                     })
                     .collect();
-                let mut pv = |d: &mut Self, j: usize, head: u64, sm: usize, slot: Range| -> Range {
+                let mut pv = |d: &mut Self, j: usize, head: u64, sm: usize, slot: Split| -> Range {
                     let (sj, o, pe) = (d.bufs(sm).s[j], d.bufs(sm).o, d.prev_end[sm]);
                     let acc = j > 0;
-                    let mm = d.m.matmul(
+                    let mm = d.m.matmul_split(
                         sm,
-                        sj.base,
-                        slot.base,
+                        &Split::whole(sj),
+                        &slot,
                         o,
                         t,
                         p.head_dim,
@@ -1375,7 +1487,11 @@ impl Driver {
                     let lab = label::label(Kind::Attn, step, l, head as u32, 200 + j as u32);
                     let ix = d.add(
                         sm,
-                        with_deps(mm, &[Some(sj), Some(slot), acc.then_some(o), pe], lab),
+                        with_deps(
+                            mm,
+                            &[Some(sj), Some(slot.lo), slot.hi, acc.then_some(o), pe],
+                            lab,
+                        ),
                     );
                     d.g.dst(ix)
                 };
@@ -1400,17 +1516,29 @@ impl Driver {
                         .collect();
                     self.fetch(sm, &wo, l, step);
                     for j in 0..hpb {
-                        let (src, addr, slot) = self.take(sm);
+                        let (src, w, slot, slot_hi) = self.take(sm);
                         let acc = !first[sm] || j > 0;
                         let a = o.base + j * t * p.block_cols * 2;
-                        let mm =
-                            self.m
-                                .matmul(sm, a, addr, pbuf, t, p.d, p.block_cols, acc, p.tile);
+                        let mm = self.m.matmul_split(
+                            sm,
+                            &at(a),
+                            &w,
+                            pbuf,
+                            t,
+                            p.d,
+                            p.block_cols,
+                            acc,
+                            p.tile,
+                        );
                         let mm = with_b_dtype(self.w_dtype, mm);
                         let chain = if acc { Some(pbuf) } else { self.prev_pull[sm] };
                         let ix = self.add(
                             sm,
-                            with_deps(mm, &[Some(o), slot, chain, pe], lab(Kind::Wo, j as u32)),
+                            with_deps(
+                                mm,
+                                &[Some(o), slot, slot_hi, chain, pe],
+                                lab(Kind::Wo, j as u32),
+                            ),
                         );
                         self.read_done(sm, src, self.g.dst(ix), l, step);
                     }
@@ -1455,11 +1583,9 @@ impl Driver {
                 let b = self.bufs(sm);
                 (b.xc, b.p, b.g, b.u, b.h)
             };
-            let dma = self
-                .m
-                .dma(sm, self.home.xn2.base, xc, rows * p.d * 2, p.dma_chunk);
-            let dma = with_deps(dma, &[Some(sig), pe], lab(Kind::DmaAct, sm as u32));
-            self.add(sm, dma);
+            let halves = self.row_halves(&xc, rows * p.d * 2, rows);
+            let lab_x = lab(Kind::DmaAct, sm as u32);
+            self.dma_split(sm, self.home.xn2.base, xc, halves, &[Some(sig), pe], lab_x);
             let mut blocks = Vec::new();
             for &b in &hidden {
                 for mat in 0..3 {
@@ -1474,11 +1600,11 @@ impl Driver {
                 // H slot read these G and U slots.
                 let war = (i >= 2).then_some(hi);
                 for (out, kind) in [(gi, Kind::FfnGate), (ui, Kind::FfnUp)] {
-                    let (src, addr, slot) = self.take(sm);
-                    let mm = self.m.matmul(
+                    let (src, w, slot, slot_hi) = self.take(sm);
+                    let mm = self.m.matmul_split(
                         sm,
-                        xc.base,
-                        addr,
+                        &xc,
+                        &w,
                         out,
                         rows,
                         p.block_cols,
@@ -1487,7 +1613,11 @@ impl Driver {
                         p.tile,
                     );
                     let mm = with_b_dtype(self.w_dtype, mm);
-                    let mm = with_deps(mm, &[Some(xc), slot, war, pe], lab(kind, idx));
+                    let mm = with_deps(
+                        mm,
+                        &[Some(xc.lo), xc.hi, slot, slot_hi, war, pe],
+                        lab(kind, idx),
+                    );
                     let ix = self.add(sm, mm);
                     self.read_done(sm, src, self.g.dst(ix), l, step);
                 }
@@ -1504,12 +1634,12 @@ impl Driver {
                 );
                 self.add(sm, ge);
                 // Down: row block, accumulated into the partial sum.
-                let (src, addr, slot) = self.take(sm);
+                let (src, w, slot, slot_hi) = self.take(sm);
                 let acc = i > 0;
-                let mm = self.m.matmul(
+                let mm = self.m.matmul_split(
                     sm,
-                    hi.base,
-                    addr,
+                    &Split::whole(hi),
+                    &w,
                     pbuf,
                     rows,
                     p.d,
@@ -1519,7 +1649,11 @@ impl Driver {
                 );
                 let mm = with_b_dtype(self.w_dtype, mm);
                 let chain = if acc { Some(pbuf) } else { self.prev_pull[sm] };
-                let mm = with_deps(mm, &[Some(hi), slot, chain, pe], lab(Kind::FfnDown, idx));
+                let mm = with_deps(
+                    mm,
+                    &[Some(hi), slot, slot_hi, chain, pe],
+                    lab(Kind::FfnDown, idx),
+                );
                 let ix = self.add(sm, mm);
                 self.read_done(sm, src, self.g.dst(ix), l, step);
             }
@@ -1735,15 +1869,9 @@ impl Driver {
                 continue;
             }
             let xc = self.bufs(sm).xc;
-            let dma = self
-                .m
-                .dma(sm, self.home.x.base, xc, t * p.d * 2, p.dma_chunk);
-            let dma = with_deps(
-                dma,
-                &[Some(sig_x)],
-                label::label(Kind::DmaAct, 0, 0, sm as u32, 0),
-            );
-            self.add(sm, dma);
+            let halves = self.row_halves(&xc, t * p.d * 2, t);
+            let lab_x = label::label(Kind::DmaAct, 0, 0, sm as u32, 0);
+            self.dma_split(sm, self.home.x.base, xc, halves, &[Some(sig_x)], lab_x);
             let blocks: Vec<(u64, u64)> = mine
                 .iter()
                 .map(|(b, _)| (self.linear_block(*b), self.hbm.bb))
@@ -1751,13 +1879,13 @@ impl Driver {
             self.fetch(sm, &blocks, 0, 0);
             let mut deps = Vec::new();
             for &(b, out) in &mine {
-                let (src, addr, slot) = self.take(sm);
+                let (src, w, slot, slot_hi) = self.take(sm);
                 let mm = self
                     .m
-                    .matmul(sm, xc.base, addr, out, t, p.block_cols, p.d, false, p.tile);
+                    .matmul_split(sm, &xc, &w, out, t, p.block_cols, p.d, false, p.tile);
                 let mm = with_deps(
                     mm,
-                    &[Some(xc), slot],
+                    &[Some(xc.lo), xc.hi, slot, slot_hi],
                     label::label(Kind::FfnGate, 0, 0, 0, b as u32),
                 );
                 let ix = self.add(sm, mm);

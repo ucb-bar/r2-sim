@@ -50,11 +50,23 @@ pub enum Args {
     /// `C[m, n] (+)= A[m, k] * B[k, n]`, row-major with leading dimensions
     /// in elements; C is at `dst.base`. One chunk per `tile[0] x tile[1]`
     /// output tile over the full `k`.
+    ///
+    /// Split operands (banked SMEM, architecture Section 5.5): with `a2`,
+    /// the rows of A are in two half matrices. Row `r` of A, with
+    /// `t = r / tile[0]` and `j = r % tile[0]`, is row `t * h + j` of the
+    /// matrix at `a` when `j < h = tile[0] / 2`, else row `t * h + j - h`
+    /// of the matrix at `a2`; both have leading dimension `lda`. With
+    /// `b2`, the columns of B are split in the same way over `tile[1]`
+    /// (the matrices at `b` and `b2`, leading dimension `ldb`).
     Matmul {
-        /// Address of A.
+        /// Address of A (with `a2`: of its low half rows).
         a: Addr,
-        /// Address of B.
+        /// Address of B (with `b2`: of its low half columns).
         b: Addr,
+        /// Address of the high half rows of A; `None`: A is one matrix.
+        a2: Option<Addr>,
+        /// Address of the high half columns of B; `None`: B is one matrix.
+        b2: Option<Addr>,
         /// Leading dimension of A, in elements.
         lda: u64,
         /// Leading dimension of B, in elements.
@@ -195,11 +207,12 @@ impl Descriptor {
     /// Bytes of the descriptor in an `Invoke` message (Section 3.3):
     /// opcode 2, PE 2, `dst` base and length 16, 8 per dependency (address
     /// and version packed in 64 bits), and the request data (DMA 32,
-    /// matmul 52, vector 24, join 0, spawn 4). The label is not sent.
+    /// matmul 52 plus 8 per high-half address, vector 24, join 0, spawn 4).
+    /// The label is not sent.
     pub fn wire_bytes(&self) -> u64 {
         let args = match self.args {
             Args::Dma { .. } => 32,
-            Args::Matmul { .. } => 52,
+            Args::Matmul { a2, b2, .. } => 52 + 8 * (a2.is_some() as u64 + b2.is_some() as u64),
             Args::Vector { src: None, .. } => 24,
             Args::Vector { src: Some(_), .. } => 32,
             Args::Join => 0,
@@ -413,6 +426,32 @@ impl TransferRoutes {
         self.physical(a)
     }
 
+    /// The pieces of `r` in memory blocks, as (block, bytes) in address
+    /// order (physical addresses; bytes in no block are left out).
+    pub fn pieces(&self, r: Range) -> impl Iterator<Item = (usize, u64)> + '_ {
+        let mut a = r.base;
+        std::iter::from_fn(move || {
+            while a < r.bound {
+                match self.physical(a) {
+                    Some((b, run)) => {
+                        let n = run.min(r.bound - a);
+                        a += n;
+                        return Some((b, n));
+                    }
+                    None => {
+                        // To the next block's first byte.
+                        let i = self.blocks.partition_point(|x| x.0.base <= a);
+                        a = self
+                            .blocks
+                            .get(i)
+                            .map_or(r.bound, |x| x.0.base.min(r.bound));
+                    }
+                }
+            }
+            None
+        })
+    }
+
     /// The read half from block `b` to DMA engine `pe`.
     pub fn read(&self, pe: PeId, b: usize) -> Option<&Rc<Half>> {
         self.halves[pe.0 as usize * self.nblocks + b].0.as_ref()
@@ -474,6 +513,15 @@ pub struct AccFlags {
 }
 
 impl NodeConfig<'_> {
+    /// The memory block that holds the physical address `a` (by the
+    /// routing function's block table).
+    pub fn block_of(&self, a: u64) -> &MemBlock {
+        match self.routes.physical(a) {
+            Some((b, _)) => &self.memories[b],
+            None => self.memory(Addr(a)),
+        }
+    }
+
     /// The memory block that holds `addr`.
     pub fn memory(&self, addr: Addr) -> &MemBlock {
         self.memories
@@ -644,9 +692,20 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
 }
 
 /// Atlas matmul: one chunk per output tile; tensor ops on the array and
-/// operand plus C bytes on the SMEM port.
+/// operand plus C bytes on SMEM. With one SMEM port (`smem_port`), all
+/// bytes are on that port. On a banked SMEM (`smem_port` is `None`), each
+/// operand and C range of the chunk charges the ports of the blocks it
+/// overlaps, in proportion to its bytes in each (architecture Section
+/// 5.5, banked SMEM); the demands of one chunk are co-charged.
 pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Matmul {
+        a,
+        b,
+        a2,
+        b2,
+        lda,
+        ldb,
+        ldc,
         m,
         n,
         k,
@@ -680,6 +739,12 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         .memories
         .iter()
         .find(|m| m.covers(&desc.dst))
+        .or_else(|| {
+            smem_port
+                .is_none()
+                .then(|| node.memories.iter().find(|m| m.holds(Addr(desc.dst.base))))
+                .flatten()
+        })
         .map_or((None, None), |m| {
             (
                 node.topology.best_pair(&m.attach, masters),
@@ -709,6 +774,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         }
     };
     let acc = node.acc;
+    let es = out_dtype.bytes();
     let mut chunks = Vec::new();
     for mi in (0..m).step_by(tile[0] as usize) {
         let tm = tile[0].min(m - mi);
@@ -723,13 +789,14 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             let mut ops = Demand::work(array, qm * qn * k);
             ops.utilization = utilization;
             // Operands in, C out, and C in when accumulating. C is exact.
-            let c_bytes = tm * tn * out_dtype.bytes();
+            let c_bytes = tm * tn * es;
             // With a row panel, A is read at the first output tile of the row.
             let a_bytes = if row_panel && ni > 0 {
                 0
             } else {
                 in_dtype.bytes_for(qm * k)
             };
+            let b_bytes = b_dtype.bytes_for(k * qn);
             let c_out = if acc.skip_write { 0 } else { c_bytes };
             let c_in = if accumulate && !acc.skip_read {
                 c_bytes
@@ -743,8 +810,47 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             };
             // A and B and C in are reads; C out and the accumulator flush
             // are writes (one resource: charged as their sum).
-            let read = a_bytes + b_dtype.bytes_for(k * qn) + c_in;
+            let read = a_bytes + b_bytes + c_in;
             let write = c_out + flush;
+            let mut demand = vec![ops];
+            match smem_port {
+                Some(port) => demand.extend([
+                    Demand::read(port, read),
+                    Demand::write(smem_wport.unwrap_or(port), write),
+                ]),
+                None => {
+                    // A: the tile's rows; B: all K rows of the tile's
+                    // columns; C: the tile. A half of a split operand is
+                    // in one bank by layout: its bytes go to the bank of
+                    // its first byte.
+                    let c = Range::from_len(
+                        desc.dst.base + (mi * ldc + ni) * es,
+                        ((tm - 1) * ldc + tn) * es,
+                    );
+                    for (part, bytes) in rows_split(a, a2, mi, qm, tile[0], a_bytes)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let r = Range::from_len(
+                            part.0 + in_dtype.bytes_for(part.1 * lda),
+                            in_dtype.bytes_for((part.2 - 1) * lda + k),
+                        );
+                        operand(node, r, a2.is_some(), bytes, &mut demand);
+                    }
+                    for (part, bytes) in rows_split(b, b2, ni, qn, tile[1], b_bytes)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let r = Range::from_len(
+                            part.0 + b_dtype.bytes_for(part.1),
+                            b_dtype.bytes_for((k - 1) * ldb + part.2),
+                        );
+                        operand(node, r, b2.is_some(), bytes, &mut demand);
+                    }
+                    spread(node, c, c_in, Dir::Read, &mut demand);
+                    spread(node, c, write, Dir::Write, &mut demand);
+                }
+            }
             let use_of = |p: Option<(AttachId, AttachId)>, bytes, dir| {
                 p.map(|(from, to)| RouteUse {
                     from,
@@ -754,11 +860,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 })
             };
             chunks.push(Chunk {
-                demand: vec![
-                    ops,
-                    Demand::read(smem_port, read),
-                    Demand::write(smem_wport.unwrap_or(smem_port), write),
-                ],
+                demand,
                 transfer: None,
                 rate: Ratio::ONE,
                 latency: 0,
@@ -772,6 +874,94 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     Profile {
         chunks,
         holds: Vec::new(),
+    }
+}
+
+/// Where row (or column) `r` of a split operand with tile `t` is
+/// ([`Args::Matmul`]): `(true, i)` for row `i` of the high half matrix,
+/// `(false, i)` for row `i` of the low half matrix.
+pub fn split_row(r: u64, t: u64) -> (bool, u64) {
+    let h = t / 2;
+    let (ti, j) = (r / t, r % t);
+    if j < h {
+        (false, ti * h + j)
+    } else {
+        (true, ti * h + j - h)
+    }
+}
+
+/// A part of an operand tile: (matrix address, first row in it, rows).
+type Part = (u64, u64, u64);
+
+/// The parts of `rows` rows (or columns) of one tile of an operand from
+/// row `first` (a multiple of the tile height `t`), as `((matrix address,
+/// first row in it, rows), bytes)` with `bytes` of the chunk split between
+/// them in proportion to the rows: one part without `hi`, else the low and
+/// the high half (Args::Matmul). With a quantized tile, `rows` is `t`.
+fn rows_split(
+    lo: Addr,
+    hi: Option<Addr>,
+    first: u64,
+    rows: u64,
+    t: u64,
+    bytes: u64,
+) -> [Option<(Part, u64)>; 2] {
+    let Some(hi) = hi else {
+        return [Some(((lo.0, first, rows), bytes)), None];
+    };
+    let h = t / 2;
+    let row = first / t * h;
+    let low = rows.min(h);
+    let low_bytes = bytes * low / rows;
+    [
+        (low > 0).then_some(((lo.0, row, low), low_bytes)),
+        (rows > low).then_some(((hi.0, row, rows - low), bytes - low_bytes)),
+    ]
+}
+
+/// The read of `bytes` of an operand range `r`: a half of a split operand
+/// (`split`) is in one bank by layout, so its bytes go to the bank of its
+/// first byte; an unsplit range spreads over the blocks it overlaps.
+fn operand(node: &NodeConfig, r: Range, split: bool, bytes: u64, out: &mut Vec<Demand>) {
+    if split {
+        let port = node.block_of(r.base).port_for(Dir::Read);
+        out.push(Demand::read(port, bytes));
+    } else {
+        spread(node, r, bytes, Dir::Read, out);
+    }
+}
+
+/// Adds `amount` in direction `dir` on the ports of the memory blocks that
+/// `range` overlaps, in proportion to its bytes in each (the parts sum to
+/// `amount`; bytes of `range` in no block do not count); a range in no
+/// block charges the block of its base.
+fn spread(node: &NodeConfig, range: Range, amount: u64, dir: Dir, out: &mut Vec<Demand>) {
+    if amount == 0 {
+        return;
+    }
+    let total: u64 = node.routes.pieces(range).map(|p| p.1).sum();
+    if total == 0 {
+        out.push(Demand::new(
+            node.block_of(range.base).port_for(dir),
+            amount,
+            dir,
+        ));
+        return;
+    }
+    let (mut covered, mut given) = (0u64, 0u64);
+    let mut last: Option<(usize, usize)> = None;
+    for (b, n) in node.routes.pieces(range) {
+        covered += n;
+        let part = (amount as u128 * covered as u128 / total as u128) as u64 - given;
+        given += part;
+        match last {
+            // The next set of the same block: one demand.
+            Some((lb, i)) if lb == b => out[i].amount += part,
+            _ => {
+                last = Some((b, out.len()));
+                out.push(Demand::new(node.memories[b].port_for(dir), part, dir));
+            }
+        }
     }
 }
 
@@ -829,12 +1019,20 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 bytes,
                 dir,
             });
-        for r in route
-            .resources_for(dir)
-            .iter()
-            .chain([&block.port_for(dir)])
-        {
+        for r in route.resources_for(dir) {
             demand.push(Demand::new(*r, bytes, dir));
+        }
+        // A banked block: the bytes spread over the banks of the range
+        // (architecture Section 5.5); otherwise the block's port.
+        let base = if to {
+            desc.dst.base
+        } else {
+            src.map_or(desc.dst.base, |a| a.0)
+        };
+        if block.banked && bytes > 0 {
+            spread(node, Range::from_len(base, bytes), bytes, dir, &mut demand);
+        } else {
+            demand.push(Demand::new(block.port_for(dir), bytes, dir));
         }
     }
     Profile {

@@ -40,7 +40,8 @@ use crate::graph::{excess_deps, with_deps, Graph, MAX_JOIN_DEPS};
 use crate::kv::KvLayout;
 use crate::label::{self, Kind};
 use crate::machine::{
-    parse_dtype, with_b_dtype, worker_list, Layout, Machine, MemNode, SliceBump, SmRates, SyncPool,
+    low_rows, parse_dtype, with_b_dtype, worker_list, Layout, Machine, MemNode, Role, SliceBump,
+    SmRates, Split, SyncPool,
 };
 
 /// Program parameters (a TOML file, every key optional).
@@ -117,6 +118,13 @@ pub struct Params {
     pub home: usize,
     /// Worker SMs; empty = all but home.
     pub workers: Vec<usize>,
+    /// The SMEM term of the grid cost model: "role" (the default; on a
+    /// banked SMEM each operand role's banks at half the SMEM's read rate,
+    /// the operand A side carrying the A, accumulator, residual, statistics
+    /// and out traffic unless those buffers go to the weight banks; on one
+    /// SMEM block as "port") or "port" (all SMEM bytes at the SMEM's read
+    /// rate; 2026-10-13).
+    pub smem_cost: String,
     /// SMEM bytes per SM for the builder; 0 = the whole SMEM.
     pub smem_budget: u64,
     /// Atlas tile (m, n) of every matmul.
@@ -166,6 +174,7 @@ impl Default for Params {
             home: 0,
             workers: Vec::new(),
             smem_budget: 0,
+            smem_cost: "role".into(),
             tile: [128, 128],
             norm_ops: 4,
             act_ops: 8,
@@ -322,6 +331,17 @@ pub struct CostEnv {
     pub workers: u64,
     /// SMEM bytes per SM.
     pub budget: u64,
+    /// The SMEM is this many banks of `budget / banks` (architecture
+    /// Section 5.5; 0: one block): a grid fits when its buffers fit the
+    /// banks of their roles.
+    pub banks: u64,
+    /// The bank group that buffers of no operand role try first.
+    pub whole: Role,
+    /// The SMEM term per operand role (`Params::smem_cost` "role" on a
+    /// banked SMEM).
+    pub smem_per_role: bool,
+    /// Atlas tile rows (the row halves of split A operands).
+    pub tile_rows: u64,
     /// Allocation granule, bytes.
     pub granule: u64,
     /// Candidate K chunks (the largest that fits wins on SMEM traffic).
@@ -400,7 +420,10 @@ pub(crate) fn roofline(s: &GemmShape, e: &CostEnv) -> Roofline {
     let into = a_once + w_once + if s.residual { c } else { 0 };
     let parts = [
         (w_once as f64 / e.hbm_rate, "weights once"),
-        (macs as f64 / (w * e.sm.mac.max(1e-9)), "Atlas"),
+        (
+            macs as f64 / (w * e.sm.mac_for(Dtype::Bf16, s.w).max(1e-9)),
+            "Atlas",
+        ),
         (smem as f64 / (w * e.sm.smem.max(1e-9)), "SMEM port"),
         (
             (into as f64 / e.sm.link_down.max(1e-9)).max(c as f64 / e.sm.link_up.max(1e-9)) / w,
@@ -454,6 +477,90 @@ pub(crate) fn smem_need_ws(s: &GemmShape, t: u64, cw: u64, kc: u64, g: u64) -> u
     w + out + a + res + t.div_ceil(tt) * r(tt * 8)
 }
 
+/// A banked layout of `budget` bytes in `banks` equal banks (for the fit
+/// of a grid or an attention tile).
+fn budget_layout(budget: u64, banks: u64, granule: u64, whole: Role) -> Layout {
+    let q = budget / banks;
+    let b: Vec<Range> = (0..banks).map(|i| Range::from_len(i * q, q)).collect();
+    Layout::with_banks(Range::from_len(0, budget), &b, granule, whole)
+}
+
+/// One SM's GEMM buffers.
+struct GemmBufs {
+    acc: Vec<Vec<Range>>,
+    a_slot: [Split; 2],
+    w_slot: [Split; 2],
+    res: Option<Range>,
+    stats: Range,
+    tt: u64,
+}
+
+/// Lays out one SM's GEMM buffers for `t` rows, pass width `cw` and K
+/// chunk `kc` in `lay` (as [`smem_need`] and [`smem_need_ws`] count them):
+/// the accumulators, the A staging slots (split by rows of `tile_rows`
+/// tiles), the W staging slots or the resident W slice of the pass (split
+/// by columns), the residual tile and the row statistics.
+#[allow(clippy::too_many_arguments)]
+fn gemm_layout(
+    lay: &mut Layout,
+    s: &GemmShape,
+    ws: bool,
+    t: u64,
+    cw: u64,
+    kc: u64,
+    g: u64,
+    tile_rows: u64,
+) -> Result<GemmBufs, String> {
+    let mats = s.mats();
+    let wseg = s.w.bytes_for(kc * 128).div_ceil(g) * g;
+    // Weight-stationary: accumulators, A slots and residual of one token
+    // tile; the W slice resident (in w_slot[0]).
+    let tt = if ws { t.min(WS_TILE) } else { t };
+    let nk = s.k.div_ceil(kc);
+    let sets = if s.single_acc && !ws { 1 } else { 2 };
+    let take_acc = |lay: &mut Layout| {
+        (0..sets)
+            .map(|_| (0..mats).map(|_| lay.take(tt * cw * 2)).collect())
+            .collect::<Result<Vec<Vec<Range>>, String>>()
+    };
+    // On a banked SMEM the operand slots go first, so that the
+    // accumulators are the buffers that move to the other bank group.
+    let early = if lay.banked() {
+        None
+    } else {
+        Some(take_acc(lay)?)
+    };
+    let low = low_rows(tt, tile_rows);
+    let mut a = || lay.take_split(Role::Act, kc / 128, tt * 256, low, tt);
+    let a_slot = [a()?, a()?];
+    let w_slot = if ws {
+        let wres = lay.take_split(Role::W, mats * (cw / 128) * nk, wseg, 1, 2)?;
+        [wres, wres]
+    } else {
+        let mut w = || lay.take_split(Role::W, mats * (cw / 128), wseg, 1, 2);
+        [w()?, w()?]
+    };
+    let acc = match early {
+        Some(a) => a,
+        None => take_acc(lay)?,
+    };
+    let res = if s.residual {
+        Some(lay.take(tt * cw * 2)?)
+    } else {
+        None
+    };
+    let ntt = t.div_ceil(tt);
+    let stats = lay.take(ntt * (tt * 8).div_ceil(g) * g)?;
+    Ok(GemmBufs {
+        acc,
+        a_slot,
+        w_slot,
+        res,
+        stats,
+        tt,
+    })
+}
+
 /// Estimated cycles of one candidate; see [`GridChoice::cost`].
 #[allow(clippy::too_many_arguments)]
 fn estimate(
@@ -500,6 +607,21 @@ fn estimate(
     let epi = passes * (mats + u64::from(s.residual) + 1) * t * cw * 2;
     let stats = if s.norm { t * s.k * 2 } else { 0 };
     let smem = link_in + link_out + mm_bytes + epi + stats;
+    let smem_time = if e.smem_per_role {
+        // The weight banks: the W DMA writes and the B reads; the
+        // activation banks: the rest, less what the buffers of no operand
+        // role (accumulators, residual, statistics) move when they are in
+        // the weight banks.
+        let w_side = w_sm + passes * mats * nk * b_mm;
+        let whole = res + link_out + passes * mats * c_pass + epi + stats;
+        let (a_side, w_side) = match e.whole {
+            Role::Act => (smem - w_side, w_side),
+            Role::W => (smem - w_side - whole, w_side + whole),
+        };
+        a_side.max(w_side) as f64 / (e.sm.smem / 2.0).max(1e-9)
+    } else {
+        smem as f64 / e.sm.smem.max(1e-9)
+    };
     let macs = passes * nk * mats * rows * cw * kc;
     // Per-pass costs on the SM's critical path. With two staging slots the
     // last K chunk of a pass loads only after the previous pass's last
@@ -536,8 +658,11 @@ fn estimate(
             link_out as f64 / e.sm.link_up.max(1e-9) + fixed,
             "SM link out",
         ),
-        (smem as f64 / e.sm.smem.max(1e-9) + fixed, "SMEM port"),
-        (macs as f64 / e.sm.mac.max(1e-9) + fixed, "Atlas"),
+        (smem_time + fixed, "SMEM port"),
+        (
+            macs as f64 / e.sm.mac_for(Dtype::Bf16, s.w).max(1e-9) + fixed,
+            "Atlas",
+        ),
     ];
     // Whole-GEMM traffic.
     let a = passes * s.n * s.k * 2 * cg;
@@ -702,7 +827,13 @@ pub fn choose_grid(
                 let mats = s.mats();
                 let execution_ok =
                     !ws || e.sm.execution == 0 || mats * (cw / 128) * nk <= e.sm.execution / 2;
-                need <= e.budget && execution_ok && e.owner_grant.is_none_or(|g| tracked <= g)
+                let fits_smem = if e.banks > 1 {
+                    let mut lay = budget_layout(e.budget, e.banks, e.granule, e.whole);
+                    gemm_layout(&mut lay, s, ws, t, cw, kc, e.granule, e.tile_rows).is_ok()
+                } else {
+                    need <= e.budget
+                };
+                fits_smem && execution_ok && e.owner_grant.is_none_or(|g| tracked <= g)
             };
             let cw = match s.cw_fixed {
                 Some(f) if cs % f == 0 && fits(f) => f,
@@ -996,6 +1127,9 @@ impl Driver {
         let workers = worker_list(m.sms.len(), p.home, &p.workers)?;
         let w_dtype = parse_dtype(&p.weight_dtype)?;
         let order = Order::parse(&p.order)?;
+        if !["port", "role"].contains(&p.smem_cost.as_str()) {
+            return Err(format!("unknown smem_cost {:?} (port, role)", p.smem_cost));
+        }
         let hbm_slices = m.hbm.len();
         let mut mem_nodes = m.hbm.clone();
         mem_nodes.extend(m.cmem_nodes.iter().cloned());
@@ -1336,7 +1470,7 @@ impl Driver {
     /// Adds a task that `node` owns (the owner follows from `dst`).
     fn add(&mut self, node: Node, mut desc: Descriptor) -> usize {
         // Deps beyond one message go through a join at the same node.
-        let rest = excess_deps(&mut desc);
+        let rest = excess_deps(&mut desc, |d| self.g.chains(d));
         if !rest.is_empty() {
             let j = self.signal(node, &rest, desc.label.unwrap_or(0));
             desc.deps.push(nu_model::Dep::Unversioned(j.base));
@@ -1457,6 +1591,46 @@ impl Driver {
         self.add(sm, d);
     }
 
+    /// [`Self::get`] into a buffer that may be split over a bank pair:
+    /// `bytes.0` from `src` into the low half, `bytes.1` after them into the
+    /// high half (a half of 0 bytes is not copied).
+    fn get_split(
+        &mut self,
+        sm: usize,
+        src: u64,
+        dst: Split,
+        bytes: (u64, u64),
+        deps: &[Option<Range>],
+        lab: u64,
+    ) {
+        if bytes.0 > 0 || dst.hi.is_none() {
+            self.get(sm, src, dst.lo, bytes.0, deps, lab);
+        }
+        if let (Some(hi), true) = (dst.hi, bytes.1 > 0) {
+            self.get(sm, src + bytes.0, hi, bytes.1, deps, lab);
+        }
+    }
+
+    /// `bytes` of `cols` B columns as the halves of a split buffer hold
+    /// them (all low on one SMEM block).
+    fn col_halves(&self, bytes: u64, cols: u64) -> (u64, u64) {
+        if self.m.sms[self.workers[0]].banks.len() != 4 {
+            return (bytes, 0);
+        }
+        let lo = bytes * low_rows(cols, self.p.tile[1]) / cols;
+        (lo, bytes - lo)
+    }
+
+    /// `bytes` of `rows` A rows as the halves of a split buffer hold them:
+    /// the rows in low tile halves first (all low on one SMEM block).
+    fn row_halves(&self, bytes: u64, rows: u64) -> (u64, u64) {
+        if self.m.sms[self.workers[0]].banks.len() != 4 {
+            return (bytes, 0);
+        }
+        let lo = bytes * low_rows(rows, self.p.tile[0]) / rows;
+        (lo, bytes - lo)
+    }
+
     /// A write of `bytes` from `sm`'s SMEM at `src` into `dst` (HBM or
     /// cmem), after `ready` (a signal at `sm`), into every copy of the
     /// activation memory: a pull by each memory owner's copy engine.
@@ -1558,6 +1732,11 @@ impl Driver {
         CostEnv {
             workers: self.workers.len() as u64,
             budget: self.budget,
+            banks: self.m.sms[self.workers[0]].banks.len() as u64,
+            whole: self.m.sms[self.workers[0]].whole,
+            smem_per_role: self.p.smem_cost == "role"
+                && self.m.sms[self.workers[0]].banks.len() > 1,
+            tile_rows: self.p.tile[0],
             granule: self.m.granule,
             kcs,
             sm: self.m.sms[self.workers[0]].rates,
@@ -1619,8 +1798,7 @@ impl Driver {
         let (kc, g) = (gc.kc, self.m.granule);
         let blocks = shape.c.div_ceil(128);
         let bpc = gc.cs / 128;
-        let mats = if gm.w2.is_some() { 2 } else { 1 };
-        let wseg = self.m.round(self.w_dtype.bytes_for(kc * 128));
+        let nk = gm.w.k.div_ceil(kc);
         let mut sms = Vec::new();
         let mut wi = 0;
         for tgi in 0..gc.tg {
@@ -1636,36 +1814,16 @@ impl Driver {
                 }
                 let sm = self.workers[wi];
                 wi += 1;
-                let mut lay = Layout::new(self.m.sms[sm].smem, g);
-                // Weight-stationary: accumulators, A slots and residual of
-                // one token tile; the W slice resident (in w_slot[0]).
-                let tt = if gc.ws { t.min(WS_TILE) } else { t };
-                let nk = gm.w.k.div_ceil(kc);
-                let sets = if self.p.single_accumulator && !gc.ws {
-                    1
-                } else {
-                    2
-                };
-                let acc = (0..sets)
-                    .map(|_| (0..mats).map(|_| lay.take(tt * gc.cw * 2)).collect())
-                    .collect::<Result<Vec<Vec<Range>>, String>>()?;
-                let a_slot = [lay.take(tt * kc * 2)?, lay.take(tt * kc * 2)?];
-                let w_slot = if gc.ws {
-                    let wres = lay.take(mats * (gc.cw / 128) * nk * wseg)?;
-                    [wres, wres]
-                } else {
-                    [
-                        lay.take(mats * (gc.cw / 128) * wseg)?,
-                        lay.take(mats * (gc.cw / 128) * wseg)?,
-                    ]
-                };
-                let res = if gm.residual.is_some() {
-                    Some(lay.take(tt * gc.cw * 2)?)
-                } else {
-                    None
-                };
-                let ntt = t.div_ceil(tt);
-                let stats = lay.take(ntt * self.m.round(tt * 8))?;
+                let mut lay = Layout::of_sm(&self.m.sms[sm], g);
+                let bufs = gemm_layout(&mut lay, &shape, gc.ws, t, gc.cw, kc, g, self.p.tile[0])?;
+                let GemmBufs {
+                    acc,
+                    a_slot,
+                    w_slot,
+                    res,
+                    stats,
+                    tt,
+                } = bufs;
                 sms.push(GemmSm {
                     sm,
                     r0,
@@ -1720,7 +1878,6 @@ impl Driver {
         let k = gm.w.k;
         let nk = k.div_ceil(kc);
         let mats = st.acc[0].len();
-        let wseg = self.m.round(self.w_dtype.bytes_for(kc * 128));
         let pb = (gc.cw / 128).min(st.cb1 - st.cb);
         let cw = pb * 128;
         let ntt = st.t.div_ceil(tt);
@@ -1745,9 +1902,7 @@ impl Driver {
             st.stats.base + tti * self.m.round(tt * 8),
             self.m.round(tt * 8),
         );
-        let wslot = |mi: u64, j: u64, i: u64| {
-            Range::from_len(st.w_slot[0].base + ((mi * pb + j) * nk + i) * wseg, wseg)
-        };
+        let wslot = |mi: u64, j: u64, i: u64| st.w_slot[0].at((mi * pb + j) * nk + i);
         if st.i < nk {
             let i = st.i;
             st.i += 1;
@@ -1766,26 +1921,21 @@ impl Driver {
             for b in 0..kw.div_ceil(128) {
                 let cols = 128.min(kw - b * 128);
                 let a_src = gm.a.block(k0 / 128 + b, r, rows);
-                let dst = Range::from_len(st.a_slot[s].base + b * tt * 256, tt * 256);
-                asub.push(Some(dst));
-                self.get(
-                    sm,
-                    a_src.base,
-                    dst,
-                    rows * cols * 2,
-                    &[free],
-                    lab(Kind::DmaAct, i),
-                );
+                let dst = st.a_slot[s].at(b);
+                asub.extend(dst.deps());
+                let halves = self.row_halves(rows * cols * 2, rows);
+                self.get_split(sm, a_src.base, dst, halves, &[free], lab(Kind::DmaAct, i));
             }
             let mut wsub: Vec<Vec<Option<Range>>> = vec![Vec::new(); mats];
             for (mi, wm) in [Some(gm.w), gm.w2].into_iter().flatten().enumerate() {
                 for j in 0..pb {
                     let dst = wslot(mi as u64, j, i);
-                    wsub[mi].push(Some(dst));
+                    wsub[mi].extend(dst.deps());
                     if tti == 0 {
                         let (src, bytes) = wm.chunk(self.w_dtype, cb + j, k0, kw);
                         let wf = st.wfree[i as usize];
-                        self.get(sm, src, dst, bytes, &[wf], lab(Kind::DmaW, i));
+                        let halves = dst.halves(bytes);
+                        self.get_split(sm, src, dst, halves, &[wf], lab(Kind::DmaW, i));
                         self.report.borrow_mut().w_bytes += bytes;
                     }
                 }
@@ -1806,11 +1956,11 @@ impl Driver {
             }
             let mut outs = Vec::new();
             for (mi, &out) in acc_p.iter().enumerate() {
-                let b = wslot(mi as u64, 0, i).base;
-                let a = st.a_slot[s].base;
+                let b = wslot(mi as u64, 0, i);
+                let a = st.a_slot[s];
                 let mm = self
                     .m
-                    .matmul(sm, a, b, out, rows, cw, kw, i > 0, self.p.tile);
+                    .matmul_split(sm, &a, &b, out, rows, cw, kw, i > 0, self.p.tile);
                 let mm = keep(with_b_dtype(self.w_dtype, mm), i + 1 < nk);
                 let chain = if i == 0 { war } else { Some(out) };
                 let mut deps = asub.clone();
@@ -1850,7 +2000,6 @@ impl Driver {
         let k = gm.w.k;
         let nk = k.div_ceil(kc);
         let mats = st.acc[0].len();
-        let wseg = self.m.round(self.w_dtype.bytes_for(kc * 128));
         let pb = (gc.cw / 128).min(st.cb1 - st.cb);
         let cw = pb * 128;
         let (pass, cb) = (st.pass, st.cb);
@@ -1876,26 +2025,20 @@ impl Driver {
             for b in 0..kw.div_ceil(128) {
                 let cols = 128.min(kw - b * 128);
                 let a_src = gm.a.block(k0 / 128 + b, r0, t);
-                let dst = Range::from_len(st.a_slot[s].base + b * t * 256, t * 256);
-                asub.push(Some(dst));
-                self.get(
-                    sm,
-                    a_src.base,
-                    dst,
-                    t * cols * 2,
-                    &[free],
-                    lab(Kind::DmaAct, i),
-                );
+                let dst = st.a_slot[s].at(b);
+                asub.extend(dst.deps());
+                let halves = self.row_halves(t * cols * 2, t);
+                self.get_split(sm, a_src.base, dst, halves, &[free], lab(Kind::DmaAct, i));
             }
             // W chunks of this pass's blocks.
             let mut wsub: Vec<Vec<Option<Range>>> = vec![Vec::new(); mats];
             for (mi, wm) in [Some(gm.w), gm.w2].into_iter().flatten().enumerate() {
                 for j in 0..pb {
                     let (src, bytes) = wm.chunk(self.w_dtype, cb + j, k0, kw);
-                    let off = (mi as u64 * pb + j) * wseg;
-                    let dst = Range::from_len(st.w_slot[s].base + off, wseg);
-                    wsub[mi].push(Some(dst));
-                    self.get(sm, src, dst, bytes, &[free], lab(Kind::DmaW, i));
+                    let dst = st.w_slot[s].at(mi as u64 * pb + j);
+                    wsub[mi].extend(dst.deps());
+                    let halves = dst.halves(bytes);
+                    self.get_split(sm, src, dst, halves, &[free], lab(Kind::DmaW, i));
                     self.report.borrow_mut().w_bytes += bytes;
                 }
             }
@@ -1910,9 +2053,11 @@ impl Driver {
                 readers.push(Some(st.stats));
             }
             for (mi, &out) in acc_p.iter().enumerate() {
-                let b = st.w_slot[s].base + mi as u64 * pb * wseg;
-                let a = st.a_slot[s].base;
-                let mm = self.m.matmul(sm, a, b, out, t, cw, kw, i > 0, self.p.tile);
+                let b = st.w_slot[s].at(mi as u64 * pb);
+                let a = st.a_slot[s];
+                let mm = self
+                    .m
+                    .matmul_split(sm, &a, &b, out, t, cw, kw, i > 0, self.p.tile);
                 let mm = keep(with_b_dtype(self.w_dtype, mm), i + 1 < nk);
                 let chain = if i == 0 { war } else { Some(out) };
                 let mut deps = asub.clone();
@@ -2026,6 +2171,69 @@ impl Driver {
 
     // ---- attention ----
 
+    /// One SM's attention buffers for `qt` query rows in `lay`: per head Q
+    /// (split by rows) and O, two K and two V slots (split by columns:
+    /// keys for K, head_dim for V), two score buffers and per head the row
+    /// statistics.
+    fn attn_layout(&self, lay: &mut Layout, qt: u64) -> Result<AttnBufs, String> {
+        let md = self.model;
+        let kb = self.p.key_block;
+        let [t0, t1] = self.p.tile;
+        let qb = (0..md.heads)
+            .map(|_| lay.take_split(Role::Act, 1, qt * md.head_dim * 2, low_rows(qt, t0), qt))
+            .collect::<Result<_, _>>()?;
+        let take_ob = |lay: &mut Layout| {
+            (0..md.heads)
+                .map(|_| lay.take(qt * md.head_dim * 2))
+                .collect::<Result<Vec<Range>, String>>()
+        };
+        // On a banked SMEM the operand buffers go first, so that the O
+        // accumulators are the buffers that move to the other bank group.
+        let early = if lay.banked() {
+            None
+        } else {
+            Some(take_ob(lay)?)
+        };
+        let kv = kb * md.head_dim * 2;
+        let mut k = || lay.take_split(Role::W, 1, kv, low_rows(kb, t1), kb);
+        let kslot = [k()?, k()?];
+        let hd = md.head_dim;
+        let mut v = || lay.take_split(Role::W, 1, kv, low_rows(hd, t1), hd);
+        let vslot = [v()?, v()?];
+        // The scores: operand A of P x V.
+        let sbuf = [
+            lay.take_role(Role::Act, qt * kb * 2)?,
+            lay.take_role(Role::Act, qt * kb * 2)?,
+        ];
+        let ob = match early {
+            Some(o) => o,
+            None => take_ob(lay)?,
+        };
+        let st = (0..md.heads)
+            .map(|_| lay.take(qt * 8))
+            .collect::<Result<_, _>>()?;
+        Ok(AttnBufs {
+            qb,
+            ob,
+            kslot,
+            vslot,
+            sbuf,
+            st,
+        })
+    }
+
+    /// True when the attention buffers of `qt` query rows fit the SMEM
+    /// budget (on a banked SMEM: the banks of their roles).
+    fn attn_fits(&self, qt: u64) -> bool {
+        let sm = &self.m.sms[self.workers[0]];
+        if sm.banks.len() < 2 {
+            return self.attn_need(qt) <= self.budget;
+        }
+        let banks = sm.banks.len() as u64;
+        let mut lay = budget_layout(self.budget, banks, self.m.granule, sm.whole);
+        self.attn_layout(&mut lay, qt).is_ok()
+    }
+
     /// SMEM bytes of one attention unit of `qt` query rows.
     fn attn_need(&self, qt: u64) -> u64 {
         let md = self.model;
@@ -2045,7 +2253,6 @@ impl Driver {
     /// K/V block per SM per round.
     fn attention(&mut self, layer: u32, seqs: u64, seq: u64) -> Result<(u64, u64, Dones), String> {
         let md = self.model;
-        let kb = self.p.key_block;
         let qt = if self.p.q_tile > 0 {
             self.p.q_tile
         } else {
@@ -2064,17 +2271,17 @@ impl Driver {
                     q
                 };
                 let macs = 2 * md.heads * rows * seq.next_multiple_of(128) * md.head_dim;
-                let unit =
-                    ((kv + qo) as f64 / r.link_down.max(1e-9)).max(macs as f64 / r.mac.max(1e-9));
+                let unit = ((kv + qo) as f64 / r.link_down.max(1e-9))
+                    .max(macs as f64 / r.mac_for(Dtype::Bf16, Dtype::Bf16).max(1e-9));
                 units.div_ceil(w) as f64 * unit
             };
             [256, 128, 64, 32, 16]
                 .into_iter()
-                .filter(|&q| q <= seq.next_power_of_two() && self.attn_need(q) <= self.budget)
+                .filter(|&q| q <= seq.next_power_of_two() && self.attn_fits(q))
                 .min_by(|&a, &b| est(a).total_cmp(&est(b)))
                 .ok_or("no attention tile fits SMEM")?
         };
-        if self.attn_need(qt) > self.budget {
+        if !self.attn_fits(qt) {
             return Err(format!("q_tile {qt} does not fit SMEM"));
         }
         let g = self.m.granule;
@@ -2092,30 +2299,11 @@ impl Driver {
             let w = ui % self.workers.len();
             if w == sms.len() {
                 let sm = self.workers[w];
-                let mut lay = Layout::new(self.m.sms[sm].smem, g);
-                let mut take = |b: u64| lay.take(b);
-                let qb = (0..md.heads)
-                    .map(|_| take(qt * md.head_dim * 2))
-                    .collect::<Result<_, _>>()?;
-                let ob = (0..md.heads)
-                    .map(|_| take(qt * md.head_dim * 2))
-                    .collect::<Result<_, _>>()?;
-                let kslot = [take(kb * md.head_dim * 2)?, take(kb * md.head_dim * 2)?];
-                let vslot = [take(kb * md.head_dim * 2)?, take(kb * md.head_dim * 2)?];
-                let sbuf = [take(qt * kb * 2)?, take(qt * kb * 2)?];
-                let st = (0..md.heads)
-                    .map(|_| take(qt * 8))
-                    .collect::<Result<_, _>>()?;
+                let mut lay = Layout::of_sm(&self.m.sms[sm], g);
+                let bufs = self.attn_layout(&mut lay, qt)?;
                 sms.push(AttnSm {
                     sm,
-                    bufs: AttnBufs {
-                        qb,
-                        ob,
-                        kslot,
-                        vslot,
-                        sbuf,
-                        st,
-                    },
+                    bufs,
                     units: Vec::new(),
                     next: 0,
                     step: 0,
@@ -2162,14 +2350,9 @@ impl Driver {
             for h in 0..md.heads {
                 let cb = h * md.head_dim / 128;
                 let src = self.plan.q.block(cb, row0, rows);
-                self.get(
-                    sm,
-                    src.base,
-                    b.qb[h as usize],
-                    rows * md.head_dim * 2,
-                    &[war],
-                    lab(Kind::DmaAct, h),
-                );
+                let halves = self.row_halves(rows * md.head_dim * 2, rows);
+                let dst = b.qb[h as usize];
+                self.get_split(sm, src.base, dst, halves, &[war], lab(Kind::DmaAct, h));
             }
             st.free = [war, war];
             st.sfree = [war, war];
@@ -2185,20 +2368,23 @@ impl Driver {
             let s = (j % 2) as usize;
             let (ksrc, vsrc) = self.kv_block(layer, kvh, sidx * seq + j * kb);
             let kv_bytes = keys * md.head_dim * 2;
-            self.get(
+            let khalves = self.col_halves(kv_bytes, keys);
+            let free = [st.free[s]];
+            self.get_split(
                 sm,
                 ksrc,
                 b.kslot[s],
-                kv_bytes,
-                &[st.free[s]],
+                khalves,
+                &free,
                 lab(Kind::DmaAct, 100 + x),
             );
-            self.get(
+            let vhalves = b.vslot[s].halves(kv_bytes);
+            self.get_split(
                 sm,
                 vsrc,
                 b.vslot[s],
-                kv_bytes,
-                &[st.free[s]],
+                vhalves,
+                &free,
                 lab(Kind::DmaAct, 200 + x),
             );
             let mut readers = Vec::new();
@@ -2207,10 +2393,10 @@ impl Driver {
                 let scoreboard = b.sbuf[st.si % 2];
                 let sdep = st.sfree[st.si % 2];
                 let (qh, kslot) = (b.qb[h], b.kslot[s]);
-                let mm = self.m.matmul(
+                let mm = self.m.matmul_split(
                     sm,
-                    qh.base,
-                    kslot.base,
+                    &qh,
+                    &kslot,
                     scoreboard,
                     rows,
                     keys,
@@ -2218,11 +2404,8 @@ impl Driver {
                     false,
                     self.p.tile,
                 );
-                let mm = with_deps(
-                    mm,
-                    &[Some(qh), Some(kslot), sdep],
-                    lab(Kind::Attn, 1000 + x),
-                );
+                let deps = [qh.deps(), kslot.deps(), [sdep, None]].concat();
+                let mm = with_deps(mm, &deps, lab(Kind::Attn, 1000 + x));
                 self.add(sm, mm);
                 let ops = rows * keys * self.p.softmax_ops + rows * md.head_dim;
                 let v = self.m.vector(sm, b.st[h], ops, rows * keys * 2, rows * 8);
@@ -2233,10 +2416,10 @@ impl Driver {
                 );
                 self.add(sm, v);
                 let (oh, vslot) = (b.ob[h], b.vslot[s]);
-                let pv = self.m.matmul(
+                let pv = self.m.matmul_split(
                     sm,
-                    scoreboard.base,
-                    vslot.base,
+                    &Split::whole(scoreboard),
+                    &vslot,
                     oh,
                     rows,
                     md.head_dim,
@@ -2248,7 +2431,12 @@ impl Driver {
                 let first = if j == 0 { war } else { Some(oh) };
                 let pv = with_deps(
                     pv,
-                    &[Some(scoreboard), Some(vslot), Some(b.st[h]), first],
+                    &[
+                        &[Some(scoreboard)][..],
+                        &vslot.deps(),
+                        &[Some(b.st[h]), first],
+                    ]
+                    .concat(),
                     lab(Kind::Attn, 3000 + x),
                 );
                 self.add(sm, pv);
@@ -2276,7 +2464,10 @@ impl Driver {
         let mut dsts = Vec::new();
         for cb in 0..(md.heads * md.head_dim).div_ceil(128) {
             let dst = self.plan.o.block(cb, row0, rows);
+            // The column block's first head; its 128 columns may run into
+            // the next buffers (kept inside one bank).
             let src = b.ob[((cb * 128 / md.head_dim) as usize).min(b.ob.len() - 1)].base;
+            let src = self.m.in_bank(sm, src, rows * 256);
             dsts.extend(self.write_out(
                 sm,
                 src,
@@ -2596,8 +2787,8 @@ struct GemmSm {
     cb: u64,
     cb1: u64,
     acc: Vec<Vec<Range>>,
-    a_slot: [Range; 2],
-    w_slot: [Range; 2],
+    a_slot: [Split; 2],
+    w_slot: [Split; 2],
     res: Option<Range>,
     stats: Range,
     /// Per staging slot: the signal that its last readers are done.
@@ -2638,10 +2829,10 @@ struct AttnSm {
 /// One SM's attention buffers.
 #[derive(Debug, Clone)]
 struct AttnBufs {
-    qb: Vec<Range>,
+    qb: Vec<Split>,
     ob: Vec<Range>,
-    kslot: [Range; 2],
-    vslot: [Range; 2],
+    kslot: [Split; 2],
+    vslot: [Split; 2],
     sbuf: [Range; 2],
     st: Vec<Range>,
 }

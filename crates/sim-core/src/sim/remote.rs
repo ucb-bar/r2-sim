@@ -85,7 +85,10 @@ pub(crate) enum MsgKind {
     Return { task: TaskId },
     /// Invoker to owner: a forwarded invoke with its descriptor, and the
     /// invoker's call for a tracer.
-    Invoke { desc: Descriptor, call: TaskCall },
+    Invoke {
+        desc: Box<Descriptor>,
+        call: TaskCall,
+    },
     /// Requester to owner: free the version table entry at base address
     /// `addr` (an absent entry is a no-op).
     VersionReset { addr: u64 },
@@ -776,7 +779,7 @@ impl Sim {
                     trace!(self, t => t.entry_open(&e, start));
                 }
                 let n = &mut self.nus[to.0 as usize];
-                n.inbound.push_back((Entry::Inbound(call), desc));
+                n.inbound.push_back((Entry::Inbound(call), *desc));
                 n.inbound_peak = n.inbound_peak.max(n.inbound.len());
                 self.drain_inbound(to);
             }
@@ -995,7 +998,7 @@ impl Sim {
             .expect("held request to replay");
         h.state = HeldState::Sent;
         let kind = match h.kind.clone() {
-            HeldKind::Invoke(desc, call) => MsgKind::Invoke { desc: *desc, call },
+            HeldKind::Invoke(desc, call) => MsgKind::Invoke { desc, call },
             HeldKind::VersionReset(addr) => MsgKind::VersionReset { addr },
         };
         self.stats.resends += 1;
@@ -1018,7 +1021,7 @@ impl Sim {
     /// acknowledged, and sends it into the invoke source queue.
     fn send_held(&mut self, nu: NeutrinoId, owner: NeutrinoId, kind: MsgKind, seq: u64) {
         let held = match &kind {
-            MsgKind::Invoke { desc, call } => HeldKind::Invoke(Box::new(desc.clone()), *call),
+            MsgKind::Invoke { desc, call } => HeldKind::Invoke(desc.clone(), *call),
             MsgKind::VersionReset { addr } => HeldKind::VersionReset(*addr),
             _ => unreachable!("only requests are held"),
         };
@@ -1128,7 +1131,14 @@ impl Sim {
             seq: 0,
             n: self.nus[nu.0 as usize].calls,
         };
-        self.send_request(nu, owner, MsgKind::Invoke { desc, call });
+        self.send_request(
+            nu,
+            owner,
+            MsgKind::Invoke {
+                desc: Box::new(desc),
+                call,
+            },
+        );
         self.respond(
             nu,
             Response::Invoked(TaskHandle {

@@ -431,7 +431,9 @@ pub struct RunInfo {
     pub params_file: Option<String>,
     /// `--param key=value` overrides.
     pub params: Vec<String>,
-    /// `--set PATH=VALUE` configuration overrides.
+    /// `--set PATH=VALUE` configuration overrides, then the other flags
+    /// that change the model (`--acc-buffer`, `--operand-reuse`,
+    /// `--quantize`, `--cocharge`, `--flow`) as `"--flag value"`.
     pub overrides: Vec<String>,
     pub granule: u64,
 }

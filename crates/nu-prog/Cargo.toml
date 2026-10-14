@@ -9,6 +9,7 @@ license.workspace = true
 nu-model = { path = "../nu-model" }
 sim-core = { path = "../sim-core" }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.9"
 
 [dev-dependencies]

@@ -47,3 +47,86 @@ fn writes_to_sync_only_are_ignored() {
     n.write(Addr(0x20_0000), &[1, 2, 3]).unwrap();
     assert_eq!(n.read(Addr(0x20_0000), 3).unwrap(), vec![0; 3]);
 }
+
+/// C = A x B for A 4 x 2 and B 2 x 4 (tile 2 x 2): once with each operand
+/// one matrix, once with A split by rows and B split by columns into half
+/// matrices (Args::Matmul): the same C.
+#[test]
+fn a_split_operand_reads_its_halves() {
+    use sim_core::{Args, Descriptor, Dtype, FuncOp, OpKind, OpcodeId};
+    let bf = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|&x| f32_to_bf16(x).to_le_bytes())
+            .collect()
+    };
+    let a: Vec<f32> = (1..=8).map(|x| x as f32).collect();
+    let b: Vec<f32> = (1..=8).map(|x| (x * 10) as f32).collect();
+    let (a, b) = (&a, &b);
+    let run = |split: bool| -> Vec<u8> {
+        let mut n = numeric();
+        let (pa, pa2, pb, pb2, pc) = (0x10_0000, 0x11_0000, 0x12_0000, 0x13_0000, 0x14_0000);
+        if split {
+            // Rows 0 and 2 (low halves of the two row tiles) at pa, 1 and 3
+            // at pa2; columns 0 and 2 of B at pb, 1 and 3 at pb2.
+            let rows = |r: &[usize]| -> Vec<f32> {
+                r.iter()
+                    .flat_map(|&i| a[2 * i..2 * i + 2].to_vec())
+                    .collect()
+            };
+            n.write(Addr(pa), &bf(&rows(&[0, 2]))).unwrap();
+            n.write(Addr(pa2), &bf(&rows(&[1, 3]))).unwrap();
+            let cols = |c: &[usize]| -> Vec<f32> {
+                (0..2)
+                    .flat_map(|p| c.iter().map(move |&j| b[4 * p + j]))
+                    .collect()
+            };
+            n.write(Addr(pb), &bf(&cols(&[0, 2]))).unwrap();
+            n.write(Addr(pb2), &bf(&cols(&[1, 3]))).unwrap();
+        } else {
+            n.write(Addr(pa), &bf(a)).unwrap();
+            n.write(Addr(pb), &bf(b)).unwrap();
+        }
+        let desc = Descriptor {
+            opcode: OpcodeId(2),
+            pe: None,
+            dst: Range::from_len(pc, 32),
+            versioned: false,
+            inferred_version: None,
+            deps: vec![],
+            label: None,
+            args: Args::Matmul {
+                a: Addr(pa),
+                b: Addr(pb),
+                a2: split.then_some(Addr(pa2)),
+                b2: split.then_some(Addr(pb2)),
+                lda: 2,
+                ldb: if split { 2 } else { 4 },
+                ldc: 4,
+                m: 4,
+                n: 4,
+                k: 2,
+                in_dtype: Dtype::Bf16,
+                b_dtype: Dtype::Bf16,
+                out_dtype: Dtype::Bf16,
+                accumulate: false,
+                keep: false,
+                tile: [2, 2],
+            },
+        };
+        let op = FuncOp {
+            seq: 1,
+            time: 0,
+            nu: nu_model::NeutrinoId(0),
+            gid: None,
+            kind: OpKind::Task(desc),
+        };
+        n.apply(&op).unwrap();
+        n.read(Addr(pc), 32).unwrap()
+    };
+    let one = run(false);
+    assert_eq!(
+        &one[0..2],
+        &f32_to_bf16(1.0 * 10.0 + 2.0 * 50.0).to_le_bytes()
+    );
+    assert_eq!(run(true), one);
+}

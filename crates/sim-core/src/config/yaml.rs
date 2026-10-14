@@ -1737,16 +1737,30 @@ impl Builder {
     }
 
     /// The port of the one scratch memory that is a slave on one of
-    /// `buses`.
-    fn smem_port(&self, name: &str, buses: &[String]) -> Result<ResourceId, ConfigError> {
+    /// `buses`; `None` when that memory is banked (the profile charges its
+    /// banks by address).
+    fn smem_port(&self, name: &str, buses: &[String]) -> Result<Option<ResourceId>, ConfigError> {
         let mut found: Vec<&(String, String, ResourceId)> = self
             .scratch_ports
             .iter()
             .filter(|s| buses.contains(&s.1))
             .collect();
         found.dedup_by(|a, b| a.0 == b.0);
+        // The banks of one memory count as that memory.
+        let memory = |bank: &str| {
+            self.mems
+                .iter()
+                .find(|m| m.block.name == bank && m.block.banked)
+                .and_then(|_| bank.rsplit_once(".b").map(|(m, _)| m.to_string()))
+        };
+        let mems: Vec<Option<String>> = found.iter().map(|s| memory(&s.0)).collect();
+        if let Some(Some(first)) = mems.first() {
+            if mems.iter().all(|m| m.as_ref() == Some(first)) {
+                return Ok(None);
+            }
+        }
         match found.as_slice() {
-            [s] => Ok(s.2),
+            [s] => Ok(Some(s.2)),
             [] => err(format!("{name}: no scratch memory is a slave on {buses:?}")),
             [a, b, ..] => err(format!(
                 "{name}: {} and {} are slaves on {buses:?}",
@@ -1813,7 +1827,7 @@ impl Builder {
                     let smem_wport = self
                         .mems
                         .iter()
-                        .find(|m| m.block.port == smem_port)
+                        .find(|m| Some(m.block.port) == smem_port)
                         .and_then(|m| m.block.wport);
                     let quantize = match c.quantize.as_deref().unwrap_or("tile") {
                         "tile" => true,

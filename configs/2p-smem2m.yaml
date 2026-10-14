@@ -1,4 +1,5 @@
-# 2p.yaml with 2 MiB of SMEM per SM (the 5b item 3b target size).
+# 2p.yaml with 2 MiB of SMEM per SM (the 5b item 3b target size): two
+# banks of 1 MiB at the 128 B/cycle per port of sm.yaml.
 base: 2p.yaml
 set:
   - "root.gpc*.sm*.smem.addr=[[0x0, 0x200000]]"

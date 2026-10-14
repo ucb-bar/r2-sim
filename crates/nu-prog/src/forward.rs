@@ -48,11 +48,12 @@ pub struct Params {
     /// placement (the CLI fills it from the trace).
     pub expert_prob: Vec<Vec<f64>>,
     /// Vision encoder parameters. `model`, `weight_dtype`, `act_mem`,
-    /// `act_copies`, `single_accumulator` and `action` come from this struct.
+    /// `act_copies`, `single_accumulator`, `smem_cost` and `action` come
+    /// from this struct.
     pub vision: prefill::Params,
     /// VLM prefill parameters. `model`, `weight_dtype`, `act_mem`,
-    /// `act_copies`, `single_accumulator`, `action` and `last_layer` come from
-    /// this struct.
+    /// `act_copies`, `single_accumulator`, `smem_cost`, `action` and
+    /// `last_layer` come from this struct.
     pub vlm: prefill::Params,
     /// Action expert parameters. `weight_dtype`, `cmem_reserve` and a
     /// non-empty `expert_prob` come from this struct.
@@ -67,6 +68,14 @@ pub struct Params {
     /// cmem: "owner" (the gpc that owns it) or "writer" (the gpc of the
     /// writing SM; a cross-gpc invoke when they differ).
     pub slice_writes: String,
+    /// On a banked SMEM, the bank group that buffers of no operand role
+    /// (accumulators, residual, statistics) try first: "act" (the
+    /// activation banks) or "weights" (architecture Section 5.5).
+    pub smem_whole: String,
+    /// The SMEM term of the prefill grid cost model: "role" (the default)
+    /// or "port" (`prefill::Params::smem_cost`); copied to both prefill
+    /// stages.
+    pub smem_cost: String,
 }
 
 impl Default for Params {
@@ -87,6 +96,8 @@ impl Default for Params {
             action: adamoe::Params::default(),
             drivers: "hierarchical".into(),
             slice_writes: "owner".into(),
+            smem_whole: "act".into(),
+            smem_cost: "role".into(),
         }
     }
 }
@@ -214,6 +225,16 @@ fn build(
     m.versions
         .borrow_mut()
         .set_mode(VresetPolicy::parse(&p.vreset_policy)?);
+    let whole = match p.smem_whole.as_str() {
+        "act" => crate::machine::Role::Act,
+        "weights" => crate::machine::Role::W,
+        w => return Err(format!("unknown smem_whole {w:?} (act, weights)")),
+    };
+    let mut m = m.clone();
+    for s in &mut m.sms {
+        s.whole = whole;
+    }
+    let m = &m;
     let mut vp = p.vision.clone();
     let mut lp = p.vlm.clone();
     let mut ap = p.action.clone();
@@ -230,6 +251,7 @@ fn build(
         x.act_mem = p.act_mem.clone();
         x.act_copies = p.act_copies;
         x.single_accumulator = p.single_accumulator;
+        x.smem_cost = p.smem_cost.clone();
         x.action = ap.clone();
     }
     lp.last_layer = p.vlm_last_layer.clone();

@@ -159,8 +159,10 @@ pub enum PeParams {
         /// slower operand type has rate r charges `MACs * max / r`. Empty:
         /// every type at the array rate.
         rates: Vec<(crate::profile::Dtype, Ratio)>,
-        /// The SMEM port resource.
-        smem_port: ResourceId,
+        /// The SMEM port resource; `None` on a banked SMEM, whose operand
+        /// and C bytes charge the ports of the banks by address
+        /// (architecture Section 5.5).
+        smem_port: Option<ResourceId>,
         /// The SMEM write port (`wr_bytes`), charged by C out and the
         /// flush instead of `smem_port`.
         smem_wport: Option<ResourceId>,

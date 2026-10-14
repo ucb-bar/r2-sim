@@ -111,7 +111,7 @@ fn main() {
                     row_panel: false,
                     acc_buffer: 0,
                     array,
-                    smem_port,
+                    smem_port: Some(smem_port),
                     smem_wport: None,
                     utilization: Ratio::ONE,
                     quantize: true,
@@ -163,6 +163,8 @@ fn main() {
                         args: Args::Matmul {
                             a: Addr(a.base),
                             b: Addr(a.base),
+                            a2: None,
+                            b2: None,
                             lda: 64,
                             ldb: 128,
                             ldc: 128,

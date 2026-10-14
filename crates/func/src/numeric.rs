@@ -1,7 +1,9 @@
 //! The `Numeric` backend.
 
 use nu_model::{Addr, Range};
-use sim_core::{Args, Descriptor, Dtype, FuncError, FuncOp, FunctionalBackend, MemBlock, OpKind};
+use sim_core::{
+    split_row, Args, Descriptor, Dtype, FuncError, FuncOp, FunctionalBackend, MemBlock, OpKind,
+};
 
 use crate::dtype::{bf16_to_f32, f32_to_bf16};
 use crate::memory::{check_in_dst, err, Memory};
@@ -73,6 +75,9 @@ impl Numeric {
                 b_dtype,
                 out_dtype,
                 accumulate,
+                a2,
+                b2,
+                tile,
                 ..
             } => {
                 for dt in [in_dtype, b_dtype, out_dtype] {
@@ -84,8 +89,41 @@ impl Numeric {
                 let es = out_dtype.bytes();
                 let c_span = if m == 0 { 0 } else { ((m - 1) * ldc + n) * es };
                 check_in_dst(&desc.dst, &Range::from_len(c, c_span))?;
-                let av = self.read_matrix(a.0, m, k, lda, in_dtype)?;
-                let bv = self.read_matrix(b.0, k, n, ldb, b_dtype)?;
+                let es_a = in_dtype.bytes();
+                let av = match a2 {
+                    None => self.read_matrix(a.0, m, k, lda, in_dtype)?,
+                    Some(a2) => {
+                        let mut v = Vec::with_capacity((m * k) as usize);
+                        for r in 0..m {
+                            let (hi, i) = split_row(r, tile[0]);
+                            let base = if hi { a2.0 } else { a.0 };
+                            v.extend(self.read_matrix(
+                                base + i * lda * es_a,
+                                1,
+                                k,
+                                lda,
+                                in_dtype,
+                            )?);
+                        }
+                        v
+                    }
+                };
+                let bv = match b2 {
+                    None => self.read_matrix(b.0, k, n, ldb, b_dtype)?,
+                    Some(b2) => {
+                        let es_b = b_dtype.bytes();
+                        let mut v = vec![0.0; (k * n) as usize];
+                        for c in 0..n {
+                            let (hi, i) = split_row(c, tile[1]);
+                            let base = if hi { b2.0 } else { b.0 } + i * es_b;
+                            let col = self.read_matrix(base, k, 1, ldb, b_dtype)?;
+                            for (p, x) in col.into_iter().enumerate() {
+                                v[p * n as usize + c as usize] = x;
+                            }
+                        }
+                        v
+                    }
+                };
                 let mut cv = if accumulate {
                     self.read_matrix(c, m, n, ldc, out_dtype)?
                 } else {

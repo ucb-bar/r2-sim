@@ -63,11 +63,19 @@ const WIRE_LIMIT: u64 = 256;
 pub(crate) const MAX_JOIN_DEPS: usize = 29;
 
 /// The deps beyond what fits one message with `desc` (its fixed part plus
-/// 8 bytes per dep), leaving one dep for the join that takes them; empty
-/// when all fit.
-pub(crate) fn excess_deps(desc: &mut Descriptor) -> Vec<Option<Range>> {
+/// 8 bytes per dep) and one more dep when `chains()` (asked only when the
+/// deps are at the limit: [`Graph::add`] will append a write-after-write
+/// dep, [`Graph::chains`]), leaving one dep for the join that takes them;
+/// empty when all fit.
+pub(crate) fn excess_deps(
+    desc: &mut Descriptor,
+    chains: impl FnOnce(&Descriptor) -> bool,
+) -> Vec<Option<Range>> {
     let fixed = desc.wire_bytes() - 8 * desc.deps.len() as u64;
-    let max = ((WIRE_LIMIT - fixed) / 8) as usize;
+    let mut max = ((WIRE_LIMIT - fixed) / 8) as usize;
+    if desc.deps.len() >= max && chains(desc) {
+        max -= 1;
+    }
     if desc.deps.len() <= max {
         return Vec::new();
     }
@@ -256,6 +264,32 @@ impl Graph {
         self.tasks
             .iter()
             .rposition(|(t, _)| t.dst.base <= a && a < t.dst.bound)
+    }
+
+    /// True when [`Graph::add`] will append a write-after-write dep to
+    /// `desc`: the window has an earlier task with the same `dst` that none
+    /// of `desc`'s deps resolves to.
+    pub(crate) fn chains(&self, desc: &Descriptor) -> bool {
+        let Some(p) = self
+            .latest(desc.dst.base)
+            .filter(|&p| self.tasks[p].0.dst == desc.dst)
+        else {
+            return false;
+        };
+        let to_p = |x: Option<DepRef>| matches!(x, Some(DepRef::Task(q)) if q == p);
+        !desc.deps.iter().any(|d| match *d {
+            Dep::Unversioned(a) => match pin_of(a) {
+                Some((w, i)) => to_p(
+                    self.pins
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .filter(|_| w == self.window),
+                ),
+                None => to_p(self.resolve(a)),
+            },
+            _ => false,
+        })
     }
 
     pub(crate) fn dst(&self, t: TaskIx) -> Range {

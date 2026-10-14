@@ -32,8 +32,8 @@ pub use config::{
 };
 pub use func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
 pub use profile::{
-    Args, Chunk, Descriptor, Dtype, NodeConfig, Occupancy, OpcodeId, PeId, Profile, ProfileFn,
-    ProfileRegistry,
+    split_row, Args, Chunk, Descriptor, Dtype, NodeConfig, Occupancy, OpcodeId, PeId, Profile,
+    ProfileFn, ProfileRegistry,
 };
 pub use program::{NeutrinoProgram, NuCtx, TaskHandle};
 pub use resource::{

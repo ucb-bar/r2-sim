@@ -236,6 +236,8 @@ fn matmul(b: &Built, pe: &str, c: nu_model::Range, n: u64, deps: Vec<nu_model::D
         args: Args::Matmul {
             a: nu_model::Addr(c.base),
             b: nu_model::Addr(c.base),
+            a2: None,
+            b2: None,
             lda: n,
             ldb: n,
             ldc: n,

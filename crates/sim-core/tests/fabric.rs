@@ -83,6 +83,8 @@ fn gemm_array_cycles(sets: &[&str], d: Dtype) -> u64 {
         args: Args::Matmul {
             a: Addr(c.base),
             b: Addr(c.base),
+            a2: None,
+            b2: None,
             lda: 64,
             ldb: 64,
             ldc: 64,
@@ -438,6 +440,8 @@ fn demands_record_reads_and_writes() {
         args: Args::Matmul {
             a: Addr(c.base),
             b: Addr(c.base),
+            a2: None,
+            b2: None,
             lda: 64,
             ldb: 64,
             ldc: 64,
