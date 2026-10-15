@@ -118,14 +118,14 @@ impl Default for Params {
 
 /// One SM of the machine.
 #[derive(Debug, Clone)]
-struct Sm {
-    path: String,
-    nu: NeutrinoId,
-    gpc: usize,
-    dma: PeId,
-    atlas: Option<PeId>,
-    muon: Option<PeId>,
-    smem: Range,
+pub(crate) struct Sm {
+    pub(crate) path: String,
+    pub(crate) nu: NeutrinoId,
+    pub(crate) gpc: usize,
+    pub(crate) dma: PeId,
+    pub(crate) atlas: Option<PeId>,
+    pub(crate) muon: Option<PeId>,
+    pub(crate) smem: Range,
 }
 
 /// What a task of the run is for.
@@ -193,7 +193,7 @@ pub struct Run {
 
 /// The SMs of `b`: nodes with an SMEM block and a DMA engine, ordered by
 /// gpc and then by SM.
-fn sms_of(b: &Built) -> Vec<Sm> {
+pub(crate) fn sms_of(b: &Built) -> Vec<Sm> {
     let topo = b.sim.topology();
     let mut out = Vec::new();
     for i in 0..topo.len() {
@@ -221,7 +221,7 @@ fn sms_of(b: &Built) -> Vec<Sm> {
 }
 
 /// `count` SMs, packed (in order) or spread round-robin over the gpcs.
-fn pick(all: &[Sm], count: usize, placement: &str) -> Result<Vec<Sm>, String> {
+pub(crate) fn pick(all: &[Sm], count: usize, placement: &str) -> Result<Vec<Sm>, String> {
     if count == 0 || count > all.len() {
         return Err(format!("sms = {count}: the machine has {} SMs", all.len()));
     }

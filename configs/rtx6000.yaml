@@ -101,7 +101,9 @@ device:
     # limit: 64 transfers in flight, 512 B beats, latency 40 (a stand-in,
     # not a hardware number).
     - {name: dma, type: dma, latency: 40, inflight: 64, beat_bytes: 512, master: [$this.sbus]}
-  neutrino: {scoreboard: 1024, pending: 4096, execution: 4096, versions: 16384, inbound_refs: 1024, inbound_invokes: 256, outbound_deps: 256, outbound_invokes: 64}
+  # versions: the card has no version table; 1,048,576 entries so that it
+  # cannot limit a run (2026-10-15).
+  neutrino: {scoreboard: 1024, pending: 4096, execution: 4096, versions: 1048576, inbound_refs: 1024, inbound_invokes: 256, outbound_deps: 256, outbound_invokes: 64}
   children:
     - {name: gpc0, config: rtx6000-gpc.yaml}
     - {name: gpc1, config: rtx6000-gpc.yaml}

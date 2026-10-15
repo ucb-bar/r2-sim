@@ -306,6 +306,10 @@ struct Out<'a> {
     /// programs, so their JSON does not change).
     #[serde(skip_serializing_if = "Option::is_none")]
     micro: Option<serde_json::Value>,
+    /// A kernel sequence's per-kernel record (absent for the other
+    /// programs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kernels: Option<serde_json::Value>,
     stats: &'a Stats,
 }
 
@@ -383,7 +387,7 @@ fn run(argv: &[String]) -> Result<(), String> {
             r.num as f64 / r.den as f64
         })
         .sum();
-    if rate_f == 0.0 && launch.micro.is_none() {
+    if rate_f == 0.0 && launch.micro.is_none() && launch.kernels.is_none() {
         return Err("no memory named hbm".into());
     }
 
@@ -413,7 +417,15 @@ fn run(argv: &[String]) -> Result<(), String> {
     if let Some(f) = a.flow {
         b.sim.set_flow(f);
     }
-    b.sim.set_functional(Box::new(func::Trace::new(records)));
+    if launch.kernels.is_some() {
+        // The kernel sequences carry no data (no loads), and their output
+        // stores name a store record as their range, not the memory they
+        // write (a correlation-only convention, nu_prog::kernels): no data
+        // plane.
+        b.sim.set_functional(Box::new(sim_core::NullBackend));
+    } else {
+        b.sim.set_functional(Box::new(func::Trace::new(records)));
+    }
     // The names are taken now, before the run consumes the simulation.
     let names = tracing.then(|| trace::names(&b));
     let atlas = b
@@ -462,6 +474,10 @@ fn run(argv: &[String]) -> Result<(), String> {
         .micro
         .as_ref()
         .map(|r| nu_prog::micro::result(&r.borrow(), &stats));
+    let kernels = launch
+        .kernels
+        .as_ref()
+        .map(|r| nu_prog::kernels::result(&r.borrow()));
     let prefill = launch.prefill.as_ref().map(|r| r.borrow().clone());
     let forward = launch.forward.as_ref().map(|r| r.borrow().clone());
     if let Some((dir, out)) = &raw {
@@ -631,6 +647,7 @@ fn run(argv: &[String]) -> Result<(), String> {
         prefill: prefill.as_ref(),
         forward: forward.as_ref(),
         micro,
+        kernels,
         stats: &stats_out,
     };
     print_summary(&out, &stats);

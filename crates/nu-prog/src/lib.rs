@@ -8,6 +8,8 @@
 //!   configuration.
 //! * [`micro`]: micro-benchmarks, one mode per run, to compare the model
 //!   with measurements on a card.
+//! * [`kernels`]: a sequence of GPU-style kernels (GEMM, softmax,
+//!   layernorm, elementwise, attention) with the card's tiling.
 //! * [`kv`]: the layout of the prefix KV cache in HBM.
 //! * [`label`]: the task label scheme.
 //! * [`synthetic`]: synthetic router traces.
@@ -19,6 +21,7 @@
 pub mod adamoe;
 pub mod forward;
 mod graph;
+pub mod kernels;
 pub mod kv;
 pub mod label;
 pub mod machine;
@@ -63,6 +66,8 @@ pub struct Launch {
     pub forward: Option<Rc<RefCell<forward::Report>>>,
     /// A micro-benchmark's record, for [`micro::result`] after the run.
     pub micro: Option<Rc<RefCell<micro::Report>>>,
+    /// A kernel sequence's record, for [`kernels::result`] after the run.
+    pub kernels: Option<Rc<RefCell<kernels::Report>>>,
 }
 
 /// Parses program parameters: TOML text, then `key=value` overrides
@@ -86,7 +91,8 @@ pub fn params<T: serde::de::DeserializeOwned>(
         .map_err(|e: toml::de::Error| e.to_string())
 }
 
-/// The programs known by name: `adamoe`, `prefill`, `forward`, `micro`.
+/// The programs known by name: `adamoe`, `prefill`, `forward`, `micro`,
+/// `kernels`.
 pub fn launch(
     name: &str,
     built: &Built,
@@ -111,6 +117,7 @@ pub fn launch(
                 prefill: None,
                 forward: None,
                 micro: None,
+                kernels: None,
             })
         }
         "forward" => {
@@ -129,6 +136,7 @@ pub fn launch(
                 prefill: None,
                 forward: Some(fwd),
                 micro: None,
+                kernels: None,
             })
         }
         "prefill" => {
@@ -147,6 +155,7 @@ pub fn launch(
                 prefill: Some(report),
                 forward: None,
                 micro: None,
+                kernels: None,
             })
         }
         "micro" => {
@@ -163,10 +172,29 @@ pub fn launch(
                 prefill: None,
                 forward: None,
                 micro: Some(report),
+                kernels: None,
+            })
+        }
+        "kernels" => {
+            let p: kernels::Params = params(params_text, overrides)?;
+            let run = kernels::build(built, p)?;
+            let report = run.report.clone();
+            let nu = NeutrinoId(0);
+            Ok(Launch {
+                nu,
+                drivers: vec![nu],
+                home: nu,
+                program: Box::new(move |ctx| Box::pin(run.run(ctx))),
+                name: "kernels",
+                report: Default::default(),
+                prefill: None,
+                forward: None,
+                micro: None,
+                kernels: Some(report),
             })
         }
         _ => Err(format!(
-            "unknown program {name:?} (known: adamoe, prefill, forward, micro)"
+            "unknown program {name:?} (known: adamoe, prefill, forward, micro, kernels)"
         )),
     }
 }
