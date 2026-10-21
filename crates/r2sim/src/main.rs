@@ -17,7 +17,7 @@ use sim_core::{build_config_file, ProfileRegistry, SimWarning, Stats};
 
 const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
 [--trace FILE | --synthetic SEED] [--stats OUT] [--timeline] [--quantize tile|none] \
-[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]";
+[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--asm DIR] [--no-diagnostics]";
 
 #[derive(Default)]
 struct Args {
@@ -34,6 +34,8 @@ struct Args {
     trace_raw: Option<PathBuf>,
     trace_zstd: bool,
     trace_config: Option<PathBuf>,
+    /// `--asm DIR`: one assembly-style listing per program instance.
+    asm: Option<PathBuf>,
     /// `--set trace.KEY=VALUE`: trace configuration overrides.
     trace_sets: Vec<String>,
     sets: Vec<String>,
@@ -90,6 +92,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--trace-raw" => a.trace_raw = Some(val()?.into()),
             "--trace-zstd" => a.trace_zstd = true,
             "--trace-config" => a.trace_config = Some(val()?.into()),
+            "--asm" => a.asm = Some(val()?.into()),
             "--set" => {
                 // Tracing is not part of the SoC configuration.
                 let v = val()?;
@@ -327,6 +330,24 @@ fn action_params(
     }
 }
 
+/// One file per program instance: `<neutrino>.<k>.<program>.s`, k the
+/// instance's index on its Neutrino.
+fn write_asm(
+    dir: &std::path::Path,
+    sym: &sim_core::asm::Symbols,
+    listings: &[sim_core::asm::Listing],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut count: BTreeMap<u32, usize> = BTreeMap::new();
+    for l in listings {
+        let k = count.entry(l.nu.0).or_default();
+        let name = format!("{}.{k}.{}.s", sym.nu(l.nu), l.name);
+        *k += 1;
+        std::fs::write(dir.join(name), sym.listing(l))?;
+    }
+    Ok(())
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if let Err(e) = run(&argv) {
@@ -465,11 +486,19 @@ fn run(argv: &[String]) -> Result<(), String> {
         }
         None => None,
     };
+    let symbols = a
+        .asm
+        .as_ref()
+        .map(|_| sim_core::asm::Symbols::from_built(&b));
     let mut sim = b.sim;
+    sim.set_asm(a.asm.is_some());
     sim.spawn_named(launch.nu, launch.name, launch.program);
     let t0 = Instant::now();
     let stats = sim.run();
     let wall = t0.elapsed().as_secs_f64();
+    if let (Some(dir), Some(sym)) = (&a.asm, &symbols) {
+        write_asm(dir, sym, &stats.asm).map_err(|e| format!("--asm: {e}"))?;
+    }
     let micro = launch
         .micro
         .as_ref()
@@ -477,7 +506,7 @@ fn run(argv: &[String]) -> Result<(), String> {
     let kernels = launch
         .kernels
         .as_ref()
-        .map(|r| nu_prog::kernels::result(&r.borrow()));
+        .map(|r| nu_prog::kernels::result(&r.borrow(), &stats));
     let prefill = launch.prefill.as_ref().map(|r| r.borrow().clone());
     let forward = launch.forward.as_ref().map(|r| r.borrow().clone());
     if let Some((dir, out)) = &raw {

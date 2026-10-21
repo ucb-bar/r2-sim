@@ -9,7 +9,7 @@
 //!   Tensors are laid out in the linear ranges of the memories `dram` and
 //!   `l2` (by default `root.hbm` and `root.l2`; the linear range is the
 //!   source range of the hash link that maps onto the memory, if any).
-//! * `cache`: `first_touch` (default) or `home`. Under `first_touch`, the
+//! * `cache`: `first_touch` (default), `home`, `per_kernel` or `sim`. Under `first_touch`, the
 //!   first read of a tile range in launch order comes from the tensor's
 //!   home, and later reads of that range come from the L2; writes go to
 //!   the L2. This stands for an L2 that keeps a working set that fits;
@@ -17,7 +17,16 @@
 //!   built (a read that follows a first read of the same range in another
 //!   CTA reads the L2 even while the first read is still in flight). Every
 //!   tensor of home `dram` then has a copy in the L2 range. Under `home`,
-//!   every access goes to the tensor's home.
+//!   every access goes to the tensor's home. Under `per_kernel` the L2 is
+//!   empty at each kernel's start (a measurement tool's flush): every
+//!   tensor's home is the dram, and the first-touch rule applies within
+//!   each kernel. Under `sim` every tensor's home is the dram and every
+//!   access goes there; the simulator's cache of the dram (a `cache` key
+//!   on the l2 memory, `sim_core::sim::cache`) decides what the L2 holds,
+//!   and the device empties it before each kernel's start mark; the
+//!   `kernels` object then has each kernel's cache counters.
+//! * `sms`: the SMs the CTAs run on, the first n taken round-robin over the
+//!   gpcs (default 0: every SM).
 //! * `kernels`: `{name, op, inputs, output, ctas_per_sm, ..}` with `op` one
 //!   of `gemm`, `softmax`, `layernorm`, `elementwise`, `attention` and the
 //!   shape and tile fields of [`Kernel`].
@@ -66,7 +75,19 @@
 //!   C shares the buffers' space (CUTLASS's epilogue reuses it).
 //! * `softmax`, `layernorm`, `elementwise`: a CTA of `rows_per_cta` rows of
 //!   `cols` elements: a DMA per input (`elementwise` has 1 or 2), a Muon
-//!   task of rows x cols x `ops_per_elem` lane-ops, the rows out.
+//!   task of rows x cols x `ops_per_elem` lane-ops, the rows out. With
+//!   `piece` P > 0 the CTA's rows stream in pieces of P elements, each a
+//!   DMA per input, a Muon task of its share of the lane-ops (after its
+//!   own loads only) and a store (after its Muon task), through two piece
+//!   buffers per input and two output piece buffers per slot (the smallest
+//!   SMEM without false dependencies; `row_pieces`). The second pass of a
+//!   normalization (the whole row's statistics before any output) is not
+//!   modeled. `simt_util` u (0 < u <= 1, default 1) charges the row op's
+//!   Muon tasks lane-ops / u, as a utilization of u (exclusive,
+//!   architecture Section 5.6); `softmax_util` does the same for
+//!   attention's Muon tasks. The kernels report keeps the unscaled
+//!   lane-ops (`lane_ops`), the charged ones (`lane_ops_charged`) and the
+//!   value (`simt_util`).
 //! * `attention` (FlashAttention-2 forward): inputs Q, K, V; Q and O are
 //!   batch x heads x seq x head_dim, K and V batch x kv_heads x seq_kv x
 //!   head_dim. A CTA is (batch, head, Q tile of `bq` rows), with the Q tile
@@ -83,12 +104,17 @@
 //!   SMEM of their own. With `s_in = "smem"` S goes to SMEM, the online
 //!   softmax reads it and writes P in place, and O has SMEM of its own.
 //!
-//! The accumulator is shared like the SMEM: a CTA has `--acc-buffer /
-//! ctas_per_sm` bytes, and a kernel whose C tile (gemm) or S and O
-//! (attention) do not fit in that is an error.
+//! Tensor units: an SM has one Atlas (`atlas`) or one per sub-partition
+//! (`atlas0`, `atlas1`, ...); warp w of a CTA runs its matmuls on unit w
+//! mod the units. Each unit has its own accumulator (`--acc-buffer` sets
+//! every unit's), shared by the SM's CTAs like the SMEM: on a unit, each
+//! CTA has `acc_buffer / ctas_per_sm` bytes for the C tiles (gemm) or S
+//! and O (attention) of its warps on that unit; more is an error.
 //!
 //! Every task writes a versioned range; the program sets each version.
-//! A task's label is the index of its kernel.
+//! A task's label (nu_prog::label) is (its role: load, store, matmul,
+//! softmax, norm, eltwise or rescale; layer = the kernel's index; unit =
+//! the SM; idx = the CTA's index in the kernel).
 //! Version counters start again with each kernel: the SMs' and gpcs'
 //! programs start again with it. The device's Neutrino holds no versions.
 
@@ -101,6 +127,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sim_core::{Args, Built, Descriptor, Dtype, NuCtx, OpcodeId, PeId};
 
+use crate::label::{self, Kind};
 use crate::micro::{pick, sms_of, Sm};
 
 /// The alignment of every range a task writes (the Neutrino granule).
@@ -123,6 +150,9 @@ pub struct Params {
     /// output write is in flight from one of two output buffers (default
     /// true). False: the slot waits for the write.
     pub posted_outputs: bool,
+    /// The SMs the CTAs run on: the first `sms` taken round-robin over the
+    /// gpcs (0, the default: every SM).
+    pub sms: usize,
 }
 
 impl Default for Params {
@@ -134,6 +164,7 @@ impl Default for Params {
             dram: "root.hbm".into(),
             l2: "root.l2".into(),
             posted_outputs: true,
+            sms: 0,
         }
     }
 }
@@ -192,6 +223,13 @@ pub struct Kernel {
     pub cols: u64,
     pub rows_per_cta: u64,
     pub ops_per_elem: u64,
+    /// Elements per piece: a CTA's rows stream through its SMEM in pieces
+    /// (one DMA per input, one Muon task and one store each); 0, the
+    /// default: the CTA's rows in one piece.
+    pub piece: u64,
+    /// The row op's Muon utilization (0 < u <= 1, default 1): its tasks
+    /// are charged lane-ops / u.
+    pub simt_util: f64,
     // attention
     pub batch: u64,
     pub heads: u64,
@@ -212,10 +250,15 @@ pub struct Kernel {
     /// S read it, V once every warp's P V did) or `after_pv` (both after
     /// P V).
     pub kv_release: String,
-    /// Warps as row groups: each a chain over bq / warps rows (S, online
-    /// softmax, P V) on the CTA's K and V tiles.
+    /// The CTA's warps. Attention: row groups, each a chain over bq /
+    /// warps rows (S, online softmax, P V) on the CTA's K and V tiles
+    /// (default 1). Gemm: the CTA's warp tiles (default bm x bn / 4096,
+    /// CUTLASS sm80's 64 x 64). Warp w runs its matmuls on tensor unit w
+    /// mod the SM's units.
     pub warps: u64,
     pub softmax_ops: u64,
+    /// Attention's Muon utilization (0 < u <= 1, default 1).
+    pub softmax_util: f64,
     /// Lane-ops per O element per KV tile (the online softmax's rescale).
     pub rescale_ops: u64,
     pub norm_ops: u64,
@@ -245,6 +288,8 @@ impl Default for Kernel {
             cols: 0,
             rows_per_cta: 1,
             ops_per_elem: 1,
+            piece: 0,
+            simt_util: 1.0,
             batch: 1,
             heads: 1,
             kv_heads: 0,
@@ -256,8 +301,9 @@ impl Default for Kernel {
             causal: false,
             s_in: "acc".into(),
             kv_release: "fa2".into(),
-            warps: 1,
+            warps: 0,
             softmax_ops: 12,
+            softmax_util: 1.0,
             rescale_ops: 1,
             norm_ops: 1,
         }
@@ -274,7 +320,13 @@ pub struct KernelRec {
     pub start: u64,
     pub end: u64,
     pub macs: u64,
+    /// Lane-ops of the kernel's Muon tasks: the work, and as charged (the
+    /// work over `simt_util` or `softmax_util`).
     pub lane_ops: u64,
+    pub lane_ops_charged: u64,
+    /// The utilization of the row ops' Muon tasks (`simt_util`) or of
+    /// attention's (`softmax_util`); 1 for the others.
+    pub simt_util: f64,
     /// Bytes read from the home memory `dram`, and from the L2 range.
     pub dram_read_bytes: u64,
     pub l2_read_bytes: u64,
@@ -311,13 +363,47 @@ pub struct TensorRec {
 }
 
 /// The `kernels` object of `--stats`.
-pub fn result(r: &Report) -> Value {
-    json!(r)
+pub fn result(r: &Report, stats: &sim_core::Stats) -> Value {
+    let mut out = json!(r);
+    // cache = sim: per kernel, each cache's counters between the flush
+    // before it and the next flush (or the run's end).
+    if r.cache == "sim" {
+        for (k, kr) in out["kernels"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let per: Vec<Value> = stats
+                .caches
+                .iter()
+                .filter_map(|c| {
+                    let from = c.flushes.get(k)?.counts;
+                    let to = c.flushes.get(k + 1).map_or(c.counts, |f| f.counts);
+                    Some(json!({
+                        "name": c.name,
+                        "read_hits": to.read_hits - from.read_hits,
+                        "read_misses": to.read_misses - from.read_misses,
+                        "write_hits": to.write_hits - from.write_hits,
+                        "write_allocs": to.write_allocs - from.write_allocs,
+                        "allocs": to.allocs - from.allocs,
+                        "clean_evictions": to.clean_evictions - from.clean_evictions,
+                        "dirty_evictions": to.dirty_evictions - from.dirty_evictions,
+                        "writeback_bytes": to.writeback_bytes - from.writeback_bytes,
+                        "peak_lines": to.peak_lines,
+                    }))
+                })
+                .collect();
+            kr["cache"] = json!(per);
+        }
+    }
+    out
 }
 
-/// A task of a CTA.
+/// A task of a CTA and its role (the label's kind).
 struct Task {
     desc: Descriptor,
+    kind: Kind,
 }
 
 /// A CTA: its tasks in order, the versions that end its compute, and the
@@ -325,7 +411,8 @@ struct Task {
 struct Cta {
     tasks: Vec<Task>,
     compute: Vec<(u64, u64)>,
-    done: (u64, u64),
+    /// Its output writes (one per piece of a row op in pieces).
+    done: Vec<(u64, u64)>,
 }
 
 /// A kernel ready to run: per SM (index into the run's SMs), its CTAs in
@@ -388,19 +475,34 @@ struct Builder {
     tensor_recs: Vec<TensorRec>,
     /// Version counters of the current kernel, by range base.
     versions: HashMap<u64, u64>,
-    /// The current kernel's index: the label of its tasks.
+    /// The current kernel's index: the layer field of its tasks' labels.
     index: u64,
+    /// The current CTA: (its index in the kernel, its SM): the idx and unit
+    /// fields of its tasks' labels.
+    cta: (u32, u32),
+    /// The kind of the Muon tasks being built.
+    muon_kind: Kind,
     /// The SMs' Atlas accumulator buffer (bytes).
     acc_buffer: u64,
+    /// The utilization of the Muon tasks being built (`simt_util`,
+    /// `softmax_util`; 1 otherwise).
+    util: f64,
     /// Posted outputs (two output buffers per slot).
     posted: bool,
     /// Per (SM, slot): the output writes of the current kernel's CTAs.
-    outs: HashMap<(usize, usize), Vec<Dep>>,
+    outs: HashMap<(usize, usize), Vec<Vec<Dep>>>,
+    /// Row ops in pieces, per (SM, slot): the pieces so far and the store
+    /// that last read each of the two output piece buffers.
+    rings: HashMap<(usize, usize), Ring>,
     /// `cache = per_kernel`: the L2 range in which each kernel's copies
     /// are placed.
     per_kernel: Option<Range>,
     rec: KernelRec,
 }
+
+/// A slot's output piece buffers (row ops in pieces): the pieces so far
+/// and the store that last read each of the two buffers.
+type Ring = (u64, [Option<Dep>; 2]);
 
 /// A gpc of the run: its Neutrino, its sync range (the `done` of its SMs'
 /// programs) and its SMs (index into the run's SMs, Neutrino).
@@ -409,6 +511,8 @@ type Gpc = (NeutrinoId, Range, Vec<(usize, NeutrinoId)>);
 /// A built run.
 pub struct Run {
     plans: Vec<(String, Plan)>,
+    /// `cache = sim`: the device empties the caches before each kernel.
+    flush: bool,
     pub report: Rc<RefCell<Report>>,
     /// Per gpc: its Neutrino, its sync range, its SMs (index, Neutrino).
     gpcs: Vec<Gpc>,
@@ -458,6 +562,22 @@ fn linear(b: &Built, name: &str) -> Result<Range, String> {
         .filter_map(|l| l.hash.as_ref())
         .find(|h| h.to_range.base <= r.base && r.bound <= h.to_range.bound)
         .map_or(r, |h| h.range))
+}
+
+/// The warp grid (warps_m, warps_n) of a bm x bn block with `warps`
+/// warps: 64 x 64 warp tiles when they make up the warps (CUTLASS sm80),
+/// else the factorization whose warp tile is closest to square; `None`
+/// when no factorization tiles the block evenly.
+fn warp_grid(bm: u64, bn: u64, warps: u64) -> Option<(u64, u64)> {
+    if bm.is_multiple_of(64) && bn.is_multiple_of(64) && (bm / 64) * (bn / 64) == warps {
+        return Some((bm / 64, bn / 64));
+    }
+    (1..=warps)
+        .filter(|&wm| {
+            warps.is_multiple_of(wm) && bm.is_multiple_of(wm) && bn.is_multiple_of(warps / wm)
+        })
+        .min_by_key(|wm| (bm / wm).abs_diff(bn / (warps / wm)))
+        .map(|wm| (wm, warps / wm))
 }
 
 /// Tile (ti, tj) of an R x C matrix tiled by h x w: (offset, rows, cols)
@@ -566,6 +686,7 @@ impl Builder {
         deps: Vec<Dep>,
     ) -> Task {
         Task {
+            kind: Kind::Load,
             desc: Descriptor {
                 opcode: self.dma,
                 pe: Some(pe),
@@ -609,13 +730,16 @@ impl Builder {
         }
         let mut t = self.dma(self.sms[s].dma, src, (dst, len), len, deps);
         t.desc.dst = Range::from_len(at, GRANULE);
+        t.kind = Kind::Store;
         Ok(t)
     }
 
     /// Appends `t` to `tasks` with its version; returns its handle.
     fn push(&mut self, tasks: &mut Vec<Task>, mut t: Task) -> Dep {
         let (addr, version) = self.version(&mut t.desc);
-        t.desc.label = Some(self.index);
+        // kind, layer = the kernel's index, unit = the SM, idx = the CTA.
+        let (cta, sm) = self.cta;
+        t.desc.label = Some(label::label(t.kind, 0, self.index as u32, sm, cta));
         tasks.push(t);
         Dep::Versioned { addr, version }
     }
@@ -623,20 +747,24 @@ impl Builder {
     #[allow(clippy::too_many_arguments)]
     fn matmul(
         &mut self,
-        sm: &Sm,
-        a: u64,
-        b: u64,
-        (c, c_len): (u64, u64),
+        (sm, unit): (&Sm, usize),
+        (a, lda): (u64, u64),
+        (b, ldb): (u64, u64),
+        (c, c_len, ldc): (u64, u64, u64),
         (m, n, k): (u64, u64, u64),
         (dtype, out_dtype): (Dtype, Dtype),
         accumulate: bool,
         keep: bool,
         deps: Vec<Dep>,
     ) -> Result<Task, String> {
-        let atlas = sm.atlas.ok_or_else(|| format!("{}: no atlas", sm.path))?;
+        if sm.atlas.is_empty() {
+            return Err(format!("{}: no atlas", sm.path));
+        }
+        let atlas = sm.atlas[unit % sm.atlas.len()];
         let opcode = self.matmul.ok_or("kernels: no atlas.matmul profile")?;
         self.rec.macs += m * n * k;
         Ok(Task {
+            kind: Kind::Matmul,
             desc: Descriptor {
                 opcode,
                 pe: Some(atlas),
@@ -650,9 +778,9 @@ impl Builder {
                     b: Addr(b),
                     a2: None,
                     b2: None,
-                    lda: k,
-                    ldb: n,
-                    ldc: n,
+                    lda,
+                    ldb,
+                    ldc,
                     m,
                     n,
                     k,
@@ -682,8 +810,13 @@ impl Builder {
     ) -> Result<Task, String> {
         let muon = sm.muon.ok_or_else(|| format!("{}: no muon", sm.path))?;
         let opcode = self.vector.ok_or("kernels: no muon.vector profile")?;
+        // A utilization below 1 charges the lane-ops over it (exclusive
+        // utilization, architecture Section 5.6); the record keeps the work.
         self.rec.lane_ops += ops;
+        let ops = (ops as f64 / self.util).ceil() as u64;
+        self.rec.lane_ops_charged += ops;
         Ok(Task {
+            kind: self.muon_kind,
             desc: Descriptor {
                 opcode,
                 pe: Some(muon),
@@ -708,13 +841,14 @@ impl Builder {
         (sm.smem.base + slot as u64 * size, size)
     }
 
-    /// Checks that a CTA's share of the SM's Atlas accumulator (`acc_buffer
-    /// / ctas_per_sm`) holds the `bytes` it keeps there.
+    /// Checks that a CTA's share of a tensor unit's accumulator
+    /// (`acc_buffer / ctas_per_sm`) holds the `bytes` its warps on that
+    /// unit keep there.
     fn acc_fits(&self, k: &Kernel, bytes: u64, what: &str) -> Result<(), String> {
         let share = self.acc_buffer / k.ctas_per_sm as u64;
         if bytes > share {
             return Err(format!(
-                "{}: {what} of {bytes} B do not fit in the CTA's {share} B of the Atlas accumulator (--acc-buffer {} over {} CTAs per SM)",
+                "{}: {what} of {bytes} B per tensor unit do not fit in the CTA's {share} B of the unit's accumulator (--acc-buffer {} per unit over {} CTAs per SM)",
                 k.name, self.acc_buffer, k.ctas_per_sm
             ));
         }
@@ -725,13 +859,13 @@ impl Builder {
     /// `s`, and the output write it waits for (the CTA two back there).
     /// Without posted outputs: buffer 0, no wait (the slot waits for the
     /// write).
-    fn out_slot(&self, s: usize, slot: usize) -> (usize, Option<Dep>) {
+    fn out_slot(&self, s: usize, slot: usize) -> (usize, Vec<Dep>) {
         if !self.posted {
-            return (0, None);
+            return (0, Vec::new());
         }
         let h = self.outs.get(&(s, slot)).map_or(&[][..], |v| v.as_slice());
         let n = h.len();
-        (n % 2, n.checked_sub(2).map(|i| h[i]))
+        (n % 2, n.checked_sub(2).map_or(Vec::new(), |i| h[i].clone()))
     }
 
     /// A CTA of slot `slot` of SM `s`.
@@ -741,13 +875,13 @@ impl Builder {
         slot: usize,
         tasks: Vec<Task>,
         compute: Vec<Dep>,
-        done: Dep,
+        done: Vec<Dep>,
     ) -> Cta {
-        self.outs.entry((s, slot)).or_default().push(done);
+        self.outs.entry((s, slot)).or_default().push(done.clone());
         Cta {
             tasks,
             compute: compute.into_iter().map(handle).collect(),
-            done: handle(done),
+            done: done.into_iter().map(handle).collect(),
         }
     }
 
@@ -805,9 +939,106 @@ impl Builder {
         Ok(need)
     }
 
+    /// A row op's CTA in pieces (`piece` elements each) on slot `slot` of
+    /// SM `s` (SMEM `[base, base + size)`): rows `r0 .. r0 + rh`. The SMEM
+    /// holds two piece buffers per input and two output piece buffers
+    /// (overlapping, at bases of their own, when they do not fit side by
+    /// side) that the slot's pieces use in turn: piece i's loads go into input
+    /// buffer i mod 2 after piece i - 2's Muon task read it; a piece's
+    /// Muon task writes the slot's next output buffer after the store
+    /// that last read it (of this CTA or the one before); a piece's store
+    /// follows its Muon task.
+    #[allow(clippy::too_many_arguments)]
+    fn row_pieces(
+        &mut self,
+        k: &Kernel,
+        ins: &[usize],
+        out: usize,
+        (s, slot): (usize, usize),
+        (base, size): (u64, u64),
+        r0: u64,
+        rh: u64,
+        es: u64,
+    ) -> Result<Cta, String> {
+        let sm = self.sms[s].clone();
+        let n_in = ins.len() as u64;
+        let pb = (k.piece * es).div_ceil(GRANULE) * GRANULE;
+        let nb = 2 * n_in + 2;
+        // The buffers side by side, or, when they do not fit, at bases
+        // spread over the slot so that each ends inside it (overlapping:
+        // the program models time, not data).
+        let step = if nb * pb <= size {
+            pb
+        } else if pb <= size && (size - pb) / (nb - 1) >= GRANULE {
+            (size - pb) / (nb - 1) / GRANULE * GRANULE
+        } else {
+            return Err(format!(
+                "{}: {nb} piece buffers of {pb} B do not fit in {size} B of SMEM per CTA",
+                k.name
+            ));
+        };
+        let in_at = |x: u64, b: u64| base + (2 * x + b) * step;
+        let out_at = |b: u64| base + (2 * n_in + b) * step;
+        let total = rh * k.cols;
+        let mut tasks = Vec::new();
+        let (mut muons, mut stores): (Vec<Dep>, Vec<Dep>) = (Vec::new(), Vec::new());
+        for i in 0..total.div_ceil(k.piece) {
+            let e0 = i * k.piece;
+            let ne = k.piece.min(total - e0);
+            let (off, len, b) = ((r0 * k.cols + e0) * es, ne * es, i % 2);
+            let war: Vec<Dep> = i
+                .checked_sub(2)
+                .map_or(Vec::new(), |j| vec![muons[j as usize]]);
+            let mut deps = Vec::new();
+            for (x, &t_in) in ins.iter().enumerate() {
+                let src = self.read_at(t_in, off, len)?;
+                let t = self.dma(sm.dma, src, (in_at(x as u64, b), pb), len, war.clone());
+                deps.push(self.push(&mut tasks, t));
+            }
+            let ring = self.rings.entry((s, slot)).or_default();
+            let j = (ring.0 % 2) as usize;
+            ring.0 += 1;
+            deps.extend(ring.1[j]);
+            let t = self.vector(
+                &sm,
+                ne * k.ops_per_elem,
+                in_at(0, b),
+                len * n_in,
+                (out_at(j as u64), pb),
+                len,
+                deps,
+            )?;
+            let m = self.push(&mut tasks, t);
+            muons.push(m);
+            let dst = self.write_at(out, off, len)?;
+            let t = self.store(s, slot, j, out_at(j as u64), dst, len, vec![m])?;
+            let st = self.push(&mut tasks, t);
+            stores.push(st);
+            self.rings.get_mut(&(s, slot)).expect("ring").1[j] = Some(st);
+        }
+        Ok(self.cta(s, slot, tasks, muons, stores))
+    }
+
     /// Plans kernel `k`.
     fn kernel(&mut self, k: &Kernel) -> Result<Plan, String> {
+        for (what, u) in [("simt_util", k.simt_util), ("softmax_util", k.softmax_util)] {
+            if !(u > 0.0 && u <= 1.0) {
+                return Err(format!("{}: {what} {u} is not in (0, 1]", k.name));
+            }
+        }
+        self.util = match k.op.as_str() {
+            "softmax" | "layernorm" | "elementwise" => k.simt_util,
+            "attention" => k.softmax_util,
+            _ => 1.0,
+        };
+        self.rec.simt_util = self.util;
+        self.muon_kind = match k.op.as_str() {
+            "softmax" | "attention" => Kind::Softmax,
+            "layernorm" => Kind::Norm,
+            _ => Kind::Eltwise,
+        };
         self.outs.clear();
+        self.rings.clear();
         if k.ctas_per_sm == 0 {
             return Err(format!("{}: ctas_per_sm is positive", k.name));
         }
@@ -869,11 +1100,33 @@ impl Builder {
                 let b_buf = (k.bk * k.bn * es).div_ceil(GRANULE) * GRANULE;
                 let c_buf = (k.bm * k.bn * es).div_ceil(GRANULE) * GRANULE;
                 let bufs = stages * (a_buf + b_buf);
-                self.acc_fits(k, k.bm * k.bn * es, "the C tile")?;
+                // The CTA's warps (CUTLASS sm80: 64 x 64 warp tiles by
+                // default): warp w covers C rows (w mod warps_m) x wtm and
+                // columns (w div warps_m) x wtn, on tensor unit w mod units.
+                let warps = if k.warps == 0 {
+                    (k.bm * k.bn / 4096).max(1)
+                } else {
+                    k.warps
+                };
+                let (warps_m, warps_n) = warp_grid(k.bm, k.bn, warps).ok_or_else(|| {
+                    format!(
+                        "{}: {warps} warps do not tile a {} x {} block",
+                        k.name, k.bm, k.bn
+                    )
+                })?;
+                let (wtm, wtn) = (k.bm / warps_m, k.bn / warps_n);
+                let units = self.sms[0].atlas.len().max(1) as u64;
+                let w_buf = (wtm * wtn * es).div_ceil(GRANULE) * GRANULE;
+                self.acc_fits(
+                    k,
+                    warps.div_ceil(units) * wtm * wtn * es,
+                    "the warps' C tiles",
+                )?;
                 for sl in 0..split {
                     let (kt0, kt1) = (sl * per_slice, ((sl + 1) * per_slice).min(kt_n));
                     for &(i, j) in &tiles {
                         let (s, slot) = place(&mut n_ctas);
+                        self.cta = ((n_ctas - 1) as u32, s as u32);
                         let sm = self.sms[s].clone();
                         let (base, size) = self.slot(&sm, slot, k.ctas_per_sm);
                         let bases: Vec<u64> = (0..stages)
@@ -908,19 +1161,57 @@ impl Builder {
                                 k.name
                             ));
                         }
+                        // The split-K partial tile: one base for both
+                        // output buffers' CTAs.
+                        let top = c0.max(c1);
+                        let mut p_at = if top + 2 * c_buf <= base + size {
+                            top + c_buf
+                        } else {
+                            base + (size - c_buf) / GRANULE * GRANULE
+                        };
+                        while p_at == c0 || p_at == c1 || bases.contains(&p_at) {
+                            p_at -= GRANULE;
+                        }
+                        // Each warp's C handle, for both output buffers:
+                        // bases of their own, over the C space (the program
+                        // models time, not data).
+                        let mut fixed = bases.clone();
+                        fixed.extend([c0, c1, p_at]);
+                        let mut taken = Vec::new();
+                        let mut handles = [Vec::new(), Vec::new()];
+                        for (par, c) in [c0, c1].into_iter().enumerate() {
+                            for w in 0..warps {
+                                let h = own(c + w * GRANULE, &fixed, &taken);
+                                if h + w_buf > base + size {
+                                    return Err(format!(
+                                        "{}: the warps' C handles do not fit in {size} B of SMEM per CTA",
+                                        k.name
+                                    ));
+                                }
+                                taken.push(h);
+                                handles[par].push(h);
+                            }
+                        }
                         let (parity, two_back) = self.out_slot(s, slot);
                         let c_at = [c0, c1][parity];
                         let mut tasks = Vec::new();
                         let (c_off, tm, tn) = tile(m, n, k.bm, k.bn, i, j);
-                        let mut c_ver: Vec<Dep> = Vec::new();
+                        // Per k-tile: every warp's matmul (None for a warp
+                        // outside an edge tile).
+                        let mut mm: Vec<Vec<Option<Dep>>> = Vec::new();
                         for kt in kt0..kt1 {
                             let x = kt - kt0;
                             let st = x % stages;
                             let a_at = bases[2 * st as usize];
                             let b_at = a_at + a_buf;
-                            // The k-tile x - stages read these buffers.
-                            let war = if x >= stages {
-                                vec![c_ver[(x - stages) as usize]]
+                            // Every warp's matmul of k-tile x - stages read
+                            // these buffers.
+                            let war: Vec<Dep> = if x >= stages {
+                                mm[(x - stages) as usize]
+                                    .iter()
+                                    .flatten()
+                                    .copied()
+                                    .collect()
                             } else {
                                 Vec::new()
                             };
@@ -933,50 +1224,56 @@ impl Builder {
                             let b_src = self.read_at(ins[1], b_off * es, tk * tn * es)?;
                             let t = self.dma(sm.dma, b_src, (b_at, b_buf), tk * tn * es, war);
                             let b_dep = self.push(&mut tasks, t);
-                            let mut deps = vec![a_dep, b_dep];
-                            deps.extend(c_ver.last().copied());
                             let last = kt + 1 == kt1;
-                            // The last matmul writes C: after the write of
-                            // the CTA two back in this slot read the buffer.
-                            if last {
-                                deps.extend(two_back);
+                            let mut row = Vec::new();
+                            for w in 0..warps {
+                                let (r0, c0w) = ((w % warps_m) * wtm, (w / warps_m) * wtn);
+                                if r0 >= tm || c0w >= tn {
+                                    row.push(None);
+                                    continue;
+                                }
+                                let (rows, cols) = (wtm.min(tm - r0), wtn.min(tn - c0w));
+                                let mut deps = vec![a_dep, b_dep];
+                                deps.extend(mm.last().and_then(|p| p[w as usize]));
+                                // The last matmul writes C: after the write
+                                // of the CTA two back in this slot read it.
+                                if last {
+                                    deps.extend(two_back.iter().copied());
+                                }
+                                let t = self.matmul(
+                                    (&sm, w as usize),
+                                    (a_at + r0 * k.bk * es, k.bk),
+                                    (b_at + c0w * es, k.bn),
+                                    (handles[parity][w as usize], w_buf, k.bn),
+                                    (rows, cols, tk),
+                                    (dtype, dtype),
+                                    x > 0,
+                                    !last,
+                                    deps,
+                                )?;
+                                row.push(Some(self.push(&mut tasks, t)));
                             }
-                            let t = self.matmul(
-                                &sm,
-                                a_at,
-                                b_at,
-                                (c_at, c_buf),
-                                (tm, tn, tk),
-                                (dtype, dtype),
-                                x > 0,
-                                !last,
-                                deps,
-                            )?;
-                            let d = self.push(&mut tasks, t);
-                            c_ver.push(d);
+                            mm.push(row);
                         }
-                        let mut c_dep = *c_ver.last().expect("a k-tile");
+                        let mut c_deps: Vec<Dep> = mm
+                            .last()
+                            .expect("a k-tile")
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .collect();
                         let c_bytes = tm * tn * es;
                         if sl > 0 {
                             // The partial tile of slice sl - 1, after it is
-                            // written and after this slice's last matmul: a
-                            // buffer of its own base, which may overlap C's
-                            // space (the program models time, not data).
-                            // One base for both output buffers' CTAs.
-                            let top = c0.max(c1);
-                            let mut p_at = if top + 2 * c_buf <= base + size {
-                                top + c_buf
-                            } else {
-                                base + (size - c_buf) / GRANULE * GRANULE
-                            };
-                            while p_at == c0 || p_at == c1 || bases.contains(&p_at) {
-                                p_at -= GRANULE;
-                            }
+                            // stored and after this slice's last matmuls.
                             let prev = written[&(i, j)];
                             let src = self.read_at(out, c_off * es, c_bytes)?;
-                            let t =
-                                self.dma(sm.dma, src, (p_at, c_buf), c_bytes, vec![c_dep, prev]);
+                            let mut deps = c_deps.clone();
+                            deps.push(prev);
+                            let t = self.dma(sm.dma, src, (p_at, c_buf), c_bytes, deps);
                             let p_dep = self.push(&mut tasks, t);
+                            let mut deps = c_deps.clone();
+                            deps.push(p_dep);
                             let t = self.vector(
                                 &sm,
                                 tm * tn * k.split_ops,
@@ -984,9 +1281,9 @@ impl Builder {
                                 2 * c_bytes,
                                 (c_at, c_buf),
                                 c_bytes,
-                                vec![c_dep, p_dep],
+                                deps,
                             )?;
-                            c_dep = self.push(&mut tasks, t);
+                            c_deps = vec![self.push(&mut tasks, t)];
                         }
                         if k.epilogue_ops > 0 && sl + 1 == split {
                             let t = self.vector(
@@ -996,15 +1293,15 @@ impl Builder {
                                 c_bytes,
                                 (c_at, c_buf),
                                 c_bytes,
-                                vec![c_dep],
+                                c_deps,
                             )?;
-                            c_dep = self.push(&mut tasks, t);
+                            c_deps = vec![self.push(&mut tasks, t)];
                         }
                         let dst = self.write_at(out, c_off * es, c_bytes)?;
-                        let t = self.store(s, slot, parity, c_at, dst, c_bytes, vec![c_dep])?;
+                        let t = self.store(s, slot, parity, c_at, dst, c_bytes, c_deps.clone())?;
                         let done = self.push(&mut tasks, t);
                         written.insert((i, j), done);
-                        per_sm[s].push(self.cta(s, slot, tasks, vec![c_dep], done));
+                        per_sm[s].push(self.cta(s, slot, tasks, c_deps, vec![done]));
                     }
                 }
             }
@@ -1021,6 +1318,7 @@ impl Builder {
                 }
                 for c in 0..k.rows.div_ceil(k.rows_per_cta) {
                     let (s, slot) = place(&mut n_ctas);
+                    self.cta = ((n_ctas - 1) as u32, s as u32);
                     let sm = self.sms[s].clone();
                     let (base, size) = self.slot(&sm, slot, k.ctas_per_sm);
                     let r0 = c * k.rows_per_cta;
@@ -1028,6 +1326,12 @@ impl Builder {
                     let len = rh * k.cols * es;
                     let buf = (k.rows_per_cta * k.cols * es).div_ceil(GRANULE) * GRANULE;
                     let n_in = ins.len() as u64;
+                    if k.piece > 0 {
+                        let cta =
+                            self.row_pieces(k, &ins, out, (s, slot), (base, size), r0, rh, es)?;
+                        per_sm[s].push(cta);
+                        continue;
+                    }
                     if buf * n_in > size {
                         return Err(format!(
                             "{}: {} input tile(s) of {len} B do not fit in {size} B of SMEM per CTA",
@@ -1076,7 +1380,7 @@ impl Builder {
                     let dst = self.write_at(out, r0 * k.cols * es, len)?;
                     let t = self.store(s, slot, parity, ob, dst, len, vec![v])?;
                     let done = self.push(&mut tasks, t);
-                    per_sm[s].push(self.cta(s, slot, tasks, vec![v], done));
+                    per_sm[s].push(self.cta(s, slot, tasks, vec![v], vec![done]));
                 }
             }
             "attention" => {
@@ -1126,11 +1430,14 @@ impl Builder {
                 // the K and V buffers have SMEM of their own. s_in = smem:
                 // S and O in SMEM too, O in the accumulator until the last
                 // KV tile.
+                // Per tensor unit: the warps on it (warp w on unit w mod
+                // units) hold their S and O there.
+                let on_unit = warps.div_ceil(self.sms[0].atlas.len().max(1) as u64);
                 let (total, s_dtype) = if acc {
-                    self.acc_fits(k, k.bq * k.bkv * 4 + k.bq * d * es, "S and O")?;
+                    self.acc_fits(k, on_unit * (wq * k.bkv * 4 + wq * d * es), "S and O")?;
                     (q_buf + kv_space, Dtype::F32)
                 } else {
-                    self.acc_fits(k, k.bq * d * es, "O")?;
+                    self.acc_fits(k, on_unit * wq * d * es, "O")?;
                     (q_buf + kv_space + s_buf + 2 * o_buf, dtype)
                 };
                 for b in 0..bt {
@@ -1138,6 +1445,7 @@ impl Builder {
                         let g = hh / (h / hkv);
                         for qi in 0..sq.div_ceil(k.bq) {
                             let (s, slot) = place(&mut n_ctas);
+                            self.cta = ((n_ctas - 1) as u32, s as u32);
                             let sm = self.sms[s].clone();
                             let (base, size) = self.slot(&sm, slot, k.ctas_per_sm);
                             if total > size {
@@ -1259,10 +1567,10 @@ impl Builder {
                                     let mut deps = vec![q_dep, k_dep];
                                     deps.extend(prev);
                                     let t = self.matmul(
-                                        &sm,
-                                        q_at + r0 * d * es,
-                                        k_at,
-                                        (s_at, p_part),
+                                        (&sm, w),
+                                        (q_at + r0 * d * es, d),
+                                        (k_at, tk),
+                                        (s_at, p_part, tk),
                                         (rows, tk, d),
                                         (dtype, s_dtype),
                                         false,
@@ -1291,13 +1599,13 @@ impl Builder {
                                     // The last P V writes O: after the write
                                     // of the CTA two back in this slot.
                                     if j + 1 == n_kv {
-                                        deps.extend(two_back);
+                                        deps.extend(two_back.iter().copied());
                                     }
                                     let t = self.matmul(
-                                        &sm,
-                                        p_at,
-                                        v_at,
-                                        (o_at, o_part),
+                                        (&sm, w),
+                                        (p_at, tk),
+                                        (v_at, d),
+                                        (o_at, o_part, d),
                                         (rows, d, tk),
                                         (dtype, dtype),
                                         j > 0,
@@ -1317,6 +1625,7 @@ impl Builder {
                             for (w, &o) in last.iter().enumerate() {
                                 let o_at = parts[w].2;
                                 let rows = wq.min(tq - w as u64 * wq);
+                                self.muon_kind = Kind::Rescale;
                                 let t = self.vector(
                                     &sm,
                                     rows * d * k.norm_ops,
@@ -1327,6 +1636,7 @@ impl Builder {
                                     vec![o],
                                 )?;
                                 norms.push(self.push(&mut tasks, t));
+                                self.muon_kind = Kind::Softmax;
                             }
                             let o_bytes = tq * d * es;
                             let dst = self.write_at(out, q_off, o_bytes)?;
@@ -1341,7 +1651,7 @@ impl Builder {
                             )?;
                             let done = self.push(&mut tasks, t);
                             // Compute is done when every warp's normalize is.
-                            per_sm[s].push(self.cta(s, slot, tasks, norms, done));
+                            per_sm[s].push(self.cta(s, slot, tasks, norms, vec![done]));
                         }
                     }
                 }
@@ -1368,14 +1678,18 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
     if all.is_empty() {
         return Err("kernels: no SM (a node with smem and dma)".into());
     }
-    let sms = pick(&all, all.len(), "spread")?;
-    let (first_touch, per_kernel) = match p.cache.as_str() {
-        "first_touch" => (true, false),
-        "home" => (false, false),
-        "per_kernel" => (false, true),
+    let sms = pick(&all, if p.sms == 0 { all.len() } else { p.sms }, "spread")?;
+    if p.kernels.len() > 256 {
+        return Err("kernels: at most 256 kernels (the label's layer field)".into());
+    }
+    let (first_touch, per_kernel, sim_cache) = match p.cache.as_str() {
+        "first_touch" => (true, false, false),
+        "home" => (false, false, false),
+        "per_kernel" => (false, true, false),
+        "sim" => (false, false, true),
         c => {
             return Err(format!(
-                "kernels: unknown cache {c:?} (first_touch, home, per_kernel)"
+                "kernels: unknown cache {c:?} (first_touch, home, per_kernel, sim)"
             ))
         }
     };
@@ -1405,24 +1719,32 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
         tensor_recs: Vec::new(),
         versions: HashMap::new(),
         index: 0,
+        cta: (0, 0),
+        muon_kind: Kind::Vec,
         acc_buffer: sms
             .iter()
-            .filter_map(|s| s.atlas)
+            .flat_map(|s| s.atlas.clone())
             .map(|a| match b.sim.pe_config(a).params {
                 sim_core::PeParams::Atlas { acc_buffer, .. } => acc_buffer,
                 _ => 0,
             })
             .min()
             .unwrap_or(0),
+        util: 1.0,
         posted: p.posted_outputs,
         outs: HashMap::new(),
+        rings: HashMap::new(),
         per_kernel: None,
         rec: KernelRec::default(),
     };
     // Pass 1, with an L2 copy of every tensor (addresses not checked):
     // which tensors are read again or written. Pass 2: L2 copies only for
     // those, placed by lifetime.
-    let (plans, recs, tensor_recs) = if per_kernel {
+    let (plans, recs, tensor_recs) = if sim_cache {
+        // Every tensor at home in the dram range, every access there: the
+        // simulator's cache decides what the L2 holds.
+        plan(&p, base.with(layout(&p, false, true, dram, l2, Some(&[]))?))?
+    } else if per_kernel {
         // Every tensor at home in the dram range; each kernel's L2 copies
         // are placed when it is planned.
         let places = layout(&p, false, per_kernel, dram, l2, Some(&[]))?;
@@ -1475,6 +1797,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
     }));
     Ok(Run {
         plans,
+        flush: sim_cache,
         report,
         gpcs,
         root_sync,
@@ -1495,9 +1818,13 @@ impl Builder {
             names: self.names.clone(),
             versions: HashMap::new(),
             index: 0,
+            cta: (0, 0),
+            muon_kind: Kind::Vec,
             acc_buffer: self.acc_buffer,
+            util: 1.0,
             posted: self.posted,
             outs: HashMap::new(),
+            rings: HashMap::new(),
             per_kernel: None,
             rec: KernelRec::default(),
         }
@@ -1678,8 +2005,8 @@ fn plan(
     Ok((plans, recs, bld.tensor_recs))
 }
 
-/// A CTA in flight on an SM: its compute versions and its output write.
-type OpenCta = (Vec<(u64, u64)>, (u64, u64));
+/// A CTA in flight on an SM: its compute versions and its output writes.
+type OpenCta = (Vec<(u64, u64)>, Vec<(u64, u64)>);
 
 /// One SM's part of a kernel: its CTAs in order, at most `limit` at once.
 /// With posted outputs a slot is free when its CTA's compute is done, and
@@ -1697,17 +2024,19 @@ async fn sm_program(ctx: NuCtx, ctas: Vec<Cta>, limit: usize, posted: bool) {
                     ctx.wait(a, v).await;
                 }
             } else {
-                ctx.wait(done.0, done.1).await;
+                for (a, v) in done {
+                    ctx.wait(a, v).await;
+                }
             }
         }
         for t in cta.tasks {
             ctx.invoke(t.desc).await;
         }
+        dones.push(cta.done.clone());
         open.push_back((cta.compute, cta.done));
-        dones.push(cta.done);
     }
     let tail = if posted { 2 * limit } else { limit };
-    for &(a, v) in &dones[dones.len().saturating_sub(tail)..] {
+    for &(a, v) in dones[dones.len().saturating_sub(tail)..].iter().flatten() {
         ctx.wait(a, v).await;
     }
 }
@@ -1717,6 +2046,13 @@ impl Run {
     /// one on each of its SMs with CTAs, then the barrier.
     pub async fn run(self, ctx: NuCtx) {
         for (ki, (name, plan)) in self.plans.into_iter().enumerate() {
+            // The kernel's gpc and SM program instances carry its name (a
+            // tracer's program bars, asm listings); one leaked string per
+            // kernel of the run.
+            let prog: &'static str = Box::leak(name.clone().into_boxed_str());
+            if self.flush {
+                ctx.cache_flush().await;
+            }
             ctx.mark(&format!("{name} start")).await;
             let start = ctx.now();
             let mut per_sm: Vec<Option<Vec<Cta>>> = plan.per_sm.into_iter().map(Some).collect();
@@ -1740,14 +2076,14 @@ impl Run {
                     for (i, (nu, ctas)) in lists.into_iter().enumerate() {
                         let d = Range::from_len(sync.base + i as u64 * GRANULE, GRANULE);
                         let sm = move |sctx: NuCtx| sm_program(sctx, ctas, limit, posted);
-                        gctx.spawn_named(nu, "kernels_sm", d, vec![], sm).await;
+                        gctx.spawn_named(nu, prog, d, vec![], sm).await;
                         sm_dones.push(d.base);
                     }
                     for d in sm_dones {
                         gctx.wait_unversioned(d).await;
                     }
                 };
-                ctx.spawn_named(*g, "kernels_gpc", done, vec![], gpc).await;
+                ctx.spawn_named(*g, prog, done, vec![], gpc).await;
                 dones.push(done.base);
             }
             for d in dones {

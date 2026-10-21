@@ -16,13 +16,24 @@ pub(crate) enum Kind {
     DmaW = 9,
     DmaAct = 10,
     Join = 11,
+    /// The kernels program's task roles.
+    Load = 12,
+    Store = 13,
+    Matmul = 14,
+    Softmax = 15,
+    Norm = 16,
+    Eltwise = 17,
+    Rescale = 18,
 }
+
+/// The number of kind numbers (0, none, included).
+pub const KINDS: u8 = 19;
 
 /// The tracer name of kind number `k` ("none" for 0, "other" when unknown).
 pub fn kind_name(k: u8) -> &'static str {
-    const NAMES: [&str; 12] = [
+    const NAMES: [&str; KINDS as usize] = [
         "none", "router", "qkv", "attn", "wo", "ffn_gate", "ffn_up", "ffn_down", "vec", "dma_w",
-        "dma_act", "join",
+        "dma_act", "join", "load", "store", "matmul", "softmax", "norm", "eltwise", "rescale",
     ];
     NAMES.get(k as usize).copied().unwrap_or("other")
 }

@@ -12,6 +12,7 @@
 //! * [`stats`]: run outputs.
 //! * [`tracer`]: observation points and the in-memory collector.
 
+pub mod asm;
 pub mod config;
 pub(crate) mod event;
 pub mod func;
@@ -40,6 +41,7 @@ pub use resource::{
     CoCharge, Demand, Dir, DirAmounts, DirSlots, Grant, Kind, LogEntry, PathHop, ResourceId,
     ResourceStats, Resources, SCALE,
 };
+pub use sim::cache::{CacheCounts, CacheFlush, CacheStats};
 pub use sim::{Flow, Sim, MESSAGE_KINDS};
 pub use stats::{
     Blocked, ChunkRec, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats,

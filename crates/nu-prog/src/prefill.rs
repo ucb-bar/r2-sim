@@ -938,6 +938,19 @@ struct Gemm {
     epi_ops: u64,
 }
 
+/// The label kind of matrix `mi` of a GEMM phase `name`: q and kv Qkv, o
+/// Wo, up FfnUp (a gated FFN: matrix 0 is the gate, FfnGate), down FfnDown;
+/// patch_embed and projector are projections, Wo.
+fn gemm_kind(name: &str, gated: bool, mi: usize) -> Kind {
+    match name {
+        "q" | "kv" => Kind::Qkv,
+        "up" if gated && mi == 0 => Kind::FfnGate,
+        "up" => Kind::FfnUp,
+        "down" => Kind::FfnDown,
+        _ => Kind::Wo,
+    }
+}
+
 /// One logged phase.
 #[derive(Debug, Clone, Serialize)]
 pub struct PhaseLog {
@@ -1966,7 +1979,7 @@ impl Driver {
                 let mut deps = asub.clone();
                 deps.push(chain);
                 deps.extend(wsub[mi].iter().copied());
-                let mm = with_deps(mm, &deps, lab(Kind::FfnUp, i));
+                let mm = with_deps(mm, &deps, lab(gemm_kind(gm.name, gm.w2.is_some(), mi), i));
                 self.add(sm, mm);
                 readers.push(Some(out));
                 outs.push(Some(out));
@@ -2063,7 +2076,7 @@ impl Driver {
                 let mut deps = asub.clone();
                 deps.push(chain);
                 deps.extend(wsub[mi].iter().copied());
-                let mm = with_deps(mm, &deps, lab(Kind::FfnUp, i));
+                let mm = with_deps(mm, &deps, lab(gemm_kind(gm.name, gm.w2.is_some(), mi), i));
                 self.add(sm, mm);
                 readers.push(Some(out));
             }

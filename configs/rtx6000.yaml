@@ -26,9 +26,8 @@
 # Not modeled (recorded): the data in flight per GPC, which limits the
 # card's GPC read rate (rtx6000-gpc.yaml); DRAM traffic does not pass
 # through the L2 slice ports (each slice fronts its channels on the card);
-# the GDDR7 channel interleave is a plain 256 B stripe (the card hashes it;
-# unmeasured); a random dependent load from the GDDR7 (the card adds about
-# 550 cycles to an L2 hit); the card's remote SMEM in a cluster (DSMEM);
+# a random dependent load from the GDDR7 (the card adds about 550 cycles to
+# an L2 hit); the card's remote SMEM in a cluster (DSMEM);
 # MIG is off; 192 SMs stand for 188.
 
 global:
@@ -64,11 +63,15 @@ device:
               index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000, 0x1A8000],
               drop: [8, 10, 11, 12, 13, 15]}}
     # The GDDR7 channel interleave: linear [32 GiB, 128 GiB) to 64 channels
-    # of 1.5 GiB at 128 GiB, 256 B per channel in turn (the card hashes the
-    # channel too; unmeasured, so a plain stripe over bits 8 to 13).
+    # of 1.5 GiB at 128 GiB. On the card each L2 slice fronts its own
+    # channels, so a line's channel follows its slice: the L2's measured
+    # slice hash picks the channel too (2026-10-15; before, a plain
+    # 256 B stripe, unmeasured, which put pieces of rows that start on the
+    # same channel group on the same few channels).
     - {name: sbus_to_mbus, topology: link, from: $this.sbus, to: $this.mbus, latency: 0,
        hash: {range: [0x800000000, 0x2000000000], to_range: [0x2000000000, 0x3800000000],
-              index: [0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000]}}
+              index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000, 0x1A8000],
+              drop: [8, 10, 11, 12, 13, 15]}}
   memory:
     # L2: 64 contiguous physical slices (banks) of 2 MiB on the L2 clock,
     # 7/8 of the SM clock (measured 0.874 at the boost lock point). Per L2
@@ -78,8 +81,11 @@ device:
     # sector). Latency 142 SM cycles: the 124 L2 cycles of an L2 hit that
     # scale with the L2 clock (the hit costs 307.5 SM cycles with SM 1.588 /
     # L2 2.068 GHz and 354.0 with 2.614 / 2.286).
+    # Experiment (2026-10-15, sim-core sim::cache): the L2 caches the GDDR7,
+    # 256 B lines (the channel stripe), slice c fronts channel c.
     - {name: l2, type: scratch, addr: [[0x100000000, 0x108000000]], banks: 64,
-       bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, clock: 7/8, latency: 142, slave: $this.l2bus}
+       bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, clock: 7/8, latency: 142, slave: $this.l2bus,
+       cache: {of: $this.hbm, line_bytes: 256}}
     # GDDR7: 96 GiB over 16 devices of 32 bits, each four independent 8-bit
     # channels: 64 channels of 2 B per DRAM cycle (NCU's peak: 128 B per
     # DRAM cycle, 1,709 GB/s) on the DRAM clock, 51/10 of the SM clock

@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 
 use nu_model::{Addr, Range};
-use sim_core::{build_config_file, Args, Built, Descriptor, NuCtx, ProfileRegistry};
+use sim_core::{build_config_file, Args, Built, Descriptor, Dtype, NuCtx, ProfileRegistry};
 
 fn config(name: &str) -> Built {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -230,4 +230,77 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
         "{}",
         s.end_time
     );
+}
+
+/// The ends of two 128 x 128 x 1024 bf16 matmuls invoked together by
+/// gpc0.sm0 of rtx6000-half.yaml on tensor units `units`.
+fn two_matmuls(units: [&str; 2]) -> [u64; 2] {
+    let b = config("rtx6000-half.yaml");
+    let sm = b.nu("root.gpc0.sm0");
+    let smem = b.memory("root.gpc0.sm0.smem").base;
+    let descs: Vec<Descriptor> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| Descriptor {
+            opcode: b.sim.profiles().lookup("atlas.matmul").unwrap(),
+            pe: Some(b.pe(&format!("root.gpc0.sm0.{u}"))),
+            dst: Range::from_len(smem + 0x8000 * i as u64, 0x8000),
+            versioned: false,
+            inferred_version: None,
+            deps: vec![],
+            label: Some(i as u64),
+            args: Args::Matmul {
+                a: Addr(smem),
+                b: Addr(smem),
+                a2: None,
+                b2: None,
+                lda: 1024,
+                ldb: 128,
+                ldc: 128,
+                m: 128,
+                n: 128,
+                k: 1024,
+                in_dtype: Dtype::Bf16,
+                b_dtype: Dtype::Bf16,
+                out_dtype: Dtype::Bf16,
+                accumulate: false,
+                keep: false,
+                tile: [128, 128],
+            },
+        })
+        .collect();
+    let mut sim = b.sim;
+    sim.set_timeline(true);
+    sim.spawn(sm, move |ctx: NuCtx| async move {
+        let mut hs = Vec::new();
+        for d in descs {
+            hs.push(ctx.invoke(d).await.addr);
+        }
+        for h in hs {
+            ctx.wait_unversioned(h).await;
+        }
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let end = |l: u64| {
+        let t = s.tasks.iter().find(|t| t.label == Some(l)).unwrap();
+        t.chunks.last().unwrap().end
+    };
+    [end(0), end(1)]
+}
+
+#[test]
+fn the_tensor_cores_of_an_sm_are_four_units() {
+    // Each sub-partition's unit does 128 bf16 MAC per cycle: one matmul of
+    // 16 Mi MAC takes 131,072 cycles. Two on different units run side by
+    // side; two on one unit take twice as long. (Operands from the SMEM,
+    // 512 KiB at 128 B/cycle, take 4,096 cycles: the units bound it.)
+    let apart = two_matmuls(["atlas0", "atlas1"]);
+    let shared = two_matmuls(["atlas0", "atlas0"]);
+    let t = 128 * 128 * 1024 / 128;
+    for e in apart {
+        assert!(e >= t && e < t + t / 50, "{apart:?}");
+    }
+    let last = *shared.iter().max().unwrap();
+    assert!(last >= 2 * t && last < 2 * t + t / 50, "{shared:?}");
 }

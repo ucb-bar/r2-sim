@@ -16,8 +16,11 @@
 # * smem: the 128 KB L1/shared block at 128 B/cycle in 32 B beats (8 B
 #   loads, ldmatrix and 16 B stores reach 128; 4 B and 16 B loads 64).
 #   Latency 34 cycles (a dependent ld.shared).
-# * atlas: the four tensor cores as one unit, dense MAC per cycle: bf16
-#   512, fp8 1024, fp4 2048 (mma.sync from registers: 511.8, 1023.6, 2047).
+# * atlas0 to atlas3: the four tensor cores, one per sub-partition (a warp
+#   runs on the sub-partition w mod 4), each a quarter of the SM's dense
+#   MAC per cycle: bf16 128, fp8 256, fp4 512 (mma.sync from registers on
+#   all four: 511.8, 1023.6, 2047 per SM). acc_buffer is per unit (the
+#   sub-partition's registers; --acc-buffer sets every unit's).
 # * muon: the 128 CUDA cores as a 128-lane vector unit (125 fp32 FMA per
 #   cycle measured); overhead 20 cycles per task (not measured).
 # * dma: the SM's bulk copy engine (TMA). Latency 289 cycles, the one
@@ -39,7 +42,13 @@ memory:
      slave: [$this.lbus, $this.smsbus]}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 compute:
-  - {name: atlas, type: tensor, rate: {bf16: 512, fp8: 1024, mxfp4: 2048},
+  - {name: atlas0, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
+     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+  - {name: atlas1, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
+     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+  - {name: atlas2, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
+     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+  - {name: atlas3, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
      quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 128}, overhead: 20, master: [$this.lbus, $this.smsbus]}
   - {name: dma, type: dma, latency: 289, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}

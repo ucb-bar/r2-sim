@@ -10,6 +10,7 @@
 //!
 //! Messages, remote dependencies and `spawn_child` are in [`remote`].
 
+pub mod cache;
 mod remote;
 
 use std::cell::{Cell, RefCell};
@@ -296,6 +297,14 @@ pub struct Sim {
     memories: Vec<MemBlock>,
     /// The routing function of transfers, built at the start of the run.
     routes: crate::profile::TransferRoutes,
+    /// The programs' requests, recorded when on (`crate::asm`).
+    asm: Option<crate::asm::Recorder>,
+    /// Cached DRAMs (an experiment; `cache` module).
+    caches: Vec<cache::Cache>,
+    /// By memory block: (cache, channel index) for a cached DRAM channel.
+    cache_of: Vec<Option<(usize, usize)>>,
+    /// Per cache: the DMA engine whose route halves carry write-backs.
+    cache_wb: Vec<PeId>,
     /// The hops of the transfer chunk being reserved (kept across chunks).
     hop_buf: Vec<PathHop>,
 
@@ -370,6 +379,10 @@ impl Sim {
             res: Resources::new(),
             memories: Vec::new(),
             routes: Default::default(),
+            asm: None,
+            caches: Vec::new(),
+            cache_of: Vec::new(),
+            cache_wb: Vec::new(),
             hop_buf: Vec::new(),
             hashes: Vec::new(),
             profiles,
@@ -930,6 +943,25 @@ impl Sim {
         self.memories.push(mem);
     }
 
+    /// Makes the blocks `slices` a cache of the DRAM blocks `channels`
+    /// with lines of `line` bytes (the `cache` module).
+    pub(crate) fn add_cache(
+        &mut self,
+        name: String,
+        line: u64,
+        slices: Vec<usize>,
+        channels: Vec<usize>,
+    ) {
+        let size = self.memories[slices[0]].range.len();
+        self.caches.push(cache::Cache::new(cache::CacheConfig {
+            name,
+            line,
+            slices,
+            channels,
+            capacity: size / line,
+        }));
+    }
+
     /// Adds the address rewrite of fabric link `link` (Section 3.1), whose
     /// node `owner` owns its linear range.
     pub fn add_hash(&mut self, link: usize, owner: NeutrinoId, numeric: bool, hash: AddressHash) {
@@ -982,6 +1014,13 @@ impl Sim {
         self.spawn_named(nu, "main", program);
     }
 
+    /// Records every program's requests from now on (an assembly-style
+    /// listing per program instance in `Stats::asm`; `crate::asm`). Call it
+    /// before spawning the programs to list. Off by default.
+    pub fn set_asm(&mut self, on: bool) {
+        self.asm = on.then(Default::default);
+    }
+
     /// [`Sim::spawn`] with a program name for a tracer.
     pub fn spawn_named(
         &mut self,
@@ -1007,6 +1046,9 @@ impl Sim {
         n.prog_name = name;
         n.state = ProgState::Busy;
         let now = self.now;
+        if let Some(a) = self.asm.as_mut() {
+            a.start(nu, name, None, now);
+        }
         trace!(self, t => t.entries_clear(nu, Table::Versions, now));
         trace!(self, t => t.program_start(nu, name, None, now));
         self.queue.push(self.now, Event::NuResume(nu));
@@ -1027,6 +1069,7 @@ impl Sim {
         let hashes: Vec<&AddressHash> = self.hashes.iter().map(|h| &h.hash).collect();
         self.routes =
             crate::profile::TransferRoutes::build(&pes, &self.memories, &hashes, &self.topo);
+        self.setup_caches();
         self.livelock = self.livelock_cycles.unwrap_or_else(|| {
             let t_retry = self.nus.iter().map(|n| n.cfg.t_retry).max().unwrap_or(0);
             10 * t_retry + self.topo.max_latency()
@@ -1145,6 +1188,8 @@ impl Sim {
         self.stats.end_time = self.now;
         self.stats.resources = self.res.stats();
         self.stats.func_ops = self.func_seq;
+        self.stats.caches = self.caches.iter().map(|c| c.stats()).collect();
+        self.stats.asm = self.asm.take().map(|a| a.listings).unwrap_or_default();
         let t = std::mem::take(&mut self.ticket_stats);
         self.stats.tickets = t.tickets;
         self.stats.ticket_rejects = t.rejects;
@@ -1255,6 +1300,9 @@ impl Sim {
     /// an invoke or a spawn, the descriptor's assembly (`c_desc`) and then
     /// its issue.
     fn start_request(&mut self, nu: NeutrinoId, req: Request) {
+        if let Some(a) = self.asm.as_mut() {
+            a.op(nu, self.now, &req);
+        }
         let n = &self.nus[nu.0 as usize];
         let c = &n.cfg.costs;
         let desc = match &req {
@@ -1273,7 +1321,7 @@ impl Sim {
             Request::Load { .. } => c.load,
             Request::Store { .. } => c.store,
             Request::Spawn { .. } => c.spawn,
-            Request::Mark(_) => 0,
+            Request::Mark(_) | Request::CacheFlush => 0,
         };
         // An invoke's cost is its task's (trace-raw 1.6), named by the
         // call's number until the task has a gid.
@@ -1479,6 +1527,13 @@ impl Sim {
                 self.respond(nu, Response::Done);
             }
             Request::Cycles(_) => self.respond(nu, Response::Done),
+            Request::CacheFlush => {
+                let now = self.now;
+                for c in &mut self.caches {
+                    c.flush(now);
+                }
+                self.respond(nu, Response::Done)
+            }
             Request::Mark(name) => {
                 if let Some(mut t) = self.tracer.take() {
                     let res = &self.res;
@@ -2190,7 +2245,11 @@ impl Sim {
                     topology: &self.topo,
                     acc,
                 };
-                let prof = self.profiles.profile(&n.rec(t).desc, &node);
+                let mut prof = self.profiles.profile(&n.rec(t).desc, &node);
+                if !self.caches.is_empty() {
+                    let desc = self.nus[nu.0 as usize].rec(t).desc.clone();
+                    self.cache_chunks(pe, &desc, &mut prof);
+                }
                 self.nus[nu.0 as usize].rec_mut(t).profile = Some(prof);
             }
             let holds = self.nus[nu.0 as usize]

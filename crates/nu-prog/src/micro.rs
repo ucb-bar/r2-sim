@@ -12,7 +12,9 @@
 //!   another node's memory is a pull by its owner's engine.
 //! * `latency`: one transfer of `bytes` from `mem` into the first SM's
 //!   SMEM.
-//! * `atlas`: one matmul (`m`, `n`, `k`, `dtype`) per SM, operands in SMEM.
+//! * `atlas`: one matmul (`m`, `n`, `k`, `dtype`) per tensor unit of each
+//!   SM (one per sub-partition when the SM has `atlas0`, `atlas1`, ...),
+//!   operands in SMEM; the rate is the SM's over all its units.
 //! * `muon`: one vector task (`lane_ops`, `bytes` read, `bytes_out`
 //!   written) per SM.
 //! * `pingpong`: two SMs (`pair = same_gpc | other_gpc`); `rounds` round
@@ -123,7 +125,9 @@ pub(crate) struct Sm {
     pub(crate) nu: NeutrinoId,
     pub(crate) gpc: usize,
     pub(crate) dma: PeId,
-    pub(crate) atlas: Option<PeId>,
+    /// The tensor units: `atlas`, or `atlas0`, `atlas1`, ... (one per
+    /// sub-partition).
+    pub(crate) atlas: Vec<PeId>,
     pub(crate) muon: Option<PeId>,
     pub(crate) smem: Range,
 }
@@ -207,7 +211,12 @@ pub(crate) fn sms_of(b: &Built) -> Vec<Sm> {
         };
         let gpc = topo.node(nu).parent.map_or(0, |p| p.0 as usize);
         out.push(Sm {
-            atlas: b.try_pe(&format!("{path}.atlas")),
+            atlas: match b.try_pe(&format!("{path}.atlas")) {
+                Some(a) => vec![a],
+                None => (0..)
+                    .map_while(|i| b.try_pe(&format!("{path}.atlas{i}")))
+                    .collect(),
+            },
             muon: b.try_pe(&format!("{path}.muon")),
             path,
             nu,
@@ -461,41 +470,54 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
         "atlas" | "muon" => {
             sms = pick(&all, p.sms, &p.placement)?;
             for (j, s) in sms.iter().enumerate() {
-                let desc = if p.mode == "atlas" {
+                // atlas: one matmul per tensor unit, each with its own C in
+                // the SMEM; muon: one vector task.
+                let mut descs = Vec::new();
+                if p.mode == "atlas" {
                     let d = parse_dtype(&p.dtype)?;
-                    let c = p.m * p.n * Dtype::Bf16.bytes();
-                    if c > s.smem.len() {
-                        return Err(format!("{}: C of {c} B exceeds its SMEM", s.path));
+                    if s.atlas.is_empty() {
+                        return Err(format!("{}: no atlas", s.path));
                     }
-                    Descriptor {
-                        opcode: op("atlas.matmul")?,
-                        pe: Some(s.atlas.ok_or_else(|| format!("{}: no atlas", s.path))?),
-                        dst: dst_range(s.smem.base, c),
-                        versioned: true,
-                        inferred_version: None,
-                        deps: Vec::new(),
-                        label: None,
-                        args: Args::Matmul {
-                            a: Addr(s.smem.base),
-                            b: Addr(s.smem.base),
-                            a2: None,
-                            b2: None,
-                            lda: p.k,
-                            ldb: p.n,
-                            ldc: p.n,
-                            m: p.m,
-                            n: p.n,
-                            k: p.k,
-                            in_dtype: d,
-                            b_dtype: d,
-                            out_dtype: Dtype::Bf16,
-                            accumulate: false,
-                            keep: false,
-                            tile: p.tile,
-                        },
+                    let c = p.m * p.n * Dtype::Bf16.bytes();
+                    let slot = c.div_ceil(GRANULE) * GRANULE;
+                    if slot * s.atlas.len() as u64 > s.smem.len() {
+                        return Err(format!(
+                            "{}: C of {c} B for each of {} tensor units exceeds its SMEM",
+                            s.path,
+                            s.atlas.len()
+                        ));
+                    }
+                    for (u, &unit) in s.atlas.iter().enumerate() {
+                        descs.push(Descriptor {
+                            opcode: op("atlas.matmul")?,
+                            pe: Some(unit),
+                            dst: dst_range(s.smem.base + u as u64 * slot, c),
+                            versioned: true,
+                            inferred_version: None,
+                            deps: Vec::new(),
+                            label: None,
+                            args: Args::Matmul {
+                                a: Addr(s.smem.base),
+                                b: Addr(s.smem.base),
+                                a2: None,
+                                b2: None,
+                                lda: p.k,
+                                ldb: p.n,
+                                ldc: p.n,
+                                m: p.m,
+                                n: p.n,
+                                k: p.k,
+                                in_dtype: d,
+                                b_dtype: d,
+                                out_dtype: Dtype::Bf16,
+                                accumulate: false,
+                                keep: false,
+                                tile: p.tile,
+                            },
+                        });
                     }
                 } else {
-                    Descriptor {
+                    descs.push(Descriptor {
                         opcode: op("muon.vector")?,
                         pe: Some(s.muon.ok_or_else(|| format!("{}: no muon", s.path))?),
                         dst: dst_range(s.smem.base, p.bytes_out),
@@ -509,24 +531,26 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             bytes_out: p.bytes_out,
                             src: None,
                         },
-                    }
-                };
+                    });
+                }
                 let bytes = if p.mode == "muon" {
                     p.bytes + p.bytes_out
                 } else {
                     0
                 };
-                push(
-                    &mut items,
-                    &mut metas,
-                    desc,
-                    j,
-                    Meta {
-                        role: Role::Data,
-                        sm: j,
-                        bytes,
-                    },
-                );
+                for desc in descs {
+                    push(
+                        &mut items,
+                        &mut metas,
+                        desc,
+                        j,
+                        Meta {
+                            role: Role::Data,
+                            sm: j,
+                            bytes,
+                        },
+                    );
+                }
             }
         }
         "pingpong" => {
@@ -775,6 +799,10 @@ impl Run {
     }
 }
 
+/// An SM's tasks in `result`: first chunk start, last chunk end, task
+/// count, and each task's invoke to completion.
+type Span = (u64, u64, u64, Vec<u64>);
+
 /// The measured quantities of the run (the `micro` object of `--stats`);
 /// `stats` needs the task timeline.
 pub fn result(r: &Report, stats: &Stats) -> Value {
@@ -853,27 +881,41 @@ pub fn result(r: &Report, stats: &Stats) -> Value {
             }
         }
         "atlas" | "muon" => {
-            let mut rows = Vec::new();
+            // Per SM: the span from its first chunk start to its last chunk
+            // end over its tasks (atlas: one per tensor unit).
+            let mut per: Vec<Option<Span>> = vec![None; r.sms.len()];
             for &(i, m) in &data {
                 let Some(t) = task(i) else { continue };
                 let (Some(s), Some(e)) = (first_start(t), last_end(t)) else {
                     continue;
                 };
+                let ic = t.complete.map(|c| c - t.invoke);
+                let q = per[m.sm].get_or_insert((u64::MAX, 0, 0, Vec::new()));
+                q.0 = q.0.min(s);
+                q.1 = q.1.max(e);
+                q.2 += 1;
+                q.3.extend(ic);
+            }
+            let mut rows = Vec::new();
+            for (j, x) in per.iter().enumerate() {
+                let Some((s, e, n, ics)) = x else { continue };
                 let cycles = e - s;
-                let sm = &r.sms[m.sm];
+                let sm = &r.sms[j];
                 let port = res.get(format!("{}.smem.port", sm.path).as_str());
                 let share = port.map(|x| {
-                    // The port's lane-cycles over the task's window.
+                    // The port's lane-cycles over the SM's window.
                     x.busy_slot_cycles / (x.slots.max(1e-9) * cycles.max(1) as f64)
                 });
                 let mut row = json!({
                     "sm": sm.path,
+                    "tasks": n,
                     "cycles": cycles,
-                    "invoke_to_complete": t.complete.map(|c| c - t.invoke),
+                    "invoke_to_complete": ics.iter().max(),
                     "smem_port_share": share,
                 });
                 if p.mode == "atlas" {
-                    row["mac_per_cycle"] = json!((p.m * p.n * p.k) as f64 / cycles.max(1) as f64);
+                    row["mac_per_cycle"] =
+                        json!((n * p.m * p.n * p.k) as f64 / cycles.max(1) as f64);
                 }
                 rows.push(row);
             }

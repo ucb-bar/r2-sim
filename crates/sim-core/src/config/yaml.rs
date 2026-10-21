@@ -78,6 +78,10 @@
 //!   `beat_bytes` and `block_bytes` are per bank, and `bank: {b<i>:
 //!   {...}}` overrides them for one bank (an override PATH
 //!   `<mem>.b<i>.<key>` or `<mem>.b*.<key>` writes there).
+//! * a scratch memory: `cache: {of: <dram memory>, line_bytes: L}` (an
+//!   experiment, `sim::cache`): its banks (slices) cache that DRAM; DRAM
+//!   bank (channel) c is cached by slice c mod slices, in lines of L
+//!   bytes (default 256), each slice holding its bank's bytes / L lines.
 //! * links: `hash: {range, to_range, index, drop}` (Section 3.1), ranges
 //!   in the node's own space. The node owns `range` (the linear range
 //!   programs address); a transfer to it is rewritten onto `to_range`,
@@ -563,6 +567,17 @@ struct MemSec {
     /// Per-bank overrides, by bank name (`b0`, `b1`, ...).
     #[serde(default)]
     bank: HashMap<String, BankSec>,
+    /// This scratch memory caches a DRAM (an experiment; `sim::cache`).
+    cache: Option<CacheKeySec>,
+}
+
+/// `cache: {of: <dram>, line_bytes: L}` on a scratch memory.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheKeySec {
+    of: String,
+    /// Line size in bytes (default 256), a power of two.
+    line_bytes: Option<u64>,
 }
 
 /// The keys of one bank that can differ from the memory's.
@@ -985,6 +1000,8 @@ struct Builder {
     built: Built,
     buses: HashMap<String, BusId>,
     mems: Vec<PendingMem>,
+    /// `cache` keys: (caching memory, cached DRAM, line bytes).
+    cache_keys: Vec<(String, String, u64)>,
     caches: Vec<PendingCache>,
     /// Sync ranges for the layout, in node order.
     syncs: Vec<MemInfo>,
@@ -1045,6 +1062,7 @@ impl Builder {
             },
             buses: HashMap::new(),
             mems: Vec::new(),
+            cache_keys: Vec::new(),
             caches: Vec::new(),
             syncs: Vec::new(),
             scratch_ports: Vec::new(),
@@ -1186,6 +1204,48 @@ impl Builder {
                 latency: block.load_latency,
             });
             self.built.sim.add_memory(block);
+        }
+        for (name, of, line) in std::mem::take(&mut self.cache_keys) {
+            // The blocks of a memory: the memory, or its banks in order.
+            let blocks_of = |m: &str| -> Vec<usize> {
+                let mut v: Vec<(u64, usize)> = self
+                    .built
+                    .sim
+                    .memories()
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, b)| {
+                        if b.name == m {
+                            return Some((0, i));
+                        }
+                        let k = b.name.strip_prefix(m)?.strip_prefix(".b")?.parse().ok()?;
+                        Some((k, i))
+                    })
+                    .collect();
+                v.sort();
+                v.into_iter().map(|x| x.1).collect()
+            };
+            let (slices, channels) = (blocks_of(&name), blocks_of(&of));
+            let dram = self.built.layout.memories.iter().any(|m| {
+                m.kind == "dram" && (m.path == of || m.path.starts_with(&format!("{of}.b")))
+            });
+            if channels.is_empty() || !dram {
+                return err(format!(
+                    "{name}: cache of {of:?}, which is not a dram memory"
+                ));
+            }
+            let sizes = |v: &[usize]| -> Vec<u64> {
+                v.iter()
+                    .map(|&i| self.built.sim.memories()[i].range.len())
+                    .collect()
+            };
+            let ss = sizes(&slices);
+            if ss.iter().any(|&x| x != ss[0] || x % line != 0) {
+                return err(format!(
+                    "{name}: its banks are not equal multiples of line_bytes"
+                ));
+            }
+            self.built.sim.add_cache(name, line, slices, channels);
         }
         let blocks = self.built.layout.memories.len();
         for (l, c) in cache_links {
@@ -1540,6 +1600,19 @@ impl Builder {
         for m in &sec.memory {
             let name = format!("{path}.{}", m.name);
             let banked = m.banks.is_some() || !m.bank.is_empty();
+            if let Some(c) = &m.cache {
+                if m.kind != "scratch" {
+                    return err(format!("{name}: only a scratch memory caches a DRAM"));
+                }
+                let line = c.line_bytes.unwrap_or(256);
+                if !line.is_power_of_two() {
+                    return err(format!(
+                        "{name}: cache line_bytes {line} is not a power of two"
+                    ));
+                }
+                self.cache_keys
+                    .push((name.clone(), resolve(&c.of, path, ppath)?, line));
+            }
             if m.kind == "sync" {
                 if banked || m.wr_bytes.is_some() || m.block_bytes.is_some() {
                     return err(format!("{name}: a sync range has no banks or ports"));

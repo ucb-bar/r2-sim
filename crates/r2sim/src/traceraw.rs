@@ -2008,7 +2008,9 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             (stem.to_string(), Value::Array(l))
         })
         .collect();
-    let kinds: Vec<&str> = (0..12).map(nu_prog::label::kind_name).collect();
+    let kinds: Vec<&str> = (0..nu_prog::label::KINDS)
+        .map(nu_prog::label::kind_name)
+        .collect();
     json!({
         "format": "r2raw",
         "version": [1, 7],

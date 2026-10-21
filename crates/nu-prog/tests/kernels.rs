@@ -359,7 +359,7 @@ fn attention_holds_s_and_o_in_the_accumulator_by_default() {
         .err()
         .expect("error");
     assert!(
-        e.contains("S and O of 81920 B do not fit in the CTA's 65536 B"),
+        e.contains("S and O of 81920 B per tensor unit do not fit in the CTA's 65536 B"),
         "{e}"
     );
     let l = nu_prog::launch("kernels", &b, 512, ATT, &[]).expect("launch");
@@ -388,7 +388,7 @@ fn attention_holds_s_and_o_in_the_accumulator_by_default() {
 #[test]
 fn a_kernel_starts_after_every_cta_of_the_one_before() {
     // softmax, then layernorm on its output; tasks carry their kernel's
-    // index as the label.
+    // index as the label's layer field.
     let (s, r) = run(r#"
 tensors = [
   {name = "x", bytes = 65536},
@@ -413,7 +413,11 @@ cols = 256
     let (k0, k1) = (&r.kernels[0], &r.kernels[1]);
     assert_eq!((k0.ctas, k1.ctas), (128, 128));
     assert!(k1.start >= k0.end);
-    let of = |l: u64| s.tasks.iter().filter(move |t| t.label == Some(l));
+    let of = |l: u32| {
+        s.tasks
+            .iter()
+            .filter(move |t| t.label.map(|x| nu_prog::label::split(x).2) == Some(l))
+    };
     assert!(of(0).all(|t| t.complete.unwrap() <= k0.end));
     assert!(of(1).all(|t| t.invoke >= k0.end));
     assert_eq!(of(1).count(), 128 * 3);
@@ -526,4 +530,93 @@ warps = {warps}
     assert_eq!(old.kernels[0].lane_ops, w4.kernels[0].lane_ops);
     assert!(fa2.end < old.end, "{} vs {}", fa2.end, old.end);
     assert!(w4.end < fa2.end, "{} vs {}", w4.end, fa2.end);
+}
+
+/// One layernorm row of 8192 bf16 on rtx6000-half.yaml, with the extra
+/// kernel keys `extra`.
+fn one_row(extra: &str) -> (Stats, Report) {
+    run(&format!(
+        r#"
+tensors = [
+  {{name = "x", bytes = 16384}},
+  {{name = "y", bytes = 16384}},
+]
+[[kernels]]
+name = "ln"
+op = "layernorm"
+inputs = ["x"]
+output = "y"
+rows = 1
+cols = 8192
+ops_per_elem = 8
+{extra}
+"#
+    ))
+}
+
+/// The SM tasks of a run with opcode `name`, by issue.
+fn of_opcode<'a>(s: &'a Stats, name: &str) -> Vec<&'a sim_core::TaskTimeline> {
+    let op = ProfileRegistry::with_builtins().lookup(name).unwrap();
+    let mut v: Vec<&sim_core::TaskTimeline> = s
+        .tasks
+        .iter()
+        .filter(|t| t.opcode == op && t.nu != nu_model::NeutrinoId(0))
+        .collect();
+    v.sort_by_key(|t| t.issue);
+    v
+}
+
+#[test]
+fn a_row_in_pieces_starts_its_muon_before_the_row_has_arrived() {
+    // piece 0 is the whole row (as before pieces): one load, one Muon
+    // task after it. Pieces of 2048 elements: 4 loads, 4 Muon tasks and 4
+    // stores; the first Muon task starts before the last load ends.
+    let (whole, rw) = one_row("");
+    let (zero, rz) = one_row("piece = 0");
+    assert_eq!(whole.end_time, zero.end_time);
+    assert_eq!(rw.kernels[0].lane_ops, rz.kernels[0].lane_ops);
+    let (s, r) = one_row("piece = 2048");
+    let (dmas, muons) = (of_opcode(&s, "dma"), of_opcode(&s, "muon.vector"));
+    assert_eq!((dmas.len(), muons.len()), (8, 4), "4 loads and 4 stores");
+    assert_eq!(r.kernels[0].lane_ops, rw.kernels[0].lane_ops);
+    // Without pieces the Muon task waits for the whole row's load; with
+    // them the first starts before that load would have ended.
+    let (wl, wm) = (of_opcode(&whole, "dma"), of_opcode(&whole, "muon.vector"));
+    let row_arrived = wl[0].complete.unwrap();
+    assert!(wm[0].issue.unwrap() >= row_arrived);
+    assert!(muons[0].issue.unwrap() < row_arrived);
+    assert!(s.end_time < whole.end_time);
+}
+
+#[test]
+fn simt_util_scales_a_muon_tasks_lane_ops() {
+    // simt_util 0.5 doubles the charged lane-ops and an isolated Muon
+    // task's time; the report keeps the work.
+    let span = |s: &Stats| {
+        let m = of_opcode(s, "muon.vector")[0];
+        m.chunks.last().unwrap().end - m.chunks[0].start
+    };
+    let (full, rf) = one_row("");
+    let (half, rh) = one_row("simt_util = 0.5");
+    let (kf, kh) = (&rf.kernels[0], &rh.kernels[0]);
+    assert_eq!(kf.lane_ops, kh.lane_ops);
+    assert_eq!(kh.lane_ops_charged, 2 * kf.lane_ops_charged);
+    assert_eq!(kh.simt_util, 0.5);
+    assert_eq!(span(&half), 2 * span(&full));
+    for bad in ["simt_util = 0.0", "simt_util = 1.5"] {
+        let b = build_config_file::<&str>(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../configs/rtx6000-half.yaml"),
+            &[],
+            ProfileRegistry::with_builtins(),
+        )
+        .unwrap();
+        let p = format!(
+            "tensors = [{{name = \"x\", bytes = 16384}}, {{name = \"y\", bytes = 16384}}]\n[[kernels]]\nname = \"ln\"\nop = \"layernorm\"\ninputs = [\"x\"]\noutput = \"y\"\nrows = 1\ncols = 8192\n{bad}\n"
+        );
+        let e = nu_prog::launch("kernels", &b, 512, &p, &[])
+            .err()
+            .expect("error");
+        assert!(e.contains("simt_util"), "{e}");
+    }
 }

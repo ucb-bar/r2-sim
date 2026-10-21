@@ -29,10 +29,13 @@ device:
        hash: {range: [0x0, 0x4000000], to_range: [0x100000000, 0x104000000],
               index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000],
               drop: [8, 10, 11, 12, 13]}}
-    # 8 channels of 6 GiB: linear [32 GiB, 80 GiB) to physical at 128 GiB.
+    # 32 channels of 1.5 GiB: linear [32 GiB, 80 GiB) to physical at
+    # 128 GiB. A line's channel follows its slice, as in rtx6000.yaml: the
+    # slice hash above picks the channel too (2026-10-15).
     - {name: sbus_to_mbus, topology: link, from: $this.sbus, to: $this.mbus, latency: 0,
        hash: {range: [0x800000000, 0x1400000000], to_range: [0x2000000000, 0x2C00000000],
-              index: [0x100, 0x200, 0x400, 0x800, 0x1000]}}
+              index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000],
+              drop: [8, 10, 11, 12, 13]}}
   memory:
     - {name: l2, type: scratch, addr: [[0x100000000, 0x104000000]], banks: 32,
        bw_bytes: 64, wr_bytes: 32, beat_bytes: 32, clock: 7/8, latency: 142, slave: $this.l2bus}

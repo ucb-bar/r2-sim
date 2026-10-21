@@ -88,6 +88,8 @@ pub(crate) enum Request {
     /// A named point in time: records the resource totals when marks are on
     /// (phase-scoped statistics). Costs nothing.
     Mark(String),
+    /// Empties every cache with no traffic (the `cache` experiment).
+    CacheFlush,
     /// `spawn_child`; the program travels in the mailbox.
     Spawn {
         child: NeutrinoId,
@@ -291,6 +293,13 @@ impl NuCtx {
     /// ([`crate::Sim::set_marks`]); no cost.
     pub async fn mark(&self, name: &str) {
         self.call(Request::Mark(name.to_string())).await;
+    }
+
+    /// Empties every cache of the run with no traffic and no cost (a
+    /// measurement tool's flush outside the measured time; the `cache`
+    /// experiment of `sim::cache`). Records the caches' counters.
+    pub async fn cache_flush(&self) {
+        self.call(Request::CacheFlush).await;
     }
 
     fn call(&self, req: Request) -> Call {
