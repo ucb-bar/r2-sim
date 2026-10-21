@@ -31,7 +31,7 @@
 # MIG is off; 192 SMs stand for 188.
 
 global:
-  neutrino_granule: 512
+  neutrino_granule: 128     # warp tiles with 128 B rows (2026-10-21)
   clock_ghz: 2.617
   msg_bytes: 64
   flow: readyvalid

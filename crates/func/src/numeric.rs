@@ -61,7 +61,7 @@ impl Numeric {
             Args::Join | Args::Spawn { .. } | Args::Vector { .. } => Ok(()),
             &Args::Dma {
                 src, dst, bytes, ..
-            } => self.mem.dma(&desc.dst, src.0, dst.0, bytes),
+            } => self.mem.dma(&desc.held(), src.0, dst.0, bytes),
             &Args::Matmul {
                 a,
                 b,
@@ -87,8 +87,11 @@ impl Numeric {
                 }
                 let c = desc.dst.base;
                 let es = out_dtype.bytes();
-                let c_span = if m == 0 { 0 } else { ((m - 1) * ldc + n) * es };
-                check_in_dst(&desc.dst, &Range::from_len(c, c_span))?;
+                // Each row of C, against the masked dst.
+                for r in 0..m {
+                    let row = Range::from_len(c + r * ldc * es, n * es);
+                    check_in_dst(&desc.held(), self.mem.granule(), &row)?;
+                }
                 let es_a = in_dtype.bytes();
                 let av = match a2 {
                     None => self.read_matrix(a.0, m, k, lda, in_dtype)?,
@@ -171,8 +174,8 @@ fn encode(v: &[f32], dt: Dtype) -> Vec<u8> {
 }
 
 impl FunctionalBackend for Numeric {
-    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range]) {
-        self.mem.configure(memories, sync_only);
+    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64) {
+        self.mem.configure(memories, sync_only, granule);
     }
 
     fn has_data(&self) -> bool {

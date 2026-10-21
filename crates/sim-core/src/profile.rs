@@ -169,6 +169,10 @@ pub struct Descriptor {
     /// it, and only a fence or the program's return waits for it. Its
     /// invoke returns no handle ([`crate::NuCtx::invoke_untracked`]).
     pub untracked: bool,
+    /// The granules of `dst` the task holds, as in Rocket's address sets
+    /// (2026-10-21): granule `dst.base / g + i` belongs to the range when
+    /// `i & !dst_mask == 0`; [`nu_model::FULL_MASK`] holds the whole span.
+    pub dst_mask: u32,
     /// Simulator check, not hardware state: the version the program infers
     /// for this invoke. In debug builds the owner compares it with the
     /// version it assigns and stops the run on a mismatch.
@@ -191,6 +195,7 @@ impl Descriptor {
             dst,
             versioned: false,
             untracked: false,
+            dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             deps,
             label: None,
@@ -208,6 +213,21 @@ impl Descriptor {
     pub fn versioned(mut self) -> Self {
         self.versioned = true;
         self
+    }
+
+    /// Sets the mask of `dst` (in granules; [`nu_model::FULL_MASK`]: the
+    /// whole span).
+    pub fn with_mask(mut self, mask: u32) -> Self {
+        self.dst_mask = mask;
+        self
+    }
+
+    /// The masked destination range.
+    pub fn held(&self) -> nu_model::Dst {
+        nu_model::Dst {
+            span: self.dst,
+            mask: self.dst_mask,
+        }
     }
 
     /// Marks the task as untracked; invoke it with
@@ -1311,6 +1331,7 @@ device:
                 dst: Range::from_len(dst, bytes),
                 versioned: false,
                 untracked: false,
+                dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 deps: vec![],
                 label: None,

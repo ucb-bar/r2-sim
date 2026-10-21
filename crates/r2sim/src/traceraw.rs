@@ -4,7 +4,11 @@
 //! (1.8: a forwarded VersionReset has an inbound_invokes entry that ends
 //! when it takes effect at the head of the owner's table, and the version
 //! entry it frees ends then; a task record has `flags`, bit 0 untracked,
-//! and is 112 B; no dependency names an untracked task as producer).
+//! and is 112 B; no dependency names an untracked task as producer) and
+//! 1.9 (`dst_mask` in place of the task record's `pad`: the mask of the
+//! destination range in granules; all ones for a plain range).
+//! A dependency's unversioned producer holds the granule of its address
+//! under the producer's mask.
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -82,7 +86,7 @@ const TASKS: &[(&str, &str)] = &[
     ("queued", "u64"),
     ("sent", "u64"),
     ("flags", "u32"),
-    ("pad", "u32"),
+    ("dst_mask", "u32"),
 ];
 const CHUNKS: &[(&str, &str)] = &[
     ("gid", "u32"),
@@ -479,6 +483,8 @@ struct OpenTask {
     sent: Option<Cycle>,
     /// Bit 0: untracked (1.8).
     flags: u32,
+    /// The mask of `dst` in granules (1.9).
+    dst_mask: u32,
     /// Resolved deps kept until the task's retire decides the window.
     parked: u32,
     /// Its invoke call (source Neutrino, number), when it has one: the key
@@ -558,8 +564,10 @@ pub struct RawTracer {
     tasks: IdMap<u64, OpenTask>,
     /// Producer of (base, version).
     versioned: IdMap<(u64, u64), u64>,
-    /// Latest unversioned writer by `dst` base: (end, gid).
-    unversioned: BTreeMap<u64, (u64, u64)>,
+    /// Latest unversioned writer by `dst` base: (end, gid, mask).
+    unversioned: BTreeMap<u64, (u64, u64, u32)>,
+    /// The Neutrino granule (the unit of a `dst` mask).
+    granule: u64,
     max_unversioned: u64,
     deps: Vec<OpenDep>,
     free: Vec<u32>,
@@ -732,6 +740,7 @@ impl RawTracer {
             tasks: IdMap::default(),
             versioned: IdMap::default(),
             unversioned: BTreeMap::new(),
+            granule: run.granule.max(1),
             max_unversioned: 0,
             deps: Vec::new(),
             free: Vec::new(),
@@ -825,7 +834,7 @@ impl RawTracer {
             .u64(o64(t.queued))
             .u64(o64(t.sent))
             .u32(t.flags)
-            .u32(0);
+            .u32(t.dst_mask);
         self.emit(T_TASKS, r.done());
     }
 
@@ -1092,10 +1101,18 @@ impl RawTracer {
             Dep::Versioned { addr, version } => self.versioned.get(&(addr, version)).copied(),
             Dep::Unversioned(a) => {
                 let lo = a.saturating_sub(self.max_unversioned);
+                let g = self.granule;
                 self.unversioned
                     .range(lo..=a)
-                    .filter(|(_, &(end, _))| end > a)
-                    .map(|(_, &(_, gid))| gid)
+                    .filter(|(&base, &(end, _, mask))| {
+                        end > a
+                            && nu_model::Dst {
+                                span: nu_model::Range::new(base, end),
+                                mask,
+                            }
+                            .holds(g, a)
+                    })
+                    .map(|(_, &(_, gid, _))| gid)
                     .max()
             }
         }
@@ -1120,7 +1137,7 @@ impl RawTracer {
 
     /// Task `gid` writes `key`: deps that wait on a pending entry of it
     /// now wait for its completion.
-    fn adopt(&mut self, gid: u64, versioned: Option<(u64, u64)>, dst: (u64, u64)) {
+    fn adopt(&mut self, gid: u64, versioned: Option<(u64, u64)>, dst: nu_model::Dst) {
         let mut adopted: Vec<u32> = Vec::new();
         match versioned {
             Some(_) if self.pending_v.is_empty() => {}
@@ -1133,10 +1150,10 @@ impl RawTracer {
             }
             None if self.pending_u.is_empty() => {}
             None => {
-                let deps = &self.deps;
+                let (deps, g) = (&self.deps, self.granule);
                 self.pending_u.retain(|&i| {
                     let a = deps[i as usize].key.addr();
-                    let hit = a >= dst.0 && a < dst.1;
+                    let hit = dst.holds(g, a);
                     if hit {
                         adopted.push(i);
                     }
@@ -1175,6 +1192,7 @@ impl Tracer for RawTracer {
             queued: e.call.queued,
             sent: e.call.sent,
             flags: d.untracked as u32 * UNTRACKED,
+            dst_mask: d.dst_mask,
             parked: NONE,
             call_key: None,
         };
@@ -1220,11 +1238,12 @@ impl Tracer for RawTracer {
                     self.versioned.insert(k, e.gid);
                 }
                 None => {
-                    self.unversioned.insert(d.dst.base, (d.dst.bound, e.gid));
+                    self.unversioned
+                        .insert(d.dst.base, (d.dst.bound, e.gid, d.dst_mask));
                     self.max_unversioned = self.max_unversioned.max(d.dst.len());
                 }
             }
-            self.adopt(e.gid, vkey, (d.dst.base, d.dst.bound));
+            self.adopt(e.gid, vkey, d.held());
         }
         // Its dependencies, when it can be kept.
         self.last_remote.clear();
@@ -2029,7 +2048,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         .collect();
     json!({
         "format": "r2raw",
-        "version": [1, 8],
+        "version": [1, 9],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

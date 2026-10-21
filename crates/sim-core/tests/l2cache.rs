@@ -65,6 +65,7 @@ fn run(steps: &[Step]) -> Stats {
                 dst: Range::from_len(dst, bytes.div_ceil(512) * 512),
                 versioned: false,
                 untracked: false,
+                dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 deps: vec![],
                 label: Some(i as u64),

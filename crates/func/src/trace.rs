@@ -102,8 +102,8 @@ impl Trace {
 }
 
 impl FunctionalBackend for Trace {
-    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range]) {
-        self.mem.configure(memories, sync_only);
+    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64) {
+        self.mem.configure(memories, sync_only, granule);
     }
 
     fn has_data(&self) -> bool {
@@ -118,7 +118,7 @@ impl FunctionalBackend for Trace {
                     src, dst, bytes, ..
                 } = desc.args
                 {
-                    return self.mem.dma(&desc.dst, src.0, dst.0, bytes);
+                    return self.mem.dma(&desc.held(), src.0, dst.0, bytes);
                 }
                 let Some(data) = desc.label.and_then(|l| self.records.get(&l)) else {
                     return Ok(());

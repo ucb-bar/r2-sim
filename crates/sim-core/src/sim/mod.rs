@@ -1113,7 +1113,8 @@ impl Sim {
                 ..MemBlock::plain(String::new(), h.owner, h.hash.range, ResourceId(0), 0)
             });
         }
-        backend.configure(&stores, &self.sync_only);
+        let granule = self.nus.first().map_or(1, |n| n.tables.config().granule);
+        backend.configure(&stores, &self.sync_only, granule);
         for (addr, bytes) in std::mem::take(&mut self.init) {
             if let Err(e) = backend.write(addr, &bytes) {
                 panic!("init_memory at {:#x}: {}", addr.0, e.0);
@@ -1205,7 +1206,20 @@ impl Sim {
             self.deadlock(NeutrinoId(0));
         }
         self.stats.stages = self.stage_stats();
-        let (joined, backend) = self.plane.take().expect("functional plane").finish();
+        let (joined, late, backend) = self.plane.take().expect("functional plane").finish();
+        // An op that failed after the last look at the worker (2026-10-21:
+        // such an error was lost).
+        if let Some(e) = late {
+            self.set_fatal(Fatal {
+                time: e.time,
+                nu: e.nu,
+                gid: e.gid,
+                error: FatalError::Func {
+                    seq: e.seq,
+                    msg: e.error.0,
+                },
+            });
+        }
         if let Err(msg) = joined {
             self.set_fatal(Fatal {
                 time: self.now,
@@ -1625,6 +1639,7 @@ impl Sim {
                     dst: done,
                     versioned: false,
                     untracked: false,
+                    dst_mask: nu_model::FULL_MASK,
                     inferred_version: None,
                     deps,
                     label: None,
@@ -1980,6 +1995,7 @@ impl Sim {
             dst: desc.dst,
             versioned: desc.versioned,
             untracked: desc.untracked,
+            mask: desc.dst_mask,
             deps: local,
         };
         // Debug check of the program's inference (Section 3.3): invokes of
@@ -2553,14 +2569,18 @@ impl Sim {
         let n = &mut self.nus[nu.0 as usize];
         let (gid, seq, dst) = {
             let rec = n.rec(t);
-            (rec.gid, rec.seq, rec.desc.dst)
+            (rec.gid, rec.seq, rec.desc.held())
         };
+        let granule = n.tables.config().granule;
         let holds = std::mem::take(&mut n.rec_mut(t).holds);
         let fx = n.tables.complete(t);
         let now = self.now;
         trace!(self, t => t.task_complete(gid, now));
         if self.track_writers {
-            self.writers.insert(dst, seq, Some(gid));
+            // The granules it holds, run by run.
+            for r in dst.runs(granule) {
+                self.writers.insert(r, seq, Some(gid));
+            }
         }
         let mut retry = Vec::new();
         for h in holds {

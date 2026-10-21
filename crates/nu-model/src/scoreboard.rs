@@ -32,6 +32,7 @@
 use std::collections::HashMap;
 
 use crate::addr::Range;
+use crate::dst::{Dst, FULL_MASK};
 use crate::remote::Awaiter;
 use crate::slab::Slab;
 
@@ -114,6 +115,9 @@ pub struct TaskSpec {
     pub dst: Range,
     /// `dst` is versioned: the tables assign the next version of its base.
     pub versioned: bool,
+    /// The granules of `dst` the task holds ([`FULL_MASK`]: all; Neutrino
+    /// spec, granules and destination ranges).
+    pub mask: u32,
     /// An untracked task (Section 3.2, untracked tasks): no version, no
     /// lookup finds it, it adopts and supersedes nothing, and it retires at
     /// completion. The tables count it until it retires (the fence).
@@ -128,6 +132,7 @@ impl TaskSpec {
         Self {
             dst,
             versioned: false,
+            mask: FULL_MASK,
             untracked: false,
             deps,
         }
@@ -138,8 +143,23 @@ impl TaskSpec {
         Self {
             dst,
             versioned: true,
+            mask: FULL_MASK,
             untracked: false,
             deps,
+        }
+    }
+
+    /// The same task with the mask `mask`.
+    pub fn with_mask(mut self, mask: u32) -> Self {
+        self.mask = mask;
+        self
+    }
+
+    /// The masked destination range.
+    pub fn dst(&self) -> Dst {
+        Dst {
+            span: self.dst,
+            mask: self.mask,
         }
     }
 
@@ -148,6 +168,7 @@ impl TaskSpec {
         Self {
             dst,
             versioned: false,
+            mask: FULL_MASK,
             untracked: true,
             deps,
         }
@@ -180,7 +201,11 @@ pub struct DepConfig {
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepError {
-    /// Not aligned to the granule, or empty.
+    /// A destination range that holds no granule (bound 0; the spec's
+    /// error `Empty`).
+    Empty(Range),
+    /// A destination range whose ends are not multiples of the granule.
+    /// r2-sim only: the spec's ranges are in granules.
     Misaligned(Range),
     /// A dependency of the invoked task resolves to a pending entry that
     /// the task itself would adopt: the task would wait on itself.
@@ -190,8 +215,8 @@ pub enum DepError {
         /// The `dst` of the invoked task.
         dst: Range,
     },
-    /// Two live versioned ranges share a base address with different
-    /// bounds.
+    /// Two live versioned ranges share a base address with a different
+    /// bound or mask.
     BaseConflict {
         /// The shared base address.
         base: u64,
@@ -199,6 +224,10 @@ pub enum DepError {
         bound: u64,
         /// The bound of the new range.
         new_bound: u64,
+        /// The mask on record.
+        mask: u32,
+        /// The mask of the new range.
+        new_mask: u32,
     },
     /// The version an invoke gets is still held by a task in the tables
     /// (the range was released while its producer was in flight, then
@@ -327,6 +356,8 @@ enum Waiter {
 #[derive(Debug, Clone)]
 struct Task {
     dst: Range,
+    /// The granules of `dst` it holds.
+    mask: u32,
     /// The version of a versioned `dst`.
     version: Option<u64>,
     phase: Phase,
@@ -346,13 +377,14 @@ struct PendingEntry {
     waiters: Vec<Waiter>,
 }
 
-/// One versioned base address: the version counter. The bound of the range
-/// is a simulator check (two live ranges with one base and different
-/// bounds are a software error); it is not hardware state.
+/// One versioned base address: the version counter. The bound and mask of
+/// the range are a simulator check (two live ranges with one base and a
+/// different bound or mask are a software error); they are not hardware
+/// state.
 #[derive(Debug, Clone, Copy)]
 struct VersionEntry {
     counter: u64,
-    bound: Option<u64>,
+    bound: Option<(u64, u32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -520,7 +552,7 @@ impl DepTables {
     ) -> impl Iterator<Item = (TaskId, Phase, Range)> + 'a {
         self.tasks
             .iter()
-            .filter(|(_, t)| t.dst.overlaps(range))
+            .filter(|(_, t)| t.held().overlaps(self.cfg.granule, range))
             .map(|(i, t)| (TaskId(i as u32), t.phase, t.dst))
     }
 
@@ -532,7 +564,7 @@ impl DepTables {
         self.tasks
             .iter()
             .filter(|(_, t)| {
-                t.version.is_none() && !t.untracked && t.dst.base <= addr && addr < t.dst.bound
+                t.version.is_none() && !t.untracked && t.held().holds(self.cfg.granule, addr)
             })
             .map(|(i, _)| Tag::Task(TaskId(i as u32)))
             .collect()
@@ -612,13 +644,16 @@ impl DepTables {
             return Ok(None);
         }
         let addr = spec.dst.base;
+        let mask = spec.dst().canonical_mask(self.cfg.granule);
         let v = match self.versions.get(&addr) {
             Some(e) => {
-                if let Some(bound) = e.bound.filter(|b| *b != spec.dst.bound) {
+                if let Some((bound, m)) = e.bound.filter(|b| *b != (spec.dst.bound, mask)) {
                     return Err(DepError::BaseConflict {
                         base: addr,
                         bound,
                         new_bound: spec.dst.bound,
+                        mask: m,
+                        new_mask: mask,
                     });
                 }
                 e.counter + 1
@@ -661,7 +696,7 @@ impl DepTables {
                 _ if spec.untracked => false,
                 _ if Some(*d) == own_key => true,
                 Dep::Unversioned(a) if version.is_none() => {
-                    spec.dst.base <= a && a < spec.dst.bound && self.covers(a).is_empty()
+                    spec.dst().holds(self.cfg.granule, a) && self.covers(a).is_empty()
                 }
                 _ => false,
             };
@@ -686,7 +721,7 @@ impl DepTables {
         }
         let mut adopt = Vec::new();
         for (i, p) in self.pending.iter() {
-            if !spec.untracked && adopts(&spec.dst, own_key, &p.key) {
+            if !spec.untracked && adopts(&spec.dst(), self.cfg.granule, own_key, &p.key) {
                 adopt.push(i);
             }
         }
@@ -697,7 +732,11 @@ impl DepTables {
         let supersede = if version.is_none() && !spec.untracked {
             self.tasks
                 .iter()
-                .filter(|(_, t)| t.version.is_none() && !t.untracked && spec.dst.covers(&t.dst))
+                .filter(|(_, t)| {
+                    t.version.is_none()
+                        && !t.untracked
+                        && spec.dst().covers(self.cfg.granule, &t.held())
+                })
                 .map(|(i, _)| TaskId(i as u32))
                 .collect()
         } else {
@@ -726,6 +765,7 @@ impl DepTables {
         self.next_seq += 1;
         let task = TaskId(self.tasks.insert(Task {
             dst: spec.dst,
+            mask: spec.mask,
             version,
             phase: Phase::Scoreboard,
             depcount: external_deps,
@@ -738,11 +778,12 @@ impl DepTables {
         self.untracked_len += spec.untracked as usize;
         self.scoreboard_peak = self.scoreboard_peak.max(self.scoreboard_len);
         if let Some(v) = version {
+            let mask = spec.dst().canonical_mask(self.cfg.granule);
             self.versions.insert(
                 spec.dst.base,
                 VersionEntry {
                     counter: v,
-                    bound: Some(spec.dst.bound),
+                    bound: Some((spec.dst.bound, mask)),
                 },
             );
             self.version_peak = self.version_peak.max(self.versions.len());
@@ -1130,21 +1171,33 @@ impl DepTables {
     }
 
     fn check_range(&self, r: &Range) -> Result<(), DepError> {
-        if !r.is_empty() && r.is_aligned(self.cfg.granule) {
-            Ok(())
-        } else {
+        if r.is_empty() {
+            Err(DepError::Empty(*r))
+        } else if !r.is_aligned(self.cfg.granule) {
             Err(DepError::Misaligned(*r))
+        } else {
+            Ok(())
         }
     }
 }
 
 /// True when an invoke of `dst` (with key `own` if versioned) adopts the
 /// pending key `key`: the same versioned key, or an unversioned address
-/// inside an unversioned `dst`.
-fn adopts(dst: &Range, own: Option<Dep>, key: &Dep) -> bool {
+/// whose granule an unversioned `dst` holds.
+fn adopts(dst: &Dst, g: u64, own: Option<Dep>, key: &Dep) -> bool {
     match (own, key) {
         (Some(own), _) => own == *key,
         (None, Dep::Versioned { .. }) => false,
-        (None, Dep::Unversioned(a)) => dst.base <= *a && *a < dst.bound,
+        (None, Dep::Unversioned(a)) => dst.holds(g, *a),
+    }
+}
+
+impl Task {
+    /// The granules the task holds.
+    fn held(&self) -> Dst {
+        Dst {
+            span: self.dst,
+            mask: self.mask,
+        }
     }
 }

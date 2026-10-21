@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use nu_model::Range;
+use nu_model::{Dst, Range};
 use sim_core::{FuncError, MemBlock};
 
 const PAGE: u64 = 1 << 16;
@@ -20,6 +20,8 @@ struct Block {
 pub(crate) struct Memory {
     blocks: Vec<Block>,
     sync_only: Vec<Range>,
+    /// The Neutrino granule: the unit of a destination range's mask.
+    granule: u64,
 }
 
 pub(crate) fn err<T>(msg: String) -> Result<T, FuncError> {
@@ -27,7 +29,8 @@ pub(crate) fn err<T>(msg: String) -> Result<T, FuncError> {
 }
 
 impl Memory {
-    pub fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range]) {
+    pub fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64) {
+        self.granule = granule.max(1);
         // One store per range (a block may be listed twice).
         self.blocks = Vec::new();
         for m in memories {
@@ -113,14 +116,8 @@ impl Memory {
 impl Memory {
     /// The DMA of a task with dst `task_dst`: `bytes` from `src` to `dst`.
     /// A copy from a `null`-fidelity block copies nothing.
-    pub fn dma(
-        &mut self,
-        task_dst: &Range,
-        src: u64,
-        dst: u64,
-        bytes: u64,
-    ) -> Result<(), FuncError> {
-        check_in_dst(task_dst, &Range::from_len(dst, bytes))?;
+    pub fn dma(&mut self, task_dst: &Dst, src: u64, dst: u64, bytes: u64) -> Result<(), FuncError> {
+        check_in_dst(task_dst, self.granule(), &Range::from_len(dst, bytes))?;
         if self.is_null(&Range::from_len(src, bytes)) {
             return Ok(());
         }
@@ -129,11 +126,26 @@ impl Memory {
     }
 }
 
-/// Checks that a task writes only inside its `dst`.
-pub(crate) fn check_in_dst(dst: &Range, written: &Range) -> Result<(), FuncError> {
-    if written.is_empty() || dst.covers(written) {
+impl Memory {
+    /// The Neutrino granule.
+    pub fn granule(&self) -> u64 {
+        self.granule.max(1)
+    }
+}
+
+/// Checks that a task writes only granules that its masked `dst` holds.
+pub(crate) fn check_in_dst(dst: &Dst, granule: u64, written: &Range) -> Result<(), FuncError> {
+    if dst.covers_bytes(granule, written) {
         Ok(())
+    } else if dst.mask == nu_model::FULL_MASK {
+        err(format!(
+            "task writes {written} outside its dst {}",
+            dst.span
+        ))
     } else {
-        err(format!("task writes {written} outside its dst {dst}"))
+        err(format!(
+            "task writes {written} outside its dst {} with mask {:#x}",
+            dst.span, dst.mask
+        ))
     }
 }

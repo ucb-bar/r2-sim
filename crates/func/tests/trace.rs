@@ -15,6 +15,7 @@ fn trace(records: Records) -> Trace {
             0,
         )],
         &[],
+        512,
     );
     t
 }
@@ -38,6 +39,7 @@ fn task(label: Option<u64>, dst: Range) -> Descriptor {
         label,
         versioned: true,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         args: Args::Vector {
             ops: 1,
@@ -92,6 +94,7 @@ fn dma_copies_bytes() {
         label: None,
         versioned: true,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         args: Args::Dma {
             src: Addr(0x100),

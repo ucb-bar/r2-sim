@@ -60,9 +60,10 @@ pub struct FuncError(pub String);
 
 /// A functional backend. It runs on the worker thread.
 pub trait FunctionalBackend: Send {
-    /// Called once before the run with the memory blocks and the
-    /// sync-only ranges.
-    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range]);
+    /// Called once before the run with the memory blocks, the sync-only
+    /// ranges and the Neutrino granule (the unit of a destination range's
+    /// mask).
+    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64);
     /// False for a backend that keeps no data; the simulator then runs it
     /// without a worker thread and a load is an error.
     fn has_data(&self) -> bool;
@@ -80,7 +81,7 @@ pub trait FunctionalBackend: Send {
 pub struct NullBackend;
 
 impl FunctionalBackend for NullBackend {
-    fn configure(&mut self, _: &[MemBlock], _: &[Range]) {}
+    fn configure(&mut self, _: &[MemBlock], _: &[Range], _: u64) {}
 
     fn has_data(&self) -> bool {
         false
@@ -264,22 +265,32 @@ impl FuncPlane {
 
     /// Stops the worker after it has applied every queued op (or at once
     /// after an error) and returns the backend. `Err` carries a worker
-    /// panic message.
-    pub fn finish(self) -> (Result<(), String>, Option<Box<dyn FunctionalBackend>>) {
+    /// panic message; the second item is the error of an op that failed
+    /// after the timing plane last looked (an op after the last load).
+    #[allow(clippy::type_complexity)]
+    pub fn finish(
+        self,
+    ) -> (
+        Result<(), String>,
+        Option<WorkerError>,
+        Option<Box<dyn FunctionalBackend>>,
+    ) {
         match self {
-            FuncPlane::Inline(b) => (Ok(()), Some(b)),
+            FuncPlane::Inline(b) => (Ok(()), None, Some(b)),
             FuncPlane::Worker { shared, handle, .. } => {
                 lock(&shared).closed = true;
                 shared.to_worker.notify_one();
-                match handle.join() {
-                    Ok(b) => (Ok(()), Some(b)),
+                let joined = handle.join();
+                let error = lock(&shared).error.clone();
+                match joined {
+                    Ok(b) => (Ok(()), error, Some(b)),
                     Err(p) => {
                         let msg = p
                             .downcast_ref::<String>()
                             .cloned()
                             .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
                             .unwrap_or_else(|| "unknown panic".into());
-                        (Err(msg), None)
+                        (Err(msg), error, None)
                     }
                 }
             }

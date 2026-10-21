@@ -369,7 +369,13 @@ fn run(argv: &[String]) -> Result<(), String> {
     for w in &b.warnings {
         eprintln!("r2sim: warning: {}: {w}", cfg_path.display());
     }
-    let granule = 512;
+    // The Neutrino granule of the configuration (512 B on the 2p family,
+    // 128 B on rtx6000 since 2026-10-21).
+    let granule = b
+        .sim
+        .neutrino_config(nu_model::NeutrinoId(0))
+        .tables
+        .granule;
     let records = match (&a.trace, a.synthetic) {
         (Some(p), None) => func::load_trace(p).map_err(|e| e.0)?,
         (None, Some(seed)) => {

@@ -64,6 +64,7 @@ fn run_some(b: Built, dma: bool, store: bool) -> (u64, Stats) {
         dst: Range::from_len(smem, 4096),
         versioned: false,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         deps: vec![],
         label: Some(0),

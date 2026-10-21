@@ -1,6 +1,6 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.8; older versions read
+The format is r2-vis's `trace-raw.md` (version 1.9; older versions read
 as that document says). The checks are the ones of its Section 8, plus
 the file layout:
 
@@ -9,6 +9,11 @@ the file layout:
   records, and the counts match `summary.json`;
 * untracked tasks (version 1.8, `tasks.flags` bit 0): `version`, `queued`
   and `sent` are null, and no dependency record names one as producer;
+* destination ranges (version 1.9): `dst_base` and `dst_len` are
+  multiples of the run's granule and `dst_len` is at least one granule;
+  `dst_mask` is the mask in granules (a 1.8 or older dump reads as all
+  ones: plain ranges); the number of masked (not all ones) ranges is
+  printed;
 * in a complete dump (`filters.partial` false), every gid in chunks,
   deps, charges and programs.spawn has a task record;
 * on a resource with a rate, the slots held at any cycle (version 1.7: a
@@ -173,6 +178,26 @@ def check_gids(r: Report, manifest: dict, recs: dict) -> None:
         if stem in recs:
             n = missing(recs[stem][field].astype(np.uint64))
             r.check(n == 0, f"{stem}.{field}: {n} gids without a task record")
+
+
+def dst_mask(t: np.ndarray) -> np.ndarray:
+    """The tasks' `dst_mask` (1.9); all ones before."""
+    if "dst_mask" in t.dtype.names:
+        return t["dst_mask"]
+    return np.full(len(t), NULL32, dtype=np.uint32)
+
+
+def check_dst(r: Report, manifest: dict, recs: dict) -> None:
+    t = recs["tasks"]
+    if manifest["version"] < [1, 9]:
+        print("skip  destination ranges in granules (before 1.9)")
+        return
+    g = int(manifest["run"]["granule"])
+    ok = (t["dst_base"] % g == 0) & (t["dst_len"] % g == 0) & (t["dst_len"] >= g)
+    r.check(bool(ok.all()),
+            f"tasks: {int(np.count_nonzero(~ok))} of {len(t)} dst not whole granules of {g} B")
+    masked = int(np.count_nonzero(dst_mask(t) != NULL32))
+    print(f"info  tasks: {masked} masked destination ranges")
 
 
 def check_untracked(r: Report, recs: dict) -> None:
@@ -622,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
     check_layouts(r, manifest, recs, summary)
     check_gids(r, manifest, recs)
     check_untracked(r, recs)
+    check_dst(r, manifest, recs)
     check_charges(r, manifest, recs, stats)
     check_entries(r, manifest, recs)
     check_hashes(r, manifest)

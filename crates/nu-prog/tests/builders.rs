@@ -249,6 +249,7 @@ fn matmul(b: &Built, pe: &str, c: nu_model::Range, n: u64, deps: Vec<nu_model::D
         dst: c,
         versioned: true,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         deps,
         label: None,

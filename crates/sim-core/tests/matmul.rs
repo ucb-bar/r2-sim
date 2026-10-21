@@ -215,7 +215,9 @@ fn same_base_different_bound_is_fatal() {
         FatalError::Dep(DepError::BaseConflict {
             base: smem(0, 1).base,
             bound: smem(0, KB8).bound,
-            new_bound: smem(0, 4096).bound
+            new_bound: smem(0, 4096).bound,
+            mask: nu_model::FULL_MASK,
+            new_mask: nu_model::FULL_MASK,
         })
     );
 }

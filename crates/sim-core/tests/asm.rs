@@ -49,6 +49,7 @@ fn a_descriptor_prints_as_one_instruction() {
         dst: Range::from_len(smem + 0x400, 0x800),
         versioned: true,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: Some(3),
         deps: vec![
             Dep::Versioned {
@@ -77,6 +78,7 @@ fn a_descriptor_prints_as_one_instruction() {
         dst: Range::from_len(smem + 0x8000, 0x2000),
         versioned: true,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -165,6 +167,7 @@ fn an_untracked_task_and_the_fence_print_their_syntax() {
         dst: Range::from_len(hbm + 0x800, 0x200),
         versioned: false,
         untracked: true,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -192,4 +195,21 @@ fn an_untracked_task_and_the_fence_print_their_syntax() {
         .map(|l| l.split(';').next().unwrap().trim())
         .collect();
     assert_eq!(lines, [".program root.sm0 store", want, "wait 0"]);
+}
+
+#[test]
+fn a_masked_range_prints_its_mask() {
+    // `/0x<mask>` after the range when the mask is not all ones; nothing
+    // for a plain range.
+    let b = built();
+    let sym = Symbols::from_built(&b);
+    let smem = b.memory("root.sm0.smem").base;
+    let mut d = Descriptor::join(Range::from_len(smem + 0x400, 0x800), vec![]);
+    assert_eq!(sym.task(&d), "join dst=root.sm0.smem+0x400:0x800 deps=[]");
+    d = d.with_mask(0x2).versioned();
+    d.inferred_version = Some(1);
+    assert_eq!(
+        sym.task(&d),
+        "join dst=root.sm0.smem+0x400:0x800/0x2@v1 deps=[]"
+    );
 }

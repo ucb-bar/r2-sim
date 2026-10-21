@@ -355,7 +355,7 @@ fn trace_raw_flags_untracked_tasks() {
         } else {
             tracked += 1;
         }
-        assert_eq!(u32_at(r, 108), 0, "pad");
+        assert_eq!(u32_at(r, 108), u32::MAX, "dst_mask: a plain range");
     }
     // 8 DMA tasks; 2 joins and 4 spawns.
     assert_eq!((untracked, tracked), (8, 6));

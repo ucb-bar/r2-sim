@@ -29,6 +29,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
         dst: c,
         versioned: true,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: Some(1),
         deps,
         label: None,

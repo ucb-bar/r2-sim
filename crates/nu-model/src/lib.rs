@@ -12,11 +12,13 @@
 //!   protocol and the owner-side `await` handler.
 
 pub mod addr;
+pub mod dst;
 pub mod remote;
 pub mod scoreboard;
 mod slab;
 
 pub use addr::{Addr, AddressHash, AddressSet, NeutrinoId, OwnerMap, Range};
+pub use dst::{Dst, FULL_MASK};
 pub use remote::{
     handle_await, AckAction, AwaitAck, AwaitMsg, Awaiter, OutboundDeps, OutboundDepsFull, Purpose,
     RequestId,

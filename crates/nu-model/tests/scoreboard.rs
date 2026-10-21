@@ -429,7 +429,9 @@ fn same_base_different_bound_is_an_error() {
         DepError::BaseConflict {
             base: 0,
             bound: 4 * G,
-            new_bound: 2 * G
+            new_bound: 2 * G,
+            mask: nu_model::FULL_MASK,
+            new_mask: nu_model::FULL_MASK,
         }
     );
 }
@@ -468,4 +470,118 @@ fn program_return_keeps_the_version_table() {
     assert_eq!(tb.versions_len(), 1);
     assert_eq!(tb.complete(p).retired, vec![p]);
     assert_eq!(tb.invoke(tv(a, &[]), 0).unwrap().version, Some(2));
+}
+
+// ---- masked destination ranges (2026-10-21) ----
+
+/// An unversioned task on `dst` with mask `mask`.
+fn tm(dst: Range, mask: u32, deps: &[u64]) -> TaskSpec {
+    t(dst, deps).with_mask(mask)
+}
+
+#[test]
+fn a_lookup_of_a_granule_in_a_gap_does_not_bind() {
+    // U holds granules 0 and 2 of its span of 4 (mask 0b10). A wait on
+    // granule 1 finds no producer (a new pending entry); a wait on
+    // granule 2 waits for U.
+    let mut tb = tables();
+    let u = run(&mut tb, tm(r(0, 4), 0b10, &[]));
+    let (gap, fx) = tb.wait(Dep::Unversioned(at(1) + 7)).unwrap();
+    assert_eq!(fx.pending_created.len(), 1);
+    let (held, _) = tb.wait(Dep::Unversioned(at(2))).unwrap();
+    let (WaitStatus::Pending(gap), WaitStatus::Pending(held)) = (gap, held) else {
+        panic!("both wait")
+    };
+    let fx = tb.complete(u);
+    assert_eq!(fx.waits_done, vec![held]);
+    assert!(!fx.waits_done.contains(&gap));
+}
+
+#[test]
+fn the_warp_handles_of_the_spec_are_independent_chains() {
+    // The warp-tile example: four handles of 128 granules with mask 0x7e
+    // at c, c + 1, c + 128 and c + 129. Versioned: each v2 waits for its
+    // own v1 only. Unversioned: a key of warp 1 binds warp 1 only.
+    let mut tb = DepTables::new(cfg(16, 16, 8));
+    let c = 1024;
+    let h: Vec<Range> = [0, 1, 128, 129].iter().map(|o| r(c + o, 128)).collect();
+    let v1: Vec<TaskId> = h
+        .iter()
+        .map(|d| run(&mut tb, tv(*d, &[]).with_mask(0x7e)))
+        .collect();
+    let v2: Vec<TaskId> = h
+        .iter()
+        .map(|d| {
+            let inv = tb.invoke(tv(*d, &[key(*d, 1)]).with_mask(0x7e), 0).unwrap();
+            assert_eq!(inv.version, Some(2));
+            assert!(!inv.ready);
+            inv.task
+        })
+        .collect();
+    for w in [2, 0, 3, 1] {
+        assert_eq!(tb.complete(v1[w]).ready, vec![v2[w]], "warp {w}");
+    }
+    let mut tb = DepTables::new(cfg(16, 16, 8));
+    let u: Vec<TaskId> = h.iter().map(|d| run(&mut tb, tm(*d, 0x7e, &[]))).collect();
+    // Granule c + 3 is warp 1's (c + 1 + 2), in a gap of warp 0's span.
+    let (st, _) = tb.wait(Dep::Unversioned(at(c + 3))).unwrap();
+    let WaitStatus::Pending(id) = st else {
+        panic!("waits for warp 1")
+    };
+    // Warp 1 alone completes the wait.
+    assert_eq!(tb.complete(u[1]).waits_done, vec![id]);
+    for w in [0, 2, 3] {
+        assert!(tb.complete(u[w]).waits_done.is_empty(), "warp {w}");
+    }
+}
+
+#[test]
+fn adoption_and_supersede_follow_the_mask() {
+    let mut tb = tables();
+    // A consumer of granule 1 before any producer: a pending entry. A
+    // producer that holds granules 0 and 2 does not adopt it; one that
+    // holds granule 1 does.
+    let c = tb.invoke(t(r(8, 1), &[at(1)]), 0).unwrap();
+    assert!(!c.ready);
+    let even = tb.invoke(tm(r(0, 4), 0b10, &[]), 0).unwrap();
+    assert!(even.effects.adopted.is_empty());
+    let odd = tb.invoke(tm(r(1, 2), 0b0, &[]), 0).unwrap();
+    assert_eq!(odd.effects.adopted.len(), 1);
+    tb.issue(odd.task).unwrap();
+    assert_eq!(tb.complete(odd.task).ready, vec![c.task]);
+    // Supersede: a done plain producer of 4 granules stays when the new
+    // producer holds only some of them, and retires when it holds all.
+    let mut tb = tables();
+    let p = run(&mut tb, t(r(0, 4), &[]));
+    tb.complete(p);
+    let m = tb.invoke(tm(r(0, 4), 0b10, &[]), 0).unwrap();
+    assert!(m.effects.retired.is_empty());
+    assert_eq!(tb.phase(p), Some(Phase::Done));
+    let all = tb.invoke(tm(r(0, 4), 0b11, &[]), 0).unwrap();
+    assert_eq!(all.effects.retired, vec![p]);
+}
+
+#[test]
+fn one_base_one_bound_and_one_mask() {
+    let mut tb = tables();
+    run(&mut tb, tv(r(0, 4), &[]));
+    assert_eq!(
+        tb.invoke(tv(r(0, 4), &[]).with_mask(0b10), 0).unwrap_err(),
+        DepError::BaseConflict {
+            base: 0,
+            bound: 4 * G,
+            new_bound: 4 * G,
+            mask: nu_model::FULL_MASK,
+            new_mask: 0b10,
+        }
+    );
+    // A mask that holds the whole span is the plain range.
+    tb.invoke(tv(r(0, 4), &[]).with_mask(0b11), 0).unwrap();
+}
+
+#[test]
+fn a_range_without_a_granule_is_empty() {
+    let mut tb = tables();
+    let e = Range::from_len(at(3), 0);
+    assert_eq!(tb.invoke(t(e, &[]), 0), Err(DepError::Empty(e)));
 }

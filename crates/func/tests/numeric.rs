@@ -26,6 +26,7 @@ fn numeric() -> Numeric {
             0,
         )],
         &[Range::new(0x20_0000, 0x21_0000)],
+        512,
     );
     n
 }
@@ -92,6 +93,7 @@ fn a_split_operand_reads_its_halves() {
             dst: Range::from_len(pc, 32),
             versioned: false,
             untracked: false,
+            dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             deps: vec![],
             label: None,

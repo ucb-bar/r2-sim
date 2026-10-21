@@ -30,6 +30,7 @@ fn dma(b: &Built, pe: &str, src: u64, dst: u64, bytes: u64, label: u64) -> Descr
         dst: Range::from_len(dst, bytes),
         versioned: false,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         deps: vec![],
         label: Some(label),

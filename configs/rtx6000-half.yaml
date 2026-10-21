@@ -8,7 +8,7 @@
 # assumed. MIG is off on the measured card, so this half is not measured.
 
 global:
-  neutrino_granule: 512
+  neutrino_granule: 128     # warp tiles with 128 B rows (2026-10-21)
   clock_ghz: 2.617
   msg_bytes: 64
   flow: readyvalid

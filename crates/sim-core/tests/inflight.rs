@@ -55,6 +55,7 @@ fn copies(b: Built, nu: &str, pe: &str, src: u64, dst: u64, bytes: u64, n: u64) 
             dst: Range::from_len(dst + i * bytes, bytes),
             versioned: true,
             untracked: false,
+            dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             deps: vec![],
             label: Some(i),

@@ -410,9 +410,9 @@ struct Task {
 /// version of its output write (its last task).
 struct Cta {
     tasks: Vec<Task>,
-    compute: Vec<(u64, u64)>,
+    compute: Vec<Dep>,
     /// Its output writes (one per piece of a row op in pieces).
-    done: Vec<(u64, u64)>,
+    done: Vec<Dep>,
 }
 
 /// A kernel ready to run: per SM (index into the run's SMs), its CTAs in
@@ -484,6 +484,9 @@ struct Builder {
     muon_kind: Kind,
     /// The SMs' Atlas accumulator buffer (bytes).
     acc_buffer: u64,
+    /// The Neutrino granule (bytes): the unit of a destination range's
+    /// mask.
+    granule: u64,
     /// The utilization of the Muon tasks being built (`simt_util`,
     /// `softmax_util`; 1 otherwise).
     util: f64,
@@ -524,6 +527,36 @@ fn dst_range(base: u64, bytes: u64) -> Range {
     Range::from_len(base, bytes.max(1).div_ceil(GRANULE) * GRANULE)
 }
 
+/// The masked destination range of a warp's part of a C tile (Neutrino
+/// spec, the warp-tile example): the tile at `tile` with rows of `row`
+/// bytes; the warp's part starts at row `r0` and byte `c0` of a row and is
+/// `rows` rows of `cols` bytes. `None` when a mask cannot describe it with
+/// granules of `g` bytes: a row or the warp's row not a power-of-two
+/// number of granules, or a part not on granules.
+fn warp_dst(
+    tile: u64,
+    row: u64,
+    (r0, c0): (u64, u64),
+    (rows, cols): (u64, u64),
+    g: u64,
+) -> Option<(Range, u32)> {
+    if rows == 0 || [tile, row, c0, cols].iter().any(|x| !x.is_multiple_of(g)) {
+        return None;
+    }
+    let (r, w) = (row / g, cols / g);
+    if !r.is_power_of_two() || !w.is_power_of_two() || w > r {
+        return None;
+    }
+    // Granule i of the span is row i / r, column i % r: the mask lets the
+    // row bits and the low column bits vary.
+    let mask = ((rows.next_power_of_two() - 1) * r) | (w - 1);
+    let mask = u32::try_from(mask)
+        .ok()
+        .filter(|m| *m != nu_model::FULL_MASK)?;
+    let bound = (rows - 1) * r + w;
+    Some((Range::from_len(tile + r0 * row + c0, bound * g), mask))
+}
+
 /// The first base at or after `at`, in granules, that is in neither
 /// `fixed` nor `taken`.
 fn own(mut at: u64, fixed: &[u64], taken: &[u64]) -> u64 {
@@ -531,14 +564,6 @@ fn own(mut at: u64, fixed: &[u64], taken: &[u64]) -> u64 {
         at += GRANULE;
     }
     at
-}
-
-/// A version handle's (address, version).
-fn handle(d: Dep) -> (u64, u64) {
-    match d {
-        Dep::Versioned { addr, version } => (addr, version),
-        _ => unreachable!("a versioned handle"),
-    }
 }
 
 fn elem_bytes(dtype: &str) -> Result<(Dtype, u64), String> {
@@ -693,6 +718,7 @@ impl Builder {
                 dst: dst_range(dst, dst_len),
                 versioned: true,
                 untracked: false,
+                dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 deps,
                 label: None,
@@ -745,6 +771,18 @@ impl Builder {
         Dep::Versioned { addr, version }
     }
 
+    /// [`Builder::push`] for an unversioned task: its key is the first
+    /// granule of its `dst`.
+    fn push_unversioned(&mut self, tasks: &mut Vec<Task>, mut t: Task) -> Dep {
+        t.desc.versioned = false;
+        t.desc.inferred_version = None;
+        let (cta, sm) = self.cta;
+        t.desc.label = Some(label::label(t.kind, 0, self.index as u32, sm, cta));
+        let key = Dep::Unversioned(t.desc.dst.base);
+        tasks.push(t);
+        key
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn matmul(
         &mut self,
@@ -772,6 +810,7 @@ impl Builder {
                 dst: dst_range(c, c_len),
                 versioned: true,
                 untracked: false,
+                dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 deps,
                 label: None,
@@ -825,6 +864,7 @@ impl Builder {
                 dst: dst_range(dst, dst_len),
                 versioned: true,
                 untracked: false,
+                dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 deps,
                 label: None,
@@ -883,8 +923,8 @@ impl Builder {
         self.outs.entry((s, slot)).or_default().push(done.clone());
         Cta {
             tasks,
-            compute: compute.into_iter().map(handle).collect(),
-            done: done.into_iter().map(handle).collect(),
+            compute,
+            done,
         }
     }
 
@@ -1175,24 +1215,49 @@ impl Builder {
                         while p_at == c0 || p_at == c1 || bases.contains(&p_at) {
                             p_at -= GRANULE;
                         }
-                        // Each warp's C handle, for both output buffers:
-                        // bases of their own, over the C space (the program
-                        // models time, not data).
-                        let mut fixed = bases.clone();
-                        fixed.extend([c0, c1, p_at]);
-                        let mut taken = Vec::new();
-                        let mut handles = [Vec::new(), Vec::new()];
-                        for (par, c) in [c0, c1].into_iter().enumerate() {
-                            for w in 0..warps {
-                                let h = own(c + w * GRANULE, &fixed, &taken);
-                                if h + w_buf > base + size {
-                                    return Err(format!(
-                                        "{}: the warps' C handles do not fit in {size} B of SMEM per CTA",
-                                        k.name
-                                    ));
+                        // Each warp's C handle, for both output buffers: its
+                        // part of the C tile as a masked range (2026-10-21),
+                        // so that the warps' chains are independent. When a
+                        // mask cannot describe the part, or a part's base is
+                        // a buffer's, bases of their own one granule apart
+                        // over the C space (the program models time, not
+                        // data).
+                        let g = self.granule;
+                        let mut handles: [Vec<(Range, u32)>; 2] = [Vec::new(), Vec::new()];
+                        let parts = |c: u64| -> Option<Vec<(Range, u32)>> {
+                            (0..warps)
+                                .map(|w| {
+                                    let (r0, c0w) = ((w % warps_m) * wtm, (w / warps_m) * wtn);
+                                    warp_dst(c, k.bn * es, (r0, c0w * es), (wtm, wtn * es), g)
+                                })
+                                .collect()
+                        };
+                        let mut others = bases.clone();
+                        others.push(p_at);
+                        match (parts(c0), parts(c1)) {
+                            (Some(h0), Some(h1))
+                                if !h0.iter().chain(&h1).any(|h| others.contains(&h.0.base)) =>
+                            {
+                                handles = [h0, h1];
+                            }
+                            _ => {
+                                let mut fixed = bases.clone();
+                                fixed.extend([c0, c1, p_at]);
+                                let mut taken = Vec::new();
+                                for (par, c) in [c0, c1].into_iter().enumerate() {
+                                    for w in 0..warps {
+                                        let h = own(c + w * GRANULE, &fixed, &taken);
+                                        if h + w_buf > base + size {
+                                            return Err(format!(
+                                                "{}: the warps' C handles do not fit in {size} B of SMEM per CTA",
+                                                k.name
+                                            ));
+                                        }
+                                        taken.push(h);
+                                        handles[par]
+                                            .push((dst_range(h, w_buf), nu_model::FULL_MASK));
+                                    }
                                 }
-                                taken.push(h);
-                                handles[par].push(h);
                             }
                         }
                         let (parity, two_back) = self.out_slot(s, slot);
@@ -1243,17 +1308,20 @@ impl Builder {
                                 if last {
                                     deps.extend(two_back.iter().copied());
                                 }
-                                let t = self.matmul(
+                                let (h, mask) = handles[parity][w as usize];
+                                let mut t = self.matmul(
                                     (&sm, w as usize),
                                     (a_at + r0 * k.bk * es, k.bk),
                                     (b_at + c0w * es, k.bn),
-                                    (handles[parity][w as usize], w_buf, k.bn),
+                                    (h.base, h.len(), k.bn),
                                     (rows, cols, tk),
                                     (dtype, dtype),
                                     x > 0,
                                     !last,
                                     deps,
                                 )?;
+                                t.desc.dst = h;
+                                t.desc.dst_mask = mask;
                                 row.push(Some(self.push(&mut tasks, t)));
                             }
                             mm.push(row);
@@ -1286,7 +1354,10 @@ impl Builder {
                                 c_bytes,
                                 deps,
                             )?;
-                            c_deps = vec![self.push(&mut tasks, t)];
+                            // Unversioned: its key is C's first granule,
+                            // which is also the base of warp 0's masked
+                            // handle (a versioned base has one bound).
+                            c_deps = vec![self.push_unversioned(&mut tasks, t)];
                         }
                         if k.epilogue_ops > 0 && sl + 1 == split {
                             let t = self.vector(
@@ -1298,7 +1369,7 @@ impl Builder {
                                 c_bytes,
                                 c_deps,
                             )?;
-                            c_deps = vec![self.push(&mut tasks, t)];
+                            c_deps = vec![self.push_unversioned(&mut tasks, t)];
                         }
                         let dst = self.write_at(out, c_off * es, c_bytes)?;
                         let t = self.store(s, slot, parity, c_at, dst, c_bytes, c_deps.clone())?;
@@ -1733,6 +1804,9 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
             })
             .min()
             .unwrap_or(0),
+        granule: sms
+            .first()
+            .map_or(GRANULE, |s| b.sim.neutrino_config(s.nu).tables.granule),
         util: 1.0,
         posted: p.posted_outputs,
         outs: HashMap::new(),
@@ -1824,6 +1898,7 @@ impl Builder {
             cta: (0, 0),
             muon_kind: Kind::Vec,
             acc_buffer: self.acc_buffer,
+            granule: self.granule,
             util: 1.0,
             posted: self.posted,
             outs: HashMap::new(),
@@ -2008,8 +2083,9 @@ fn plan(
     Ok((plans, recs, bld.tensor_recs))
 }
 
-/// A CTA in flight on an SM: its compute versions and its output writes.
-type OpenCta = (Vec<(u64, u64)>, Vec<(u64, u64)>);
+/// A CTA in flight on an SM: the keys of its compute and of its output
+/// writes.
+type OpenCta = (Vec<Dep>, Vec<Dep>);
 
 /// One SM's part of a kernel: its CTAs in order, at most `limit` at once.
 /// With posted outputs a slot is free when its CTA's compute is done, and
@@ -2022,14 +2098,8 @@ async fn sm_program(ctx: NuCtx, ctas: Vec<Cta>, limit: usize, posted: bool) {
     for cta in ctas {
         if open.len() >= limit {
             let (compute, done) = open.pop_front().expect("open CTA");
-            if posted {
-                for (a, v) in compute {
-                    ctx.wait(a, v).await;
-                }
-            } else {
-                for (a, v) in done {
-                    ctx.wait(a, v).await;
-                }
+            for key in if posted { compute } else { done } {
+                ctx.wait_key(key).await;
             }
         }
         for t in cta.tasks {
@@ -2039,8 +2109,8 @@ async fn sm_program(ctx: NuCtx, ctas: Vec<Cta>, limit: usize, posted: bool) {
         open.push_back((cta.compute, cta.done));
     }
     let tail = if posted { 2 * limit } else { limit };
-    for &(a, v) in dones[dones.len().saturating_sub(tail)..].iter().flatten() {
-        ctx.wait(a, v).await;
+    for &key in dones[dones.len().saturating_sub(tail)..].iter().flatten() {
+        ctx.wait_key(key).await;
     }
 }
 

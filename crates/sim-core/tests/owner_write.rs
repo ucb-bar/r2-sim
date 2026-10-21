@@ -21,6 +21,7 @@ fn dma(b: &Built, pe: &str, src: u64, dst: Range, tile: u64) -> Descriptor {
         dst,
         versioned: true,
         untracked: false,
+        dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         deps: vec![],
         label: None,

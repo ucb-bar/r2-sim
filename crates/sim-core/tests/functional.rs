@@ -189,8 +189,8 @@ fn racy_load_can_be_a_warning() {
 struct Slow(Numeric);
 
 impl FunctionalBackend for Slow {
-    fn configure(&mut self, m: &[MemBlock], s: &[Range]) {
-        self.0.configure(m, s)
+    fn configure(&mut self, m: &[MemBlock], s: &[Range], g: u64) {
+        self.0.configure(m, s, g)
     }
     fn has_data(&self) -> bool {
         true

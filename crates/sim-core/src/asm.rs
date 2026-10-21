@@ -24,8 +24,9 @@
 //!
 //! * a task, by its opcode's mnemonic (`dma`, `mm`, `vec`, `join`, or the
 //!   registered name), then `untracked` for an untracked task:
-//!   `dst=<range>[@v<n>] [pe=<path>] deps=[...] [label=<n>]` and the
-//!   opcode's arguments:
+//!   `dst=<range>[/0x<mask>][@v<n>] [pe=<path>] deps=[...] [label=<n>]`
+//!   (the mask, in granules, when it is not all ones) and the opcode's
+//!   arguments:
 //!   - `dma from=<address> to=<address> bytes=<n> tile=<n>`;
 //!   - `mm a=<address> b=<address> [a2=..] [b2=..] lda= ldb= ldc= m= n=
 //!     k= types=<a>,<b>,<c> acc=0|1 keep=0|1 tile=<rows>x<cols>`;
@@ -283,6 +284,9 @@ impl Symbols {
     pub fn task(&self, d: &Descriptor) -> String {
         let flag = if d.untracked { " untracked" } else { "" };
         let mut s = format!("{}{flag} dst={}", self.opcode(d.opcode), self.range(d.dst));
+        if d.dst_mask != nu_model::FULL_MASK {
+            s += &format!("/{:#x}", d.dst_mask);
+        }
         if d.versioned {
             match d.inferred_version {
                 Some(v) => s += &format!("@v{v}"),
