@@ -25,6 +25,10 @@
 //! * `invoke`: the driver invokes `tasks` empty tasks on one SM (`targets =
 //!   one`) or round-robin over `sms` SMs (`targets = many`).
 //!
+//! The flags and empty tasks of `pingpong`, `barrier` and `invoke` are
+//! joins in the SMs' sync-only space (a join writes no data and must be
+//! there, 2026-10-20).
+//!
 //! `mem`: `l2` and `dram` (the linear ranges of the memories named by `l2`
 //! and `dram`), `smem` (the SM's own SMEM), `rsmem_gpc` (another SM's SMEM
 //! in the same gpc), `rsmem_far` (an SM's SMEM in another gpc). SMs are
@@ -130,6 +134,8 @@ pub(crate) struct Sm {
     pub(crate) atlas: Vec<PeId>,
     pub(crate) muon: Option<PeId>,
     pub(crate) smem: Range,
+    /// Its sync-only range (joins and signals; none without one).
+    pub(crate) sync: Option<Range>,
 }
 
 /// What a task of the run is for.
@@ -223,6 +229,7 @@ pub(crate) fn sms_of(b: &Built) -> Vec<Sm> {
             gpc,
             dma,
             smem,
+            sync: b.sync_only(nu),
         });
     }
     out.sort_by_key(|s| (s.gpc, s.nu));
@@ -256,6 +263,14 @@ pub(crate) fn pick(all: &[Sm], count: usize, placement: &str) -> Result<Vec<Sm>,
         }
         p => Err(format!("unknown placement {p:?} (packed, spread)")),
     }
+}
+
+/// The base of `s`'s sync-only range: joins (flags) go there (a join
+/// writes no data; architecture, sync-only space, 2026-10-20).
+fn sync_of(s: &Sm) -> Result<u64, String> {
+    s.sync
+        .map(|r| r.base)
+        .ok_or_else(|| format!("{}: no sync-only range for its flags", s.path))
 }
 
 /// The range a task writes for `bytes` at `base`: at least one granule.
@@ -566,7 +581,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
             let mut prev: Option<(u64, u64)> = None;
             for step in 0..2 * p.rounds.max(1) {
                 let j = step % 2;
-                let flag = sms[j].smem.base;
+                let flag = sync_of(&sms[j])?;
                 let deps: Vec<Dep> = prev
                     .iter()
                     .map(|&(addr, version)| Dep::Versioned { addr, version })
@@ -593,7 +608,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
             sms = pick(&all, p.sms, &p.placement)?;
             let mut deps = Vec::new();
             for (j, s) in sms.iter().enumerate() {
-                let flag = s.smem.base;
+                let flag = sync_of(s)?;
                 let v = versions_peek(&items, flag) + 1;
                 push(
                     &mut items,
@@ -639,7 +654,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
             sms = pick(&all, targets, &p.placement)?;
             for i in 0..p.tasks {
                 let j = i % sms.len();
-                let flag = sms[j].smem.base;
+                let flag = sync_of(&sms[j])?;
                 push(
                     &mut items,
                     &mut metas,

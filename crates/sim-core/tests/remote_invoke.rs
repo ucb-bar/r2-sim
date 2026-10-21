@@ -492,7 +492,8 @@ fn a_join_with_20_deps_travels_in_3_beats() {
     // sm0 forwards the join on them at 208, so it is ready on arrival.
     let b = built_with(&[]);
     let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
-    let s1 = b.memory("root.gpc0.sm1.smem").base;
+    // Joins live in the owner's sync-only space.
+    let s1 = b.sync_only(sm1).unwrap().base;
     let at = |i: u64| Range::from_len(s1 + i * 512, 512);
     let j = at(0);
     let signals: Vec<Descriptor> = (1..21)
@@ -578,4 +579,88 @@ fn a_version_reset_takes_effect_after_the_invokes_before_it() {
     assert_eq!(versions, vec![1, 2, 1]);
     // M1, M2 and the VersionReset were in the inbound table at once.
     assert_eq!(s.inbound_invoke_peak[sm1.0 as usize], 3);
+}
+
+/// The fatal error of a run of `program` on sm0 of two_sm.yaml.
+fn fatal_on_sm0(
+    b: Built,
+    program: impl FnOnce(NuCtx) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> + 'static,
+) -> sim_core::Fatal {
+    let sm0 = b.nu("root.gpc0.sm0");
+    let mut sim = b.sim;
+    sim.spawn(sm0, program);
+    sim.run().fatal.expect("fatal")
+}
+
+#[test]
+fn a_join_outside_the_sync_only_space_is_invalid() {
+    // A join writes no data: its range must be in its owner's sync-only
+    // space (2026-10-20), whether it is invoked locally or forwarded.
+    let b = built_with(&[]);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let local = Descriptor::join(
+        Range::from_len(b.memory("root.gpc0.sm0.smem").base, 512),
+        vec![],
+    );
+    let f = fatal_on_sm0(b, move |ctx| {
+        Box::pin(async move {
+            ctx.invoke(local).await;
+        })
+    });
+    assert_eq!(f.nu, sm0);
+    assert!(
+        matches!(&f.error, FatalError::Invalid(m) if m.contains("sync-only")),
+        "{f:?}"
+    );
+    let b = built_with(&[]);
+    let mut remote = Descriptor::join(
+        Range::from_len(b.memory("root.gpc0.sm1.smem").base, 512),
+        vec![],
+    );
+    remote.versioned = true;
+    let remote = remote.with_inferred_version(1);
+    let f = fatal_on_sm0(b, move |ctx| {
+        Box::pin(async move {
+            ctx.invoke(remote).await;
+        })
+    });
+    assert_eq!(f.nu, sm1, "at the owner, on admission");
+    assert!(
+        matches!(&f.error, FatalError::Invalid(m) if m.contains("sync-only")),
+        "{f:?}"
+    );
+    // The same joins in the sync-only space run.
+    let b = built_with(&[]);
+    let j = Descriptor::join(Range::from_len(b.sync_only(sm0).unwrap().base, 512), vec![]);
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(j).await;
+        ctx.wait_unversioned(h.addr).await;
+    });
+    assert_eq!(sim.run().fatal, None);
+}
+
+#[test]
+fn a_spawn_whose_done_range_is_outside_the_sync_only_space_is_invalid() {
+    // The parent owns the done range, in its sync-only space; the root's
+    // HBM and the child's sync-only space are both refused.
+    for done in ["root.hbm", "child sync"] {
+        let b = built_with(&[]);
+        let (root, gpc0) = (b.nu("root"), b.nu("root.gpc0"));
+        let r = match done {
+            "root.hbm" => Range::from_len(b.memory("root.hbm").base, 512),
+            _ => Range::from_len(b.sync_only(gpc0).unwrap().base, 512),
+        };
+        let mut sim = b.sim;
+        sim.spawn(root, move |ctx: NuCtx| async move {
+            ctx.spawn_child(gpc0, r, vec![], |_c: NuCtx| async move {})
+                .await;
+        });
+        let f = sim.run().fatal.expect("fatal");
+        assert_eq!(f.nu, root, "{done}");
+        assert!(
+            matches!(&f.error, FatalError::Invalid(m) if m.contains("sync-only")),
+            "{done}: {f:?}"
+        );
+    }
 }

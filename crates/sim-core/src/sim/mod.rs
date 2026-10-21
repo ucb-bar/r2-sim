@@ -868,6 +868,11 @@ impl Sim {
         id
     }
 
+    /// True when `r` lies inside a sync-only range that `nu` owns.
+    fn in_own_sync(&self, nu: NeutrinoId, r: Range) -> bool {
+        self.sync_only.iter().any(|s| s.covers(&r)) && self.owners.owner_of_range(&r) == Some(nu)
+    }
+
     /// Marks `range` as sync-only: no storage, no functional effect.
     pub fn add_sync_only(&mut self, range: Range) {
         self.sync_only.push(range);
@@ -1573,6 +1578,14 @@ impl Sim {
                     let msg = format!("spawn on {child:?}, which is not a direct child");
                     return self.fatal(nu, None, FatalError::Invalid(msg));
                 }
+                // The done range: in the parent's sync-only space
+                // (2026-10-20).
+                if !self.in_own_sync(nu, done) {
+                    let msg = format!(
+                        "spawn done range {done} outside the sync-only space of the parent"
+                    );
+                    return self.fatal(nu, None, FatalError::Invalid(msg));
+                }
                 let desc = Descriptor {
                     opcode: OpcodeId::SPAWN,
                     pe: None,
@@ -1859,6 +1872,15 @@ impl Sim {
         }
         if forwarded && desc.opcode == OpcodeId::SPAWN {
             return Err(EnterFail::Fatal(FatalError::Unsupported("remote spawn")));
+        }
+        // A join writes no data: its range is in its owner's sync-only
+        // space (2026-10-20; local and forwarded joins enter here).
+        if desc.opcode == OpcodeId::JOIN && !self.in_own_sync(nu, desc.dst) {
+            let msg = format!(
+                "join with dst {} outside the sync-only space of its owner",
+                desc.dst
+            );
+            return Err(EnterFail::Fatal(FatalError::Invalid(msg)));
         }
         // Split the deps by owner; remote ones count as external deps.
         let mut local = Vec::with_capacity(desc.deps.len());
