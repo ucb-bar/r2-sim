@@ -326,12 +326,18 @@ fn a_set_overrides_one_link_of_a_child() {
 #[test]
 fn a_muon_reads_smem_over_lbus_and_a_remote_range_over_smsbus() {
     // One SM under the device. The Muon masters lbus and smsbus; SMEM is a
-    // slave on both; HBM is at the device. V1 reads and writes SMEM: the
-    // SMEM port only (2048 B at 128 B/cycle = 16 cycles) after the 10-cycle
-    // overhead. V2 reads 1024 B of HBM and writes 1024 B of SMEM: the read
-    // takes the route over smsbus and the SM's bridge down (16 B/cycle: 64
-    // cycles, latency 20; the HBM port, 64 B/cycle, takes 16), so it
-    // starts 10 + 20 cycles after its issue and lasts 64.
+    // slave on both (latency 5); HBM is at the device (latency 40). A task
+    // starts after its 10-cycle overhead and the longer path latency: the
+    // read's is its block's latency plus the route's (2026-10-21), the
+    // write's the route's only. V1 reads and writes SMEM: the SMEM port
+    // only (2048 B at 128 B/cycle = 16 cycles), after 10 + 5. V2 reads
+    // 1024 B of HBM and writes 1024 B of SMEM: the read takes the route
+    // over smsbus and the SM's bridge down (16 B/cycle: 64 cycles, latency
+    // 20; the HBM port, 64 B/cycle, takes 16), so it starts 10 + 40 + 20
+    // cycles after its issue and lasts 64. V3 reads nothing and writes
+    // 1024 B of SMEM: no read latency, 8 cycles after 10. V4 (untracked)
+    // reads SMEM and writes 1024 B of HBM over the bridge up: 10 + max(5,
+    // 20), not HBM's 40; 64 cycles.
     let b = build_config(
         "global:
   neutrino_granule: 512
@@ -340,7 +346,7 @@ device:
   name: root
   fabric: [{name: sbus}, {name: cbus, control: true}]
   memory:
-    - {name: hbm, type: dram, addr: [[0x100000, 0x200000]], bw_bytes: 64, slave: $this.sbus}
+    - {name: hbm, type: dram, addr: [[0x100000, 0x200000]], bw_bytes: 64, latency: 40, slave: $this.sbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
   neutrino: {}
   children:
@@ -352,7 +358,7 @@ device:
         - {name: smsbus_to_sbus, topology: link, from: $this.smsbus, to: $parent.sbus, bw_bytes: 16, latency: 20}
         - {name: smcbus_to_cbus, topology: link, from: $this.smcbus, to: $parent.cbus, bw_bytes: 16, latency: 20, control: true}
       memory:
-        - {name: smem, type: scratch, addr: [[0x0, 0x10000]], bw_bytes: 128, slave: [$this.lbus, $this.smsbus]}
+        - {name: smem, type: scratch, addr: [[0x0, 0x10000]], bw_bytes: 128, latency: 5, slave: [$this.lbus, $this.smsbus]}
         - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
       compute:
         - {name: muon, type: vector, rate: {lane_op: 64}, overhead: 10, master: [$this.lbus, $this.smsbus]}
@@ -382,12 +388,25 @@ device:
         },
     };
     let (v1, v2) = (v(0, None), v(1, Some(Addr(hbm.base))));
+    let mut v3 = v(2, None);
+    v3.args = Args::Vector {
+        ops: 64,
+        bytes_in: 0,
+        bytes_out: 1024,
+        src: None,
+    };
+    let mut v4 = v(3, Some(Addr(smem.base)));
+    v4.dst = Range::from_len(hbm.base, 4096);
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         let h1 = ctx.invoke(v1).await;
         let h2 = ctx.invoke(v2).await;
+        let h3 = ctx.invoke(v3).await;
+        ctx.invoke_untracked(v4).await;
         ctx.wait_unversioned(h1.addr).await;
         ctx.wait_unversioned(h2.addr).await;
+        ctx.wait_unversioned(h3.addr).await;
+        ctx.fence().await;
     });
     let s = sim.run();
     assert_eq!(s.fatal, None);
@@ -396,8 +415,10 @@ device:
         let c = t.chunks[0];
         (c.start - t.issue.unwrap(), c.end - c.start)
     };
-    assert_eq!(span(0), (10, 16));
-    assert_eq!(span(1), (30, 64));
+    assert_eq!(span(0), (15, 16));
+    assert_eq!(span(1), (70, 64));
+    assert_eq!(span(2), (10, 8));
+    assert_eq!(span(3), (30, 64));
 }
 
 #[test]

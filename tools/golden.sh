@@ -10,8 +10,9 @@
 # every run (for example GOLDEN_ARGS="--set global.endpoint_charging=false").
 # The rows run the default hierarchical program (configs/forward.toml);
 # GOLDEN_ARGS="--param drivers=single" runs the single driver. References:
-# scratch/fwd22 (hierarchical), scratch/fwd22-single (control fabric of
-# 8 B/cycle, 2026-10-20; fwd21 with 64 B/cycle control crossbars and no
+# scratch/fwd23 (hierarchical), scratch/fwd23-single (a Muon read pays its
+# block's latency, 2026-10-21; fwd22 without it, with the control fabric of
+# 8 B/cycle of 2026-10-20; fwd21 with 64 B/cycle control crossbars and no
 # backward pass in the data-path rule, fwd20 with the backward pass, fwd19 with
 # integer lanes, fwd18 before a
 # transfer paid its source latency, fwd18-4bank the four-bank SMEM of

@@ -1047,7 +1047,10 @@ fn spread(node: &NodeConfig, range: Range, amount: u64, dir: Dir, out: &mut Vec<
 /// Muon vector task: one chunk; lane-ops on the vector resource at the
 /// configured utilization, plus the task's bytes on the port of the block
 /// that holds `dst` and on the route to it, after the fixed overhead and
-/// the route latency.
+/// the longer path latency: the input path is the latency of the block
+/// that holds `src` (its bank on a banked memory; 2026-10-21) plus the
+/// route's, the output path the route's only (a write pays no block
+/// latency).
 pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Vector {
         ops,
@@ -1088,7 +1091,14 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             .topology
             .best_path(from, dest)
             .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
-        latency = latency.max(route.latency);
+        // A read pays its source block's latency, as a DMA's fill and a
+        // load do; a task that reads nothing has no input path.
+        let block_latency = if to || bytes == 0 {
+            0
+        } else {
+            block.load_latency
+        };
+        latency = latency.max(block_latency + route.latency);
         let dir = if to { Dir::Write } else { Dir::Read };
         routes[to as usize] = node
             .topology
