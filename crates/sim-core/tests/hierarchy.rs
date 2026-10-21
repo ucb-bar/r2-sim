@@ -431,6 +431,24 @@ fn remote_load_charges_the_path_twice_in_latency() {
 }
 
 #[test]
+fn remote_store_pays_the_path_latency_and_no_block_latency() {
+    // The path of `remote_load_charges_the_path_twice_in_latency`: a store
+    // takes the route once (20) and the time of its bytes (64 B: 2 cycles
+    // on the links); sm1's SMEM latency (10) is not paid by a write.
+    let b = built();
+    let sm0 = b.nu("root.gpc0.sm0");
+    let dst = b.memory("root.gpc0.sm1.smem").base;
+    let mut sim = b.sim;
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.store(Addr(dst), vec![0u8; 64]).await;
+    });
+    let s = sim.run();
+    // c_store [0,1); route latency 20; 2 cycles of bytes.
+    assert_eq!(s.fatal, None);
+    assert_eq!(s.end_time, 1 + 20 + 2);
+}
+
+#[test]
 fn remote_load_race_check_reads_the_owners_tables() {
     let b = built();
     let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));

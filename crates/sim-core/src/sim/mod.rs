@@ -1602,8 +1602,8 @@ impl Sim {
         }
     }
 
-    /// A load or store: a chunk on the memory block's port after its
-    /// latency, then `MemDone`.
+    /// A load or store: a chunk on the memory block's port (a load after
+    /// the block's latency), then `MemDone`.
     fn exec_mem(&mut self, nu: NeutrinoId, req: Request) {
         let (addr, len) = match &req {
             Request::Load { addr, len } => (*addr, *len),
@@ -1656,8 +1656,9 @@ impl Sim {
         // A transfer in data order (Section 5.4, data-path rule). A load:
         // the request takes the route to the block and the block latency,
         // then the data comes back from the port over the return route. A
-        // store: the data takes the route to the block, then the port;
-        // the block latency follows the port.
+        // store: the data takes the route to the block, then the port; the
+        // block adds no latency (a write pays the fabric latency and the
+        // time of its bytes only).
         let dir = if load { Dir::Read } else { Dir::Write };
         let (port, block_latency, attach) = (mem.port_for(dir), mem.load_latency, &mem.attach);
         let hub = self.topo.data_hub(nu);
@@ -1682,7 +1683,7 @@ impl Sim {
             src_latency: if load { block_latency } else { 0 },
             tail: None,
         };
-        let (path, lead, tail): (Vec<PathHop>, Cycle, Cycle) = if load {
+        let (path, lead): (Vec<PathHop>, Cycle) = if load {
             let mut p = vec![hop(port, from_block.lead, None)];
             p.extend(
                 from_block
@@ -1691,7 +1692,7 @@ impl Sim {
                     .map(|h| hop(h.lane, h.latency, h.pool)),
             );
             admit.tail = from_block.pool_after;
-            (p, to_block.latency + block_latency, 0)
+            (p, to_block.latency + block_latency)
         } else {
             let mut p: Vec<PathHop> = to_block
                 .hops_for(Dir::Write)
@@ -1699,7 +1700,7 @@ impl Sim {
                 .map(|h| hop(h.lane, h.latency, h.pool))
                 .collect();
             p.push(hop(port, 0, to_block.pool_after));
-            (p, to_block.lead, block_latency)
+            (p, to_block.lead)
         };
         let earliest = self.now + if self.zero_time { 0 } else { lead };
         let beat = self.nus[nu.0 as usize].cfg.beat_bytes;
@@ -1708,10 +1709,7 @@ impl Sim {
             .is_some()
             .then(|| self.topo.best_pair(hub, attach))
             .flatten();
-        let mut g = self.reserve_path(&path, beat, earliest, admit, Who::Program(nu));
-        if !self.zero_time {
-            g.end += tail;
-        }
+        let g = self.reserve_path(&path, beat, earliest, admit, Who::Program(nu));
         if let Some((from, to)) = pair {
             let r = RouteUse {
                 from,
