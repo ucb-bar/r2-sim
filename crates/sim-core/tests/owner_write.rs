@@ -20,6 +20,7 @@ fn dma(b: &Built, pe: &str, src: u64, dst: Range, tile: u64) -> Descriptor {
         pe: Some(b.pe(pe)),
         dst,
         versioned: true,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,

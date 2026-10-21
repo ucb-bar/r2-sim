@@ -68,6 +68,9 @@ impl TaskHandle {
     }
 }
 
+/// The key of the fence: address 0, which no node owns.
+pub(crate) const FENCE: Dep = Dep::Unversioned(0);
+
 /// A call from a program to its Neutrino.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Request {
@@ -215,11 +218,37 @@ impl NuCtx {
     /// full. A `dst` in another Neutrino's prefix forwards the invoke to its
     /// owner (forwarded invoke); it stalls while the outbound invoke queue is
     /// full, and returns once the descriptor is queued.
+    ///
+    /// Panics on an untracked descriptor: an untracked task has no handle
+    /// ([`NuCtx::invoke_untracked`]).
     pub async fn invoke(&self, desc: Descriptor) -> TaskHandle {
+        assert!(
+            !desc.untracked,
+            "an untracked task has no handle: use invoke_untracked"
+        );
         match self.call(Request::Invoke(desc)).await {
             Response::Invoked(h) => h,
             r => panic!("invoke answered with {r:?}"),
         }
+    }
+
+    /// Invokes `desc` as an untracked task (sets its flag): it runs on a PE
+    /// of this Neutrino, is never forwarded, and returns no handle. Nothing
+    /// can depend on it; [`NuCtx::fence`] and the program's return wait for
+    /// it. Stalls as [`NuCtx::invoke`] does on a full scoreboard.
+    pub async fn invoke_untracked(&self, mut desc: Descriptor) {
+        desc.untracked = true;
+        match self.call(Request::Invoke(desc)).await {
+            Response::Done => {}
+            r => panic!("untracked invoke answered with {r:?}"),
+        }
+    }
+
+    /// The fence, `wait 0`: blocks until every untracked task of the
+    /// program is done (`c_wait`; the answer comes `c_resolve` cycles after
+    /// the last one completes).
+    pub async fn fence(&self) {
+        self.call(Request::Wait(FENCE)).await;
     }
 
     /// Blocks until version `version` of the range at base address `addr`

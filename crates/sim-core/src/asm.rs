@@ -23,14 +23,16 @@
 //! Instructions:
 //!
 //! * a task, by its opcode's mnemonic (`dma`, `mm`, `vec`, `join`, or the
-//!   registered name): `dst=<range>[@v<n>] [pe=<path>] deps=[...]
-//!   [label=<n>]` and the opcode's arguments:
+//!   registered name), then `untracked` for an untracked task:
+//!   `dst=<range>[@v<n>] [pe=<path>] deps=[...] [label=<n>]` and the
+//!   opcode's arguments:
 //!   - `dma from=<address> to=<address> bytes=<n> tile=<n>`;
 //!   - `mm a=<address> b=<address> [a2=..] [b2=..] lda= ldb= ldc= m= n=
 //!     k= types=<a>,<b>,<c> acc=0|1 keep=0|1 tile=<rows>x<cols>`;
 //!   - `vec ops=<lane-ops> in=<bytes> out=<bytes> [src=<address>]`;
 //! * `spawn child=<neutrino> done=<range> deps=[...]`;
-//! * `wait <address>[@v<n>]`, `version <address> v=<n>`, `vreset_all`,
+//! * `wait <address>[@v<n>]`, the fence `wait 0`, `version <address>
+//!   v=<n>`, `vreset_all`,
 //!   `vreset <address>`, `cycles <n>`, `load <address> len=<n>`,
 //!   `store <address> len=<n>`, `mark "<name>"`, `cache_flush`.
 //!
@@ -279,7 +281,8 @@ impl Symbols {
 
     /// One task's instruction.
     pub fn task(&self, d: &Descriptor) -> String {
-        let mut s = format!("{} dst={}", self.opcode(d.opcode), self.range(d.dst));
+        let flag = if d.untracked { " untracked" } else { "" };
+        let mut s = format!("{}{flag} dst={}", self.opcode(d.opcode), self.range(d.dst));
         if d.versioned {
             match d.inferred_version {
                 Some(v) => s += &format!("@v{v}"),
@@ -368,6 +371,7 @@ impl Symbols {
     pub fn op(&self, op: &Op) -> String {
         match op {
             Op::Invoke(d) => self.task(d),
+            Op::Wait(Dep::Unversioned(0)) => "wait 0".into(),
             Op::Wait(d) => format!("wait {}", self.dep(d)),
             Op::Version(a, v) => format!("version {} v={v}", self.addr(*a)),
             Op::VersionReset => "vreset_all".into(),

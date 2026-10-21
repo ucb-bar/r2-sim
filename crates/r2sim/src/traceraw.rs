@@ -3,7 +3,8 @@
 //! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.8
 //! (1.8: a forwarded VersionReset has an inbound_invokes entry that ends
 //! when it takes effect at the head of the owner's table, and the version
-//! entry it frees ends then).
+//! entry it frees ends then; a task record has `flags`, bit 0 untracked,
+//! and is 112 B; no dependency names an untracked task as producer).
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -55,6 +56,9 @@ const NULL64: u64 = u64::MAX;
 /// No slab entry.
 const NONE: u32 = u32::MAX;
 
+/// `tasks.flags` bit 0: an untracked task (1.8).
+const UNTRACKED: u32 = 1;
+
 /// One slot in a charge record's `usage` (trace-raw 1.7).
 const USAGE_ONE: u32 = 65_536;
 
@@ -77,6 +81,8 @@ const TASKS: &[(&str, &str)] = &[
     ("retire", "u64"),
     ("queued", "u64"),
     ("sent", "u64"),
+    ("flags", "u32"),
+    ("pad", "u32"),
 ];
 const CHUNKS: &[(&str, &str)] = &[
     ("gid", "u32"),
@@ -140,7 +146,7 @@ type Layout = &'static [(&'static str, &'static str)];
 
 /// The record types: file stem, layout and record size.
 pub const RECORDS: [(&str, Layout, usize); 7] = [
-    ("tasks", TASKS, 104),
+    ("tasks", TASKS, 112),
     ("chunks", CHUNKS, 32),
     ("deps", DEPS, 24),
     ("charges", CHARGES, 32),
@@ -471,6 +477,8 @@ struct OpenTask {
     complete: Option<Cycle>,
     queued: Option<Cycle>,
     sent: Option<Cycle>,
+    /// Bit 0: untracked (1.8).
+    flags: u32,
     /// Resolved deps kept until the task's retire decides the window.
     parked: u32,
     /// Its invoke call (source Neutrino, number), when it has one: the key
@@ -798,7 +806,7 @@ impl RawTracer {
         if !self.task_kept(t, retire) {
             return;
         }
-        let mut r = Rec::<104>::new();
+        let mut r = Rec::<112>::new();
         r.u32(gid as u32)
             .u16(t.nu)
             .u16(t.src)
@@ -815,7 +823,9 @@ impl RawTracer {
             .u64(o64(t.complete))
             .u64(o64(retire))
             .u64(o64(t.queued))
-            .u64(o64(t.sent));
+            .u64(o64(t.sent))
+            .u32(t.flags)
+            .u32(0);
         self.emit(T_TASKS, r.done());
     }
 
@@ -1164,6 +1174,7 @@ impl Tracer for RawTracer {
             complete: None,
             queued: e.call.queued,
             sent: e.call.sent,
+            flags: d.untracked as u32 * UNTRACKED,
             parked: NONE,
             call_key: None,
         };
@@ -1201,18 +1212,20 @@ impl Tracer for RawTracer {
                 self.write_entry(k, &o, Some(end));
             }
         }
-        // This task as a producer.
+        // This task as a producer; no lookup finds an untracked task.
         let vkey = e.version.map(|v| (d.dst.base, v));
-        match vkey {
-            Some(k) => {
-                self.versioned.insert(k, e.gid);
+        if !d.untracked {
+            match vkey {
+                Some(k) => {
+                    self.versioned.insert(k, e.gid);
+                }
+                None => {
+                    self.unversioned.insert(d.dst.base, (d.dst.bound, e.gid));
+                    self.max_unversioned = self.max_unversioned.max(d.dst.len());
+                }
             }
-            None => {
-                self.unversioned.insert(d.dst.base, (d.dst.bound, e.gid));
-                self.max_unversioned = self.max_unversioned.max(d.dst.len());
-            }
+            self.adopt(e.gid, vkey, (d.dst.base, d.dst.bound));
         }
-        self.adopt(e.gid, vkey, (d.dst.base, d.dst.bound));
         // Its dependencies, when it can be kept.
         self.last_remote.clear();
         if !self.deps_on || !self.keep_nu[e.nu.0 as usize] || e.time >= self.hi {

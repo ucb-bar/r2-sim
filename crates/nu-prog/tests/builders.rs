@@ -244,6 +244,7 @@ fn matmul(b: &Built, pe: &str, c: nu_model::Range, n: u64, deps: Vec<nu_model::D
         pe: Some(b.pe(pe)),
         dst: c,
         versioned: true,
+        untracked: false,
         inferred_version: None,
         deps,
         label: None,

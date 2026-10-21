@@ -15,7 +15,7 @@ device:
     - {name: sbus}
     - {name: cbus, control: true}
   memory:
-    - {name: hbm, type: dram, addr: [[0x0, 0x10000]], bw_bytes: 64, slave: $this.sbus}
+    - {name: hbm, type: dram, addr: [[0x100000, 0x110000]], bw_bytes: 64, slave: $this.sbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
   neutrino: {c_base: 0, c_dep: 0, c_word: 0}
   children:
@@ -48,6 +48,7 @@ fn a_descriptor_prints_as_one_instruction() {
         pe: Some(b.pe("root.sm0.dma")),
         dst: Range::from_len(smem + 0x400, 0x800),
         versioned: true,
+        untracked: false,
         inferred_version: Some(3),
         deps: vec![
             Dep::Versioned {
@@ -75,6 +76,7 @@ fn a_descriptor_prints_as_one_instruction() {
         pe: Some(b.pe("root.sm0.atlas")),
         dst: Range::from_len(smem + 0x8000, 0x2000),
         versioned: true,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -147,4 +149,47 @@ fn a_recorded_program_lists_its_requests_in_order() {
         ]
     );
     assert!(text.lines().nth(1).unwrap().ends_with("; t=0"));
+}
+
+#[test]
+fn an_untracked_task_and_the_fence_print_their_syntax() {
+    // `dma untracked dst=...` (the flag right after the mnemonic) and the
+    // fence `wait 0`; the DMA writes the root's HBM from sm0's engine.
+    let b = built();
+    let sym = Symbols::from_built(&b);
+    let sm = b.nu("root.sm0");
+    let (smem, hbm) = (b.memory("root.sm0.smem").base, b.memory("root.hbm").base);
+    let d = Descriptor {
+        opcode: b.sim.profiles().lookup("dma").unwrap(),
+        pe: Some(b.pe("root.sm0.dma")),
+        dst: Range::from_len(hbm + 0x800, 0x200),
+        versioned: false,
+        untracked: true,
+        inferred_version: None,
+        deps: vec![],
+        label: None,
+        args: Args::Dma {
+            src: Addr(smem),
+            dst: Addr(hbm + 0x800),
+            bytes: 512,
+            tile_bytes: 512,
+        },
+    };
+    let want = "dma untracked dst=root.hbm+0x800:0x200 pe=root.sm0.dma deps=[] \
+                from=root.sm0.smem+0x0 to=root.hbm+0x800 bytes=512 tile=512";
+    assert_eq!(sym.task(&d), want);
+    let mut sim = b.sim;
+    sim.set_asm(true);
+    sim.spawn_named(sm, "store", move |ctx: NuCtx| async move {
+        ctx.invoke_untracked(d).await;
+        ctx.fence().await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let text = sym.listing(&s.asm[0]);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.split(';').next().unwrap().trim())
+        .collect();
+    assert_eq!(lines, [".program root.sm0 store", want, "wait 0"]);
 }

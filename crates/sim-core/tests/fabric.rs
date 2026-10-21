@@ -77,6 +77,7 @@ fn gemm_array_cycles(sets: &[&str], d: Dtype) -> u64 {
         pe: Some(b.pe("root.gpc0.sm0.atlas")),
         dst: c,
         versioned: true,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -339,7 +340,7 @@ device:
   name: root
   fabric: [{name: sbus}, {name: cbus, control: true}]
   memory:
-    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], bw_bytes: 64, slave: $this.sbus}
+    - {name: hbm, type: dram, addr: [[0x100000, 0x200000]], bw_bytes: 64, slave: $this.sbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
   neutrino: {}
   children:
@@ -369,6 +370,7 @@ device:
         pe: Some(b.pe("root.sm0.muon")),
         dst: Range::from_len(smem.base + i * 4096, 4096),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: Some(i),
@@ -418,6 +420,7 @@ fn demands_record_reads_and_writes() {
         pe: Some(b.pe("root.gpc0.sm0.dma")),
         dst,
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -434,6 +437,7 @@ fn demands_record_reads_and_writes() {
         pe: Some(b.pe("root.gpc0.sm1.atlas")),
         dst: c,
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -511,7 +515,7 @@ device:
   name: root
   fabric: [{{name: sbus}}, {{name: cbus, control: true}}]
   memory:
-    - {{name: hbm, type: dram, addr: [[0x0, 0x100000]], bw_bytes: 1024, slave: $this.sbus}}
+    - {{name: hbm, type: dram, addr: [[0x100000, 0x200000]], bw_bytes: 1024, slave: $this.sbus}}
     - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
   neutrino: {{c_base: 0, c_dep: 0, c_word: 0}}
   children:
@@ -546,6 +550,7 @@ fn two_transfers(dma: &str) -> (u64, u64) {
         pe: Some(b.pe("root.sm0.dma")),
         dst: Range::from_len(smem.base + i * 4096, 4096),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: Some(i),
@@ -639,7 +644,7 @@ device:
   name: root
   fabric: [{{name: sbus, bw_bytes: 256}}, {{name: cbus, control: true}}]
   memory:
-    - {{name: hbm, type: dram, addr: [[0x0, 0x100000]], bw_bytes: 512, slave: $this.sbus}}
+    - {{name: hbm, type: dram, addr: [[0x100000, 0x200000]], bw_bytes: 512, slave: $this.sbus}}
     - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
   compute:
     - {{name: dma, type: dma, beat_bytes: {beat}, master: [$this.sbus]}}
@@ -673,7 +678,7 @@ device:
   name: root
   fabric: [{name: sbus}, {name: mbus}, {name: cbus, control: true}]
   memory:
-    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], bw_bytes: 64, slave: $this.mbus}
+    - {name: hbm, type: dram, addr: [[0x100000, 0x200000]], bw_bytes: 64, slave: $this.mbus}
     - {name: l2, type: cache, addr: [[0x0, 0x100000]], bw_bytes: 256, latency: 5, slave: $this.sbus, master: $this.mbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
   neutrino: {}

@@ -31,7 +31,9 @@ use crate::func::{FuncOp, FuncPlane, FunctionalBackend, NullBackend, OpKind, Pla
 use crate::profile::{
     Args, Descriptor, NodeConfig, Occupancy, OpcodeId, PeId, Profile, ProfileRegistry,
 };
-use crate::program::{Mailbox, NeutrinoProgram, NuCtx, Request, Response, StartFn, TaskHandle};
+use crate::program::{
+    Mailbox, NeutrinoProgram, NuCtx, Request, Response, StartFn, TaskHandle, FENCE,
+};
 use crate::resource::{Demand, Dir, Kind, PathHop, ResourceId, Resources};
 use crate::stats::{
     Blocked, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats, WarningRec,
@@ -75,6 +77,9 @@ enum ProgState {
     Waiting(WaitId),
     /// Blocked on a remote wait; the tag is the request's `Purpose::Wait`.
     WaitingRemote(u32),
+    /// The program returned and waits, as a fence, for its untracked tasks
+    /// before the return completes (2026-10-20).
+    Returning(WaitId),
 }
 
 struct TaskRec {
@@ -118,6 +123,8 @@ pub(super) struct Entered {
     dst: Range,
     version: Option<u64>,
     ready: bool,
+    /// An untracked task: the invoke answers with no handle.
+    untracked: bool,
 }
 
 /// Why a task did not enter the tables. A stall hands the descriptor back
@@ -1245,7 +1252,9 @@ impl Sim {
                 ProgState::Idle => continue,
                 ProgState::Busy => Blocked::Busy,
                 ProgState::Stalled(e) => Blocked::Stall(e),
-                ProgState::Waiting(_) | ProgState::WaitingRemote(_) => Blocked::Wait,
+                ProgState::Waiting(_) | ProgState::WaitingRemote(_) | ProgState::Returning(_) => {
+                    Blocked::Wait
+                }
             };
             self.stats.unfinished.push((n.id, blocked));
         }
@@ -1272,11 +1281,7 @@ impl Sim {
                 self.nus[nu.0 as usize].drain_scheduled = false;
                 self.drain_inbound(nu);
             }
-            Event::WaitDone { nu, wait } => {
-                if self.nus[nu.0 as usize].state == ProgState::Waiting(wait) {
-                    self.respond(nu, Response::Done);
-                }
-            }
+            Event::WaitDone { nu, wait } => self.wait_done(nu, wait),
         }
     }
 
@@ -1291,17 +1296,11 @@ impl Sim {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(()) => {
                 n.program = None;
-                n.state = ProgState::Idle;
-                let now = self.now;
-                trace!(self, t => t.program_return(nu, now));
-                let n = &mut self.nus[nu.0 as usize];
-                let parent = n.parent_task.take();
-                // Program return frees the done unversioned entries
-                // (Section 3.2); the version table resets at the next start.
-                let fx = n.tables.program_returned();
-                self.effects(nu, None, fx);
-                if let Some((parent, task)) = parent {
-                    self.send(nu, parent, remote::MsgKind::Return { task });
+                // The return waits, as a fence, for the untracked tasks of
+                // the program (2026-10-20).
+                match n.tables.fence() {
+                    WaitStatus::Done => self.program_return(nu),
+                    WaitStatus::Pending(w) => n.state = ProgState::Returning(w),
                 }
             }
             Poll::Pending => {
@@ -1315,6 +1314,32 @@ impl Sim {
                 }
                 self.start_request(nu, req);
             }
+        }
+    }
+
+    /// The return of the program of `nu`, after its untracked tasks.
+    fn program_return(&mut self, nu: NeutrinoId) {
+        self.nus[nu.0 as usize].state = ProgState::Idle;
+        let now = self.now;
+        trace!(self, t => t.program_return(nu, now));
+        let n = &mut self.nus[nu.0 as usize];
+        let parent = n.parent_task.take();
+        // Program return frees the done unversioned entries
+        // (Section 3.2); the version table resets at the next start.
+        let fx = n.tables.program_returned();
+        self.effects(nu, None, fx);
+        if let Some((parent, task)) = parent {
+            self.send(nu, parent, remote::MsgKind::Return { task });
+        }
+    }
+
+    /// A local wait of `nu` is satisfied: answer the program, or complete
+    /// its return.
+    fn wait_done(&mut self, nu: NeutrinoId, w: WaitId) {
+        match self.nus[nu.0 as usize].state {
+            ProgState::Waiting(x) if x == w => self.respond(nu, Response::Done),
+            ProgState::Returning(x) if x == w => self.program_return(nu),
+            _ => {}
         }
     }
 
@@ -1484,6 +1509,14 @@ impl Sim {
                     self.table_stall_end(nu);
                 }
             }
+            Request::Wait(FENCE) => match self.nus[nu.0 as usize].tables.fence() {
+                WaitStatus::Done => self.respond(nu, Response::Done),
+                WaitStatus::Pending(w) => self.nus[nu.0 as usize].state = ProgState::Waiting(w),
+            },
+            Request::Wait(key) if key.addr() == 0 => {
+                let msg = format!("wait on {key:?}: the key 0 is the fence (wait 0)");
+                self.fatal(nu, None, FatalError::Invalid(msg))
+            }
             Request::Wait(key) => {
                 let range = Range::from_len(key.addr(), 1);
                 match self.owners.owner_of_range(&range) {
@@ -1591,6 +1624,7 @@ impl Sim {
                     pe: None,
                     dst: done,
                     versioned: false,
+                    untracked: false,
                     inferred_version: None,
                     deps,
                     label: None,
@@ -1812,12 +1846,34 @@ impl Sim {
     }
 
     fn exec_invoke(&mut self, nu: NeutrinoId, desc: Descriptor) {
-        match self.owners.owner_of_range(&desc.dst) {
-            None => return self.fatal(nu, None, FatalError::Unowned(desc.dst)),
-            Some(o) if o != nu => return self.forward_invoke(nu, o, desc),
-            Some(_) => {}
+        // The key 0 names no producer: it is the fence's (2026-10-20).
+        if desc.deps.iter().any(|d| d.addr() == 0) {
+            let msg = format!("invoke of {} with the key 0 in deps", desc.dst);
+            return self.fatal(nu, None, FatalError::Invalid(msg));
+        }
+        if desc.untracked {
+            if let Err(msg) = untracked_check(&desc) {
+                return self.fatal(nu, None, FatalError::Invalid(msg));
+            }
+            // Never forwarded: it runs at the invoking Neutrino, whoever
+            // owns its dst.
+            if self.owners.owner_of_range(&desc.dst).is_none() {
+                return self.fatal(nu, None, FatalError::Unowned(desc.dst));
+            }
+        } else {
+            match self.owners.owner_of_range(&desc.dst) {
+                None => return self.fatal(nu, None, FatalError::Unowned(desc.dst)),
+                Some(o) if o != nu => return self.forward_invoke(nu, o, desc),
+                Some(_) => {}
+            }
         }
         match self.enter_task(nu, desc, Entry::Local) {
+            Ok(e) if e.untracked => {
+                self.respond(nu, Response::Done);
+                if e.ready {
+                    self.on_ready(nu, e.task);
+                }
+            }
             Ok(e) => {
                 let handle = TaskHandle {
                     task: Some(e.task),
@@ -1862,9 +1918,15 @@ impl Sim {
         };
         if let Some(pe) = desc.pe {
             // The PE must be the owner's (Section 3.3): a write into another
-            // node's memory is a pull by that memory owner's DMA engine.
+            // node's memory is a pull by that memory owner's DMA engine. An
+            // untracked task enters at the invoking Neutrino, so its PE
+            // must be the invoker's.
             if self.pes[pe.0 as usize].nu != nu {
-                let msg = format!("invoke on {pe:?}, a PE of another Neutrino");
+                let msg = if desc.untracked {
+                    format!("untracked invoke on {pe:?}, a PE of another Neutrino")
+                } else {
+                    format!("invoke on {pe:?}, a PE of another Neutrino")
+                };
                 return Err(EnterFail::Fatal(FatalError::Invalid(msg)));
             }
         }
@@ -1917,6 +1979,7 @@ impl Sim {
         let spec = TaskSpec {
             dst: desc.dst,
             versioned: desc.versioned,
+            untracked: desc.untracked,
             deps: local,
         };
         // Debug check of the program's inference (Section 3.3): invokes of
@@ -1964,7 +2027,7 @@ impl Sim {
             time: now,
             remote_deps,
         }));
-        let dst = desc.dst;
+        let (dst, untracked) = (desc.dst, desc.untracked);
         if self.tracer.is_some() {
             self.trace_invoke_entries(nu, gid, dst, inv.version, &inv.effects);
         }
@@ -1996,6 +2059,7 @@ impl Sim {
             dst,
             version: inv.version,
             ready: inv.ready,
+            untracked,
         })
     }
 
@@ -2148,8 +2212,8 @@ impl Sim {
             if resolve > 0 && !self.zero_time {
                 self.queue
                     .push(self.now + resolve, Event::WaitDone { nu, wait: w });
-            } else if self.nus[nu.0 as usize].state == ProgState::Waiting(w) {
-                self.respond(nu, Response::Done);
+            } else {
+                self.wait_done(nu, w);
             }
         }
         let freed = !fx.retired.is_empty() || !fx.adopted.is_empty();
@@ -2512,6 +2576,26 @@ impl Sim {
 /// The Atlas accumulator memory's decision for matmul `desc` issued on `p`
 /// (H3), and its new state: a held dst is read from the buffer; a `keep`
 /// task whose C fits stays in it; tiles evicted for room are written back.
+/// The rules of an untracked descriptor that hold before its PE is
+/// checked (2026-10-20): a PE, no join or spawn, not versioned.
+fn untracked_check(desc: &Descriptor) -> Result<(), String> {
+    let what = if desc.opcode == OpcodeId::JOIN {
+        Some("a join")
+    } else if desc.opcode == OpcodeId::SPAWN {
+        Some("a spawn")
+    } else if desc.versioned {
+        Some("a versioned task")
+    } else if desc.pe.is_none() {
+        Some("a task without a PE")
+    } else {
+        None
+    };
+    match what {
+        Some(w) => Err(format!("{w} cannot be untracked (dst {})", desc.dst)),
+        None => Ok(()),
+    }
+}
+
 fn acc_flags(p: &mut Pe, desc: &Descriptor) -> crate::profile::AccFlags {
     let mut f = crate::profile::AccFlags::default();
     let crate::config::PeParams::Atlas { acc_buffer, .. } = p.cfg.params else {

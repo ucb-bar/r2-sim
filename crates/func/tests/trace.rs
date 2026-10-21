@@ -37,6 +37,7 @@ fn task(label: Option<u64>, dst: Range) -> Descriptor {
         deps: vec![],
         label,
         versioned: true,
+        untracked: false,
         inferred_version: None,
         args: Args::Vector {
             ops: 1,
@@ -90,6 +91,7 @@ fn dma_copies_bytes() {
         deps: vec![],
         label: None,
         versioned: true,
+        untracked: false,
         inferred_version: None,
         args: Args::Dma {
             src: Addr(0x100),

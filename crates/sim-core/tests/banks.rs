@@ -62,11 +62,12 @@ device:
     build_config(&text, ProfileRegistry::with_builtins())
 }
 
-/// A hash link from `sbus` to `hbmbus`: the linear range [0, 1 MiB) in
-/// 512 B granules over four banks of 256 KiB at 4 MiB.
+/// A hash link from `sbus` to `hbmbus`: the linear range [1 MiB, 2 MiB)
+/// (not at 0: no node owns the null address) in 512 B granules over four
+/// banks of 256 KiB at 4 MiB.
 const LINK: &str =
     "    - {name: sbus_to_hbmbus, topology: link, from: $this.sbus, to: $this.hbmbus,
-       hash: {range: [0x0, 0x100000], to_range: [0x400000, 0x500000], index: [0x200, 0x400]}}";
+       hash: {range: [0x100000, 0x200000], to_range: [0x400000, 0x500000], index: [0x200, 0x400]}}";
 
 /// The four banks behind `LINK`.
 const BANKS: &str = "    - {name: hbm, type: dram, addr: [[0x400000, 0x500000]], banks: 4,
@@ -94,6 +95,7 @@ fn dma(b: Built, nu: &str, src: u64, dst: u64, bytes: u64) -> Stats {
         pe: Some(b.pe(&format!("{nu}.dma"))),
         dst: Range::from_len(dst, bytes),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: Some(0),
@@ -147,22 +149,22 @@ fn a_banked_memory_is_one_block_per_bank() {
     );
     assert_eq!((blocks[0].load_latency, blocks[3].load_latency), (5, 7));
     // Behind a hash link the memory's name is its linear range.
-    assert_eq!(b.memory("root.hbm"), Range::new(0, 0x10_0000));
+    assert_eq!(b.memory("root.hbm"), Range::new(0x10_0000, 0x20_0000));
     let h = b.sim.hashes().next().unwrap();
     assert_eq!((h.granule(), h.slice_bytes()), (512, 0x4_0000));
-    assert_eq!(h.rewrite(0x0a00), 0x44_0000 + 0x200);
+    assert_eq!(h.rewrite(0x10_0a00), 0x44_0000 + 0x200);
     // Without the link the banks are plain blocks at their range.
     let b = node(&BANKS.replace("hbmbus", "sbus"), &[]).unwrap();
     assert_eq!(b.memory("root.hbm"), Range::new(0x40_0000, 0x50_0000));
     // Errors: a bank that does not exist, banks that do not divide.
     let bad = |m: &str| node(m, &[]).err().unwrap().0;
     let e = bad(
-        "    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], banks: 4,
+        "    - {name: hbm, type: dram, addr: [[0x100000, 0x200000]], banks: 4,
        bw_bytes: 64, slave: $this.sbus, bank: {b4: {bw_bytes: 1}}}",
     );
     assert!(e.contains("no bank \"b4\""), "{e}");
     let e = bad(
-        "    - {name: hbm, type: dram, addr: [[0x0, 0x100000]], banks: 3,
+        "    - {name: hbm, type: dram, addr: [[0x100000, 0x200000]], banks: 3,
        bw_bytes: 64, slave: $this.sbus}",
     );
     assert!(e.contains("3 equal banks"), "{e}");
@@ -179,7 +181,7 @@ fn the_loader_checks_a_hash_link() {
     let e = bad(&link, BANKS);
     assert!(e.contains("not invertible"), "{e}");
     // A memory in the linear range.
-    let mems = format!("{BANKS}\n    - {{name: x, type: dram, addr: [[0x80000, 0x90000]], bw_bytes: 64, slave: $this.sbus}}");
+    let mems = format!("{BANKS}\n    - {{name: x, type: dram, addr: [[0x180000, 0x190000]], bw_bytes: 64, slave: $this.sbus}}");
     let e = bad(LINK, &mems);
     assert!(e.contains("overlaps the hash's linear range"), "{e}");
     // Banks that do not cover the physical range.
@@ -196,7 +198,7 @@ fn the_loader_checks_a_hash_link() {
 #[test]
 fn a_range_that_is_not_a_power_of_two_is_decomposed() {
     let b = node(
-        "    - {name: hbm, type: dram, addr: [[0x0, 0xC0000]], bw_bytes: 64, slave: $this.sbus}",
+        "    - {name: hbm, type: dram, addr: [[0x100000, 0x1c0000]], bw_bytes: 64, slave: $this.sbus}",
         &[],
     )
     .unwrap();
@@ -209,13 +211,13 @@ fn a_range_that_is_not_a_power_of_two_is_decomposed() {
     assert_eq!(
         m.sets,
         [
-            AddressSet::block(0, 0x8_0000),
-            AddressSet::block(0x8_0000, 0x4_0000)
+            AddressSet::block(0x10_0000, 0x8_0000),
+            AddressSet::block(0x18_0000, 0x4_0000)
         ]
     );
     // The run continues across the two sets of one block.
-    assert_eq!(m.run(0x7_f000), 0x4_1000);
-    assert!(m.covers(&Range::new(0x7_f000, 0x8_1000)));
+    assert_eq!(m.run(0x17_f000), 0x4_1000);
+    assert!(m.covers(&Range::new(0x17_f000, 0x18_1000)));
 }
 
 #[test]
@@ -224,13 +226,13 @@ fn a_dma_chunk_stops_at_a_block_boundary() {
     // is two chunks, 1 KiB on hbm and 3 KiB on hbm2, each on its own port
     // (64 B/cycle: 16 and 48 cycles).
     let b = node(
-        "    - {name: hbm, type: dram, addr: [[0x0, 0x10000]], bw_bytes: 64, slave: $this.sbus}
-    - {name: hbm2, type: dram, addr: [[0x10000, 0x20000]], bw_bytes: 64, slave: $this.sbus}",
+        "    - {name: hbm, type: dram, addr: [[0x100000, 0x110000]], bw_bytes: 64, slave: $this.sbus}
+    - {name: hbm2, type: dram, addr: [[0x110000, 0x120000]], bw_bytes: 64, slave: $this.sbus}",
         &[],
     )
     .unwrap();
     let smem = b.memory("root.sm0.smem").base;
-    let s = dma(b, "root.sm0", 0x10000 - 1024, smem, 4096);
+    let s = dma(b, "root.sm0", 0x110000 - 1024, smem, 4096);
     assert_eq!(s.tasks[0].chunks.len(), 2);
     assert_eq!(busy(&s, "root.hbm.port"), 16);
     assert_eq!(busy(&s, "root.hbm2.port"), 48);
@@ -243,7 +245,7 @@ fn a_dma_through_a_hash_link_moves_one_granule_per_chunk() {
     // cycles, 16 slot-cycles); the read ports stay idle.
     let b = hashed(&[]);
     let smem = b.memory("root.sm0.smem").base;
-    let s = dma(b, "root", smem, 0x1000, 4096);
+    let s = dma(b, "root", smem, 0x10_1000, 4096);
     assert_eq!(s.tasks[0].chunks.len(), 8);
     for i in 0..4 {
         assert_eq!(busy(&s, &format!("root.hbm.b{i}.wport")), 16);
@@ -253,14 +255,14 @@ fn a_dma_through_a_hash_link_moves_one_granule_per_chunk() {
     // on b2 at 128 B/cycle in two 64 B slots, 8 cycles x 2 slots.
     let b = hashed(&[]);
     let smem = b.memory("root.sm0.smem").base;
-    let s = dma(b, "root.sm0", 0x1000, smem, 4096);
+    let s = dma(b, "root.sm0", 0x10_1000, smem, 4096);
     assert_eq!(busy(&s, "root.hbm.b0.port"), 16);
     assert_eq!(busy(&s, "root.hbm.b2.port"), 16);
     assert_eq!(busy(&s, "root.hbm.b0.wport"), 0);
     // An unaligned start: 256 B to the first granule's end, then 512 B.
     let b = hashed(&[]);
     let smem = b.memory("root.sm0.smem").base;
-    let s = dma(b, "root.sm0", 0x1100, smem, 1024);
+    let s = dma(b, "root.sm0", 0x10_1100, smem, 1024);
     assert_eq!(s.tasks[0].chunks.len(), 3);
 }
 
@@ -270,7 +272,7 @@ fn a_store_through_a_hash_link_is_one_piece_per_granule() {
     let sm0 = b.nu("root.sm0");
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
-        ctx.store(Addr(0x800), vec![0u8; 2048]).await;
+        ctx.store(Addr(0x10_0800), vec![0u8; 2048]).await;
     });
     let s = sim.run();
     assert_eq!(s.fatal, None);
@@ -305,6 +307,7 @@ fn atlas_mm(b: Built, a: u64, a2: Option<u64>, bb: u64, b2: Option<u64>, c: u64)
         pe: Some(b.pe("root.sm0.atlas")),
         dst: Range::from_len(smem + c, 8192),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -378,11 +381,12 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
         pe: Some(b.pe("root.sm0.atlas")),
         dst: Range::from_len(smem, 8192),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
         args: Args::Matmul {
-            a: Addr(0x1000),
+            a: Addr(0x10_1000),
             b: Addr(smem),
             a2: None,
             b2: None,
@@ -418,6 +422,7 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
         pe: Some(b.pe("root.sm0.muon")),
         dst: Range::from_len(smem, 1024),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -425,7 +430,7 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
             ops: 64,
             bytes_in: 1024,
             bytes_out: 1024,
-            src: Some(Addr(0x1000)),
+            src: Some(Addr(0x10_1000)),
         },
     };
     let mut sim = b.sim;
@@ -456,6 +461,7 @@ fn a_muon_task_spreads_over_the_banks_of_its_range() {
         pe: Some(b.pe("root.sm0.muon")),
         dst: Range::from_len(smem + 0x8000, 1024),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: None,
@@ -480,21 +486,21 @@ fn a_muon_task_spreads_over_the_banks_of_its_range() {
 
 #[test]
 fn a_bus_with_block_bytes_cuts_chunks_at_its_grid() {
-    // 4 KiB from HBM at 0x100 into SMEM in one tile; the root bus on the
+    // 4 KiB from HBM at 0x100 (offset) into SMEM in one tile; the root bus on the
     // read half has block_bytes 1024: the chunks end at multiples of 1 KiB
     // of the source address, 768 B first and 256 B last. The HBM port (64
     // B/cycle) is the slow hop: 12, 16, 16, 16 and 4 cycles.
     let hbm =
-        "    - {name: hbm, type: dram, addr: [[0x0, 0x10000]], bw_bytes: 64, slave: $this.sbus}";
+        "    - {name: hbm, type: dram, addr: [[0x100000, 0x110000]], bw_bytes: 64, slave: $this.sbus}";
     let b = node(hbm, &["root.sbus.block_bytes=1024"]).unwrap();
     let smem = b.memory("root.sm0.smem").base;
-    let s = dma(b, "root.sm0", 0x100, smem, 4096);
+    let s = dma(b, "root.sm0", 0x10_0100, smem, 4096);
     let spans: Vec<u64> = s.tasks[0].chunks.iter().map(|c| c.end - c.start).collect();
     assert_eq!(spans, [12, 16, 16, 16, 4]);
     assert_eq!(busy(&s, "root.hbm.port"), 64);
     // Without block_bytes the tile is one chunk.
     let b = node(hbm, &[]).unwrap();
-    let s = dma(b, "root.sm0", 0x100, smem, 4096);
+    let s = dma(b, "root.sm0", 0x10_0100, smem, 4096);
     assert_eq!(s.tasks[0].chunks.len(), 1);
 }
 
@@ -506,7 +512,7 @@ fn chunks_of_a_transfer_are_issued_at_the_beat_rate() {
     // chunk 1 is issued 2048 / 256 = 8 cycles later, so it waits for the
     // port only: [42, 74). The latency is paid once.
     let hbm =
-        "    - {name: hbm, type: dram, addr: [[0x0, 0x10000]], bw_bytes: 64, slave: $this.sbus}";
+        "    - {name: hbm, type: dram, addr: [[0x100000, 0x110000]], bw_bytes: 64, slave: $this.sbus}";
     let engine = [
         "root.sm0.dma.latency=10",
         "root.sm0.dma.burst_bytes=2048",
@@ -516,7 +522,7 @@ fn chunks_of_a_transfer_are_issued_at_the_beat_rate() {
         let sets: Vec<&str> = engine.iter().chain(extra).copied().collect();
         let b = node(hbm, &sets).unwrap();
         let smem = b.memory("root.sm0.smem").base;
-        let s = dma(b, "root.sm0", 0, smem, 4096);
+        let s = dma(b, "root.sm0", 0x10_0000, smem, 4096);
         let t = &s.tasks[0];
         let at = t.issue.unwrap();
         let c: Vec<(u64, u64)> = t

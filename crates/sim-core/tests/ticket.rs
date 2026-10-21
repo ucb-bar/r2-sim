@@ -39,6 +39,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>, label: u64) -> Descript
         pe: Some(b.pe(pe)),
         dst: c,
         versioned: true,
+        untracked: false,
         inferred_version: None,
         deps,
         label: Some(label),

@@ -164,6 +164,11 @@ pub struct Descriptor {
     /// `dst` is a versioned data range (Section 3.2, Versions); false for
     /// a signal in the sync-only space.
     pub versioned: bool,
+    /// An untracked task (2026-10-20): it runs on a PE of the invoking
+    /// Neutrino and is never forwarded; it gets no version, no lookup finds
+    /// it, and only a fence or the program's return waits for it. Its
+    /// invoke returns no handle ([`crate::NuCtx::invoke_untracked`]).
+    pub untracked: bool,
     /// Simulator check, not hardware state: the version the program infers
     /// for this invoke. In debug builds the owner compares it with the
     /// version it assigns and stops the run on a mismatch.
@@ -185,6 +190,7 @@ impl Descriptor {
             pe: None,
             dst,
             versioned: false,
+            untracked: false,
             inferred_version: None,
             deps,
             label: None,
@@ -201,6 +207,13 @@ impl Descriptor {
     /// Marks `dst` as a versioned data range.
     pub fn versioned(mut self) -> Self {
         self.versioned = true;
+        self
+    }
+
+    /// Marks the task as untracked; invoke it with
+    /// [`crate::NuCtx::invoke_untracked`].
+    pub fn untracked(mut self) -> Self {
+        self.untracked = true;
         self
     }
 
@@ -1134,7 +1147,8 @@ mod tests {
     use crate::resource::Dir;
     use crate::topology::{grid_run, Topology};
 
-    /// A root with an HBM of 4 banks behind a hash link (512 B granules),
+    /// A root with an HBM of 4 banks behind a hash link (512 B granules;
+    /// linear at 0x20000, off the null address),
     /// two adjacent dram blocks and a bus grid of 1 KiB, and one SM whose
     /// local bus has a grid of 256 B.
     const CONFIG: &str = "global:
@@ -1147,7 +1161,7 @@ device:
     - {name: cbus, control: true}
     - {name: hbmbus}
     - {name: sbus_to_hbmbus, topology: link, from: $this.sbus, to: $this.hbmbus,
-       hash: {range: [0x0, 0x10000], to_range: [0x40000, 0x50000], index: [0x200, 0x400]}}
+       hash: {range: [0x20000, 0x30000], to_range: [0x40000, 0x50000], index: [0x200, 0x400]}}
   memory:
     - {name: hbm, type: dram, addr: [[0x40000, 0x50000]], banks: 4, bw_bytes: 64, slave: $this.hbmbus}
     - {name: d0, type: dram, addr: [[0x10000, 0x18000]], bw_bytes: 64, slave: $this.sbus}
@@ -1271,7 +1285,7 @@ device:
             // From the hashed HBM or across the two dram blocks into SMEM,
             // or back.
             let far = if rnd(2) == 0 {
-                rnd(0x10000 - bytes)
+                0x20000 + rnd(0x10000 - bytes)
             } else {
                 0x10000 + rnd(0x10000 - bytes)
             };
@@ -1286,6 +1300,7 @@ device:
                 pe: Some(pe_id),
                 dst: Range::from_len(dst, bytes),
                 versioned: false,
+                untracked: false,
                 inferred_version: None,
                 deps: vec![],
                 label: None,

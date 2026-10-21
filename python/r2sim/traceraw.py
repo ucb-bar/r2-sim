@@ -4,8 +4,11 @@ The format is r2-vis's `trace-raw.md` (version 1.8; older versions read
 as that document says). The checks are the ones of its Section 8, plus
 the file layout:
 
-* the manifest's record layouts have the record sizes of the format, every
-  binary file holds whole records, and the counts match `summary.json`;
+* the manifest's record layouts have the record sizes of the format (tasks:
+  112 B with `flags`, 104 B without), every binary file holds whole
+  records, and the counts match `summary.json`;
+* untracked tasks (version 1.8, `tasks.flags` bit 0): `version`, `queued`
+  and `sent` are null, and no dependency record names one as producer;
 * in a complete dump (`filters.partial` false), every gid in chunks,
   deps, charges and programs.spawn has a task record;
 * on a resource with a rate, the slots held at any cycle (version 1.7: a
@@ -65,7 +68,7 @@ from pathlib import Path
 
 import numpy as np
 
-SIZES = {"tasks": 104, "chunks": 32, "deps": 24, "charges": 32, "programs": 32, "marks": 16,
+SIZES = {"tasks": 112, "chunks": 32, "deps": 24, "charges": 32, "programs": 32, "marks": 16,
          "entries": 48}
 # The record types added after version 1.0: (stem, version).
 SINCE = {"entries": [1, 3]}
@@ -73,6 +76,7 @@ TABLES = ["pending", "versions", "inbound_refs", "inbound_invokes", "outbound_de
           "outbound_invokes"]
 NULL64 = 0xFFFFFFFFFFFFFFFF
 VRESET = 1
+UNTRACKED = 1
 TYPES = {"u8": "<u1", "u16": "<u2", "u32": "<u4", "u64": "<u8"}
 NULL32 = 0xFFFFFFFF
 
@@ -139,6 +143,8 @@ def check_layouts(r: Report, manifest: dict, recs: dict, summary: dict | None) -
         if layout is None and manifest["version"] < SINCE.get(stem, [1, 0]):
             continue
         got = sum(np.dtype(TYPES[t]).itemsize for _, t in layout) if layout else None
+        if stem == "tasks" and layout and "flags" not in [n for n, _ in layout]:
+            size = 104  # 1.7, or 1.8 before untracked tasks
         r.check(got == size, f"{stem} layout is {got} B (format: {size} B)")
     if summary is not None:
         for stem, n in summary["counts"].items():
@@ -167,6 +173,21 @@ def check_gids(r: Report, manifest: dict, recs: dict) -> None:
         if stem in recs:
             n = missing(recs[stem][field].astype(np.uint64))
             r.check(n == 0, f"{stem}.{field}: {n} gids without a task record")
+
+
+def check_untracked(r: Report, recs: dict) -> None:
+    t = recs["tasks"]
+    if "flags" not in t.dtype.names:
+        print("skip  untracked tasks (no tasks.flags)")
+        return
+    u = t[(t["flags"] & UNTRACKED) != 0]
+    r.check(bool((u["version"] == NULL32).all() and (u["queued"] == NULL64).all()
+                 and (u["sent"] == NULL64).all()),
+            f"untracked tasks: {len(u)}, version, queued and sent null")
+    if "deps" in recs:
+        named = np.isin(recs["deps"]["producer"], u["gid"])
+        r.check(not named.any(),
+                f"untracked tasks: {int(np.count_nonzero(named))} deps name one as producer")
 
 
 USAGE_ONE = 65536
@@ -600,6 +621,7 @@ def main(argv: list[str] | None = None) -> int:
     r = Report()
     check_layouts(r, manifest, recs, summary)
     check_gids(r, manifest, recs)
+    check_untracked(r, recs)
     check_charges(r, manifest, recs, stats)
     check_entries(r, manifest, recs)
     check_hashes(r, manifest)

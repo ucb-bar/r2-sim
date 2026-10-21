@@ -18,7 +18,7 @@ device:
     - {name: sbus}
     - {name: cbus, control: true}
   memory:
-    - {name: hbm, type: dram, addr: [[0x0, 0x800000]], bw_bytes: 64, latency: 100, slave: $this.sbus}
+    - {name: hbm, type: dram, addr: [[0x400000, 0xC00000]], bw_bytes: 64, latency: 100, slave: $this.sbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
   compute:
     # Copy engine: writes into HBM are its pulls (Section 3.3).

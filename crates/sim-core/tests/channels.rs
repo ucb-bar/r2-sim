@@ -19,7 +19,7 @@ device:
     - {{name: sbus{sbus}}}
     - {{name: cbus, control: true}}
   memory:
-    - {{name: hbm, type: dram, addr: [[0x0, 0x10000]], bw_bytes: 1024, slave: $this.sbus}}
+    - {{name: hbm, type: dram, addr: [[0x100000, 0x110000]], bw_bytes: 1024, slave: $this.sbus}}
     - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
   neutrino: {{c_base: 0, c_dep: 0, c_word: 0, c_store: 0}}
   children:
@@ -63,6 +63,7 @@ fn run_some(b: Built, dma: bool, store: bool) -> (u64, Stats) {
         pe: Some(b.pe("root.sm0.dma")),
         dst: Range::from_len(smem, 4096),
         versioned: false,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: Some(0),

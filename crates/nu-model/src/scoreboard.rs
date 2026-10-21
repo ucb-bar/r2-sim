@@ -114,6 +114,10 @@ pub struct TaskSpec {
     pub dst: Range,
     /// `dst` is versioned: the tables assign the next version of its base.
     pub versioned: bool,
+    /// An untracked task (Section 3.2, untracked tasks): no version, no
+    /// lookup finds it, it adopts and supersedes nothing, and it retires at
+    /// completion. The tables count it until it retires (the fence).
+    pub untracked: bool,
     /// The local dependencies.
     pub deps: Vec<Dep>,
 }
@@ -124,6 +128,7 @@ impl TaskSpec {
         Self {
             dst,
             versioned: false,
+            untracked: false,
             deps,
         }
     }
@@ -133,6 +138,17 @@ impl TaskSpec {
         Self {
             dst,
             versioned: true,
+            untracked: false,
+            deps,
+        }
+    }
+
+    /// An untracked task.
+    pub fn untracked(dst: Range, deps: Vec<Dep>) -> Self {
+        Self {
+            dst,
+            versioned: false,
+            untracked: true,
             deps,
         }
     }
@@ -320,6 +336,8 @@ struct Task {
     seq: u64,
     /// Unversioned: a newer producer covers `dst`; retires at completion.
     superseded: bool,
+    /// Untracked: no lookup finds it; retires at completion.
+    untracked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +413,11 @@ pub struct DepTables {
     next_seq: u64,
     scoreboard_peak: usize,
     version_peak: usize,
+    /// Untracked tasks that have not retired.
+    untracked_len: usize,
+    /// Fences (program waits on the key 0) that wait for `untracked_len`
+    /// to reach 0.
+    fences: Vec<WaitId>,
 }
 
 impl DepTables {
@@ -418,6 +441,8 @@ impl DepTables {
             next_seq: 0,
             scoreboard_peak: 0,
             version_peak: 0,
+            untracked_len: 0,
+            fences: Vec::new(),
         }
     }
 
@@ -499,13 +524,16 @@ impl DepTables {
             .map(|(i, t)| (TaskId(i as u32), t.phase, t.dst))
     }
 
-    /// The unversioned task entries whose `dst` contains `addr`.
+    /// The unversioned tracked task entries whose `dst` contains `addr`
+    /// (no lookup finds an untracked task).
     fn covers(&self, addr: u64) -> Vec<Tag> {
         // Linear scan, like the hardware CAM. Fine at table sizes of a few
         // hundred; add an interval index if they grow to thousands.
         self.tasks
             .iter()
-            .filter(|(_, t)| t.version.is_none() && t.dst.base <= addr && addr < t.dst.bound)
+            .filter(|(_, t)| {
+                t.version.is_none() && !t.untracked && t.dst.base <= addr && addr < t.dst.bound
+            })
             .map(|(i, _)| Tag::Task(TaskId(i as u32)))
             .collect()
     }
@@ -569,9 +597,18 @@ impl DepTables {
         self.scoreboard_peak
     }
 
+    /// Untracked tasks that have not retired.
+    pub fn untracked_len(&self) -> usize {
+        self.untracked_len
+    }
+
     /// The version a versioned invoke of `dst` gets.
     fn plan_version(&self, spec: &TaskSpec) -> Result<Option<u64>, DepError> {
-        if !spec.versioned {
+        debug_assert!(
+            !(spec.untracked && spec.versioned),
+            "a versioned untracked task"
+        );
+        if !spec.versioned || spec.untracked {
             return Ok(None);
         }
         let addr = spec.dst.base;
@@ -618,7 +655,10 @@ impl DepTables {
         let mut plans = Vec::with_capacity(spec.deps.len());
         let mut new_pending: Vec<Dep> = Vec::new();
         for d in &spec.deps {
+            // An untracked task adopts nothing, so it never waits on
+            // itself.
             let self_dep = match *d {
+                _ if spec.untracked => false,
                 _ if Some(*d) == own_key => true,
                 Dep::Unversioned(a) if version.is_none() => {
                     spec.dst.base <= a && a < spec.dst.bound && self.covers(a).is_empty()
@@ -646,7 +686,7 @@ impl DepTables {
         }
         let mut adopt = Vec::new();
         for (i, p) in self.pending.iter() {
-            if adopts(&spec.dst, own_key, &p.key) {
+            if !spec.untracked && adopts(&spec.dst, own_key, &p.key) {
                 adopt.push(i);
             }
         }
@@ -654,10 +694,10 @@ impl DepTables {
         if new_pending.len() > room {
             return Err(DepError::PendingFull);
         }
-        let supersede = if version.is_none() {
+        let supersede = if version.is_none() && !spec.untracked {
             self.tasks
                 .iter()
-                .filter(|(_, t)| t.version.is_none() && spec.dst.covers(&t.dst))
+                .filter(|(_, t)| t.version.is_none() && !t.untracked && spec.dst.covers(&t.dst))
                 .map(|(i, _)| TaskId(i as u32))
                 .collect()
         } else {
@@ -692,8 +732,10 @@ impl DepTables {
             seq: self.next_seq,
             waiters: Vec::new(),
             superseded: false,
+            untracked: spec.untracked,
         }) as u32);
         self.scoreboard_len += 1;
+        self.untracked_len += spec.untracked as usize;
         self.scoreboard_peak = self.scoreboard_peak.max(self.scoreboard_len);
         if let Some(v) = version {
             self.versions.insert(
@@ -777,9 +819,9 @@ impl DepTables {
         Ok(())
     }
 
-    /// Marks an executing task done and wakes its waiters. A versioned task
-    /// retires (its version counter already says done); an unversioned one
-    /// retires only if superseded.
+    /// Marks an executing task done and wakes its waiters. A versioned or
+    /// untracked task retires (its version counter already says done, or no
+    /// lookup can find it); an unversioned one retires only if superseded.
     pub fn complete(&mut self, t: TaskId) -> Effects {
         let e = self.task_mut(t);
         assert_eq!(
@@ -790,9 +832,10 @@ impl DepTables {
         e.phase = Phase::Done;
         let waiters = std::mem::take(&mut e.waiters);
         let (versioned, superseded) = (e.version.is_some(), e.superseded);
+        let untracked = e.untracked;
         let mut out = Effects::default();
         self.wake(waiters, &mut out);
-        if versioned || superseded {
+        if versioned || superseded || untracked {
             self.retire(t, &mut out);
         }
         out
@@ -838,7 +881,7 @@ impl DepTables {
         let unversioned: Vec<(TaskId, Phase)> = self
             .tasks
             .iter()
-            .filter(|(_, t)| t.version.is_none())
+            .filter(|(_, t)| t.version.is_none() && !t.untracked)
             .map(|(i, t)| (TaskId(i as u32), t.phase))
             .collect();
         for (t, phase) in unversioned {
@@ -860,6 +903,17 @@ impl DepTables {
         let id = WaitId(self.waits.insert(pending.len() as u32) as u32);
         self.add_waiter(&pending, Waiter::Wait(id));
         Ok((WaitStatus::Pending(id), out))
+    }
+
+    /// A fence (a program wait on the key 0): pending until every untracked
+    /// task in the tables has retired. Does no lookup.
+    pub fn fence(&mut self) -> WaitStatus {
+        if self.untracked_len == 0 {
+            return WaitStatus::Done;
+        }
+        let id = WaitId(self.waits.insert(1) as u32);
+        self.fences.push(id);
+        WaitStatus::Pending(id)
     }
 
     /// Owner side of a remote `Await`. Records an inbound ref when `key`
@@ -1020,6 +1074,15 @@ impl DepTables {
         }
         self.execution_len -= 1;
         out.retired.push(t);
+        if e.untracked {
+            self.untracked_len -= 1;
+            if self.untracked_len == 0 {
+                for id in std::mem::take(&mut self.fences) {
+                    self.waits.remove(id.0 as usize);
+                    out.waits_done.push(id);
+                }
+            }
+        }
     }
 
     fn insert_pending(&mut self, key: Dep) -> PendingId {

@@ -24,6 +24,11 @@
 //!   device depends on all of them.
 //! * `invoke`: the driver invokes `tasks` empty tasks on one SM (`targets =
 //!   one`) or round-robin over `sms` SMs (`targets = many`).
+//! * `untracked`: each of `sms` SMs copies `bytes` from its SMEM into the
+//!   DRAM of its gpc (`<gpc>.hbm`) in untracked DMA tasks of `chunk` bytes
+//!   on its own engine (no pull by the gpc's engine, no Invoke message),
+//!   fences (`wait 0`), and then signals the device with a forwarded join
+//!   into the device's sync-only space. The device waits for the signals.
 //!
 //! The flags and empty tasks of `pingpong`, `barrier` and `invoke` are
 //! joins in the SMs' sync-only space (a join writes no data and must be
@@ -177,6 +182,11 @@ struct Item {
     desc: Descriptor,
     window: usize,
     done: (u64, u64),
+    /// A fence (`wait 0`) before the invoke.
+    fence: bool,
+    /// The driver waits for `done` at the end. An untracked task has no
+    /// key, and a signal is the device's to wait for.
+    wait: bool,
 }
 
 /// A gpc of a `driver = sms` run: its Neutrino, its sync range (the
@@ -199,6 +209,9 @@ pub struct Run {
     /// `done`) and their SMs (index into the run's SMs, Neutrino); the
     /// device's sync range.
     tree: Option<(Range, Vec<Gpc>)>,
+    /// The device waits for these signals (unversioned joins of the SMs)
+    /// after it starts the gpcs.
+    signals: Vec<u64>,
 }
 
 /// The SMs of `b`: nodes with an SMEM block and a DMA engine, ordered by
@@ -309,6 +322,8 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
             desc,
             window,
             done: (base, *v),
+            fence: false,
+            wait: true,
         });
         metas.push(meta);
     };
@@ -323,9 +338,18 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
     let sms;
     let mut p = p;
     if p.driver.is_empty() {
-        p.driver = if p.mode == "stream" { "sms" } else { "root" }.into();
+        p.driver = if matches!(p.mode.as_str(), "stream" | "untracked") {
+            "sms"
+        } else {
+            "root"
+        }
+        .into();
     }
-    let per_sm = matches!(p.mode.as_str(), "stream" | "latency" | "atlas" | "muon");
+    let per_sm = matches!(
+        p.mode.as_str(),
+        "stream" | "latency" | "atlas" | "muon" | "untracked"
+    );
+    let mut signals = Vec::new();
     let driver = match p.driver.as_str() {
         "root" | "sms" if p.driver == "root" || per_sm => NeutrinoId(0),
         "sm" => {
@@ -443,6 +467,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         pe: Some(pe),
                         dst: dst_range(dst, len),
                         versioned: true,
+                        untracked: false,
                         inferred_version: None,
                         deps: Vec::new(),
                         label: None,
@@ -508,6 +533,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             pe: Some(unit),
                             dst: dst_range(s.smem.base + u as u64 * slot, c),
                             versioned: true,
+                            untracked: false,
                             inferred_version: None,
                             deps: Vec::new(),
                             label: None,
@@ -537,6 +563,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         pe: Some(s.muon.ok_or_else(|| format!("{}: no muon", s.path))?),
                         dst: dst_range(s.smem.base, p.bytes_out),
                         versioned: true,
+                        untracked: false,
                         inferred_version: None,
                         deps: Vec::new(),
                         label: None,
@@ -642,6 +669,8 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                 desc: join,
                 window: 0,
                 done: (sync.base, 0),
+                fence: false,
+                wait: true,
             });
             last = vec![(sync.base, 0)];
         }
@@ -668,9 +697,86 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                 );
             }
         }
+        "untracked" => {
+            if p.chunk == 0 || p.bytes == 0 {
+                return Err("bytes and chunk are positive".into());
+            }
+            sms = pick(&all, p.sms, &p.placement)?;
+            let dma = op("dma")?;
+            let topo = b.sim.topology();
+            let root_sync = b
+                .sync_only(NeutrinoId(0))
+                .ok_or("untracked: the device has no sync space")?;
+            let slot = p.chunk.div_ceil(GRANULE) * GRANULE;
+            for (j, s) in sms.iter().enumerate() {
+                let gpc = topo.node(s.nu).parent.ok_or("untracked: an SM without a gpc")?;
+                let dram = region(&format!("{}.hbm", topo.path_name(gpc)))?;
+                let span = dram.len() / slot * slot;
+                if slot > s.smem.len() || span == 0 {
+                    return Err(format!("untracked: {} B chunks do not fit", p.chunk));
+                }
+                // Each SM writes its own part of the gpc's DRAM.
+                let at = |i: u64| (j as u64 * p.bytes.div_ceil(slot) + i) * slot % span;
+                for i in 0..p.bytes.div_ceil(p.chunk) {
+                    let len = p.chunk.min(p.bytes - i * p.chunk);
+                    let src = s.smem.base + i * slot % (s.smem.len() / slot * slot);
+                    let dst = dram.base + at(i);
+                    let desc = Descriptor {
+                        opcode: dma,
+                        pe: Some(s.dma),
+                        dst: dst_range(dst, len),
+                        versioned: false,
+                        untracked: true,
+                        inferred_version: None,
+                        deps: Vec::new(),
+                        label: Some(items.len() as u64),
+                        args: Args::Dma {
+                            src: Addr(src),
+                            dst: Addr(dst),
+                            bytes: len,
+                            tile_bytes: len,
+                        },
+                    };
+                    items.push(Item {
+                        desc,
+                        window: j,
+                        done: (0, 0),
+                        fence: false,
+                        wait: false,
+                    });
+                    metas.push(Meta {
+                        role: Role::Data,
+                        sm: j,
+                        bytes: len,
+                    });
+                }
+                // The signal: after a fence, a forwarded join into the
+                // device's sync space (one granule per SM, after the
+                // gpcs' spawn dones).
+                let signal = root_sync.base + (1024 + j as u64) * GRANULE;
+                if signal + GRANULE > root_sync.bound {
+                    return Err("untracked: the device's sync space is too small".into());
+                }
+                let mut join = Descriptor::join(dst_range(signal, GRANULE), Vec::new());
+                join.label = Some(items.len() as u64);
+                items.push(Item {
+                    desc: join,
+                    window: j,
+                    done: (signal, 0),
+                    fence: true,
+                    wait: false,
+                });
+                metas.push(Meta {
+                    role: Role::Flag,
+                    sm: j,
+                    bytes: 0,
+                });
+                signals.push(signal);
+            }
+        }
         m => {
             return Err(format!(
-                "unknown mode {m:?} (stream, latency, atlas, muon, pingpong, barrier, invoke)"
+                "unknown mode {m:?} (stream, latency, atlas, muon, pingpong, barrier, invoke, untracked)"
             ))
         }
     }
@@ -716,6 +822,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
         report,
         driver,
         tree,
+        signals,
     })
 }
 
@@ -736,6 +843,14 @@ async fn issue(ctx: &NuCtx, items: Vec<Item>, limit: usize, last: Vec<(u64, u64)
     let mut invoked_at = Vec::with_capacity(items.len());
     let mut latest: HashMap<u64, u64> = HashMap::new();
     for it in items {
+        if it.fence {
+            ctx.fence().await;
+        }
+        if it.desc.untracked {
+            ctx.invoke_untracked(it.desc).await;
+            invoked_at.push(ctx.now());
+            continue;
+        }
         let q = open.entry(it.window).or_default();
         if q.len() >= limit {
             let (a, v) = q.pop_front().expect("open task");
@@ -743,8 +858,10 @@ async fn issue(ctx: &NuCtx, items: Vec<Item>, limit: usize, last: Vec<(u64, u64)
         }
         ctx.invoke(it.desc).await;
         invoked_at.push(ctx.now());
-        open.entry(it.window).or_default().push_back(it.done);
-        latest.insert(it.done.0, it.done.1);
+        if it.wait {
+            open.entry(it.window).or_default().push_back(it.done);
+            latest.insert(it.done.0, it.done.1);
+        }
     }
     let waits = if last.is_empty() {
         let mut w: Vec<(u64, u64)> = latest.into_iter().collect();
@@ -800,6 +917,9 @@ impl Run {
                     };
                     ctx.spawn_named(g, "micro_gpc", done, vec![], gpc).await;
                     gpc_dones.push(done.base);
+                }
+                for a in self.signals {
+                    ctx.wait_unversioned(a).await;
                 }
                 for d in gpc_dones {
                     ctx.wait_unversioned(d).await;
@@ -1000,6 +1120,41 @@ pub fn result(r: &Report, stats: &Stats) -> Value {
                 out["call_cycles_per_task"] =
                     json!((calls[calls.len() - 1] - calls[0]) as f64 / (calls.len() - 1) as f64);
             }
+        }
+        "untracked" => {
+            // Per SM: bytes, the first chunk start, the last chunk end
+            // and the signal's completion at the device.
+            let mut per = Vec::new();
+            for j in 0..r.sms.len() {
+                let mine = |role: Role| {
+                    r.metas
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, m)| m.role == role && m.sm == j)
+                };
+                let dma: Vec<&sim_core::TaskTimeline> =
+                    mine(Role::Data).filter_map(|(i, _)| task(i)).collect();
+                let bytes: u64 = mine(Role::Data).map(|(_, m)| m.bytes).sum();
+                let start = dma.iter().filter_map(|t| first_start(t)).min();
+                let end = dma.iter().filter_map(|t| last_end(t)).max();
+                let signal = mine(Role::Flag)
+                    .filter_map(|(i, _)| task(i))
+                    .find_map(|t| t.complete);
+                per.push(json!({
+                    "sm": r.sms[j].path,
+                    "bytes": bytes,
+                    "first_start": start,
+                    "last_end": end,
+                    "signal_complete": signal,
+                    "end_to_signal": end.zip(signal).map(|(e, s)| s.saturating_sub(e)),
+                }));
+            }
+            let total: u64 = data.iter().map(|(_, m)| m.bytes).sum();
+            out["bytes"] = json!(total);
+            out["bytes_per_cycle"] = json!(total as f64 / driver_cycles.max(1) as f64);
+            out["invoke_messages"] =
+                json!(stats.messages_by_kind.get("Invoke").copied().unwrap_or(0));
+            out["per_sm"] = Value::Array(per);
         }
         _ => {}
     }

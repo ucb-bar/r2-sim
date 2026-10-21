@@ -25,8 +25,9 @@ device:
     - {name: l2bus, topology: xbar}
     - {name: mbus, topology: xbar}
     # The full card's hash without its top index bit (address bit 15).
+    # Linear [64 MiB, 128 MiB): no node owns the null address (2026-10-20).
     - {name: sbus_to_l2bus, topology: link, from: $this.sbus, to: $this.l2bus, latency: 0,
-       hash: {range: [0x0, 0x4000000], to_range: [0x100000000, 0x104000000],
+       hash: {range: [0x4000000, 0x8000000], to_range: [0x100000000, 0x104000000],
               index: [0x1A4100, 0x1F0400, 0x190800, 0x1F5000, 0x136000],
               drop: [8, 10, 11, 12, 13]}}
     # 32 channels of 1.5 GiB: linear [32 GiB, 80 GiB) to physical at

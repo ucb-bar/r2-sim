@@ -91,6 +91,7 @@ fn a_split_operand_reads_its_halves() {
             pe: None,
             dst: Range::from_len(pc, 32),
             versioned: false,
+            untracked: false,
             inferred_version: None,
             deps: vec![],
             label: None,

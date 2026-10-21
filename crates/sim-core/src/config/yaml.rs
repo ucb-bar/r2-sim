@@ -104,7 +104,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use nu_model::{AddressHash, DepConfig, NeutrinoId, Range};
+use nu_model::{Addr, AddressHash, DepConfig, NeutrinoId, Range};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 
@@ -1364,6 +1364,13 @@ impl Builder {
             }
             owned.push(range);
             hashes.push((b.name.clone(), rule));
+        }
+        // Address 0 is the null address (2026-10-20): no node owns it, so
+        // the key 0 names no producer (it is the fence's).
+        if let Some(r) = owned.iter().find(|r| r.contains(Addr(0))) {
+            return err(format!(
+                "{path}: owned range {r} holds address 0, the null address"
+            ));
         }
         // Link resources first, in fabric order (data, then control, as
         // the configurations list them).

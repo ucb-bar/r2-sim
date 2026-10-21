@@ -36,6 +36,7 @@ fn matmul(b: &Built, pe: &str, c: Range, label: u64) -> Descriptor {
         pe: Some(b.pe(pe)),
         dst: c,
         versioned: true,
+        untracked: false,
         inferred_version: None,
         deps: vec![],
         label: Some(label),

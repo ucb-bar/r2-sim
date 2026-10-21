@@ -60,7 +60,9 @@ fn the_rtx6000_configurations_build() {
         }
         // Programs address the linear ranges: the banked memories' names
         // map there.
-        assert_eq!(b.memory("root.l2").base, 0);
+        // The L2's linear range starts one L2 size (2 MiB per slice) above
+        // 0: no node owns the null address.
+        assert_eq!(b.memory("root.l2").base, (l2 as u64) << 21);
         assert_eq!(b.memory("root.hbm").base, 0x8_0000_0000);
     }
 }
@@ -138,17 +140,32 @@ const GRANULES: &[(u64, u64)] = &[
 #[test]
 fn the_l2_hash_maps_the_granules_of_the_card() {
     let b = config("rtx6000.yaml");
-    let h = b.sim.hashes().find(|h| h.range.base == 0).unwrap().clone();
+    // The L2's linear range starts at 128 MiB (bit 27, outside the index
+    // masks), so offset a from its base maps as card address a.
+    let h = b
+        .sim
+        .hashes()
+        .find(|h| h.range.base == 0x800_0000)
+        .unwrap()
+        .clone();
     assert_eq!((h.granule(), h.slice_bytes()), (256, 2 << 20));
+    let base = h.range.base;
     for &(a, slice) in GRANULES {
-        assert_eq!(h.slice(a), slice, "granule {a:#x}");
+        assert_eq!(h.slice(base + a), slice, "granule {a:#x}");
         // Physically in the slice's bank.
-        assert_eq!((h.rewrite(a) - h.to_range.base) / h.slice_bytes(), slice);
+        assert_eq!(
+            (h.rewrite(base + a) - h.to_range.base) / h.slice_bytes(),
+            slice
+        );
     }
     // Bit 9 does not take part: the two halves of a 1 KiB pair share a
     // slice; every granule of the page.
     for a in (0..2u64 << 20).step_by(256) {
-        assert_eq!(h.slice(a), h.slice(a ^ 0x200), "granule {a:#x}");
+        assert_eq!(
+            h.slice(base + a),
+            h.slice(base + (a ^ 0x200)),
+            "granule {a:#x}"
+        );
     }
 }
 
@@ -178,6 +195,7 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
                 pe: Some(b.pe("root.gpc0.sm0.dma")),
                 dst: Range::from_len(dst, T),
                 versioned: false,
+                untracked: false,
                 inferred_version: None,
                 deps: vec![],
                 label: Some(i),
@@ -246,6 +264,7 @@ fn two_matmuls(units: [&str; 2]) -> [u64; 2] {
             pe: Some(b.pe(&format!("root.gpc0.sm0.{u}"))),
             dst: Range::from_len(smem + 0x8000 * i as u64, 0x8000),
             versioned: false,
+            untracked: false,
             inferred_version: None,
             deps: vec![],
             label: Some(i as u64),

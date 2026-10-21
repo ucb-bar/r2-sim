@@ -22,7 +22,7 @@ device:
        slave: $this.sbus, cache: {of: $this.hbm, line_bytes: 256}}
     - {name: hbm, type: dram, addr: [[0x200000, 0x400000]], banks: 2, bw_bytes: 64, latency: 50,
        slave: $this.sbus}
-    - {name: buf, type: scratch, addr: [[0x0, 0x40000]], bw_bytes: 64, slave: $this.sbus}
+    - {name: buf, type: scratch, addr: [[0x40000, 0x80000]], bw_bytes: 64, slave: $this.sbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
   compute:
     - {name: dma, type: dma, latency: 4, master: [$this.sbus]}
@@ -64,6 +64,7 @@ fn run(steps: &[Step]) -> Stats {
                 pe: Some(pe),
                 dst: Range::from_len(dst, bytes.div_ceil(512) * 512),
                 versioned: false,
+                untracked: false,
                 inferred_version: None,
                 deps: vec![],
                 label: Some(i as u64),
