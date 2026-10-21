@@ -3,10 +3,14 @@
 # * Bridge to the gpc: 128 B/cycle each way (half the SMEM's two read
 #   ports together, so one SM cannot saturate the gpc crossbar alone),
 #   latency 10 cycles.
-# * smsbus: the SM's data bus to the gpc (unlimited); smcbus: its control
-#   bus (unlimited); lbus: local scratch (unlimited). The SMEM ports are the
-#   only limit on SMEM traffic. SMEM is a slave on lbus and smsbus: local
-#   units reach it over lbus, other nodes over smsbus.
+# * smsbus: the SM's data bus to the gpc (unlimited); lbus: local scratch
+#   (unlimited). The SMEM ports are the only limit on SMEM traffic. SMEM is
+#   a slave on lbus and smsbus: local units reach it over lbus, other nodes
+#   over smsbus.
+# * Control fabric (2026-10-20): smcbus, the SM's control bus,
+#   and the control link to the gpc move 8 B/cycle per port and per
+#   direction, as the gpc and device control crossbars; a 64 B message beat
+#   takes 8 cycles on each control hop.
 # * SMEM: 1 MiB as two contiguous banks of 512 KiB (`banks: 2`, smem.b0
 #   and smem.b1), each with one read port and one write port at 128
 #   B/cycle, latency 10 cycles; no hash link (2026-10-13;
@@ -41,13 +45,12 @@
 
 fabric:
   - {name: smsbus, topology: xbar}
-  - {name: smcbus, topology: xbar, control: true}
+  - {name: smcbus, topology: xbar, bw_bytes: 8, beat_bytes: 8, control: true}
   - {name: lbus, topology: xbar}
-  # Links to the gpc (architecture Section 8.2): data and control, each
-  # 128 B/cycle per direction (the control link at the data rate, as the
-  # bridge before it), latency 10 cycles.
+  # Links to the gpc (architecture Section 8.2), latency 10 cycles: data
+  # 128 B/cycle per direction; control 8 B/cycle per direction.
   - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 128, wr_bytes: 128, latency: 10}
-  - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 128, latency: 10, control: true}
+  - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 8, beat_bytes: 8, latency: 10, control: true}
 memory:
   - {name: smem, type: scratch, addr: [[0x0, 0x100000]], banks: 2, bw_bytes: 128, wr_bytes: 128, latency: 10,
      slave: [$this.lbus, $this.smsbus]}

@@ -18,7 +18,7 @@ device:
   name: root
   fabric:
     - {name: sbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
-    - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
+    - {name: cbus, topology: xbar, bw_bytes: 8, beat_bytes: 8, control: true}
   memory:
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
   neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}

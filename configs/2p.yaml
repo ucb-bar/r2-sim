@@ -34,8 +34,9 @@ device:
     # Data between the gpcs: 512 B/cycle per port, with separate read and
     # write channels at that rate (architecture Section 3.5).
     - {name: sbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
-    # Control between the gpcs: 64 B/cycle per port, one beat per cycle.
-    - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
+    # Control between the gpcs: 8 B/cycle per port (2026-10-20):
+    # a 64 B message beat takes 8 cycles on each control hop.
+    - {name: cbus, topology: xbar, bw_bytes: 8, beat_bytes: 8, control: true}
   memory:
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
   neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
