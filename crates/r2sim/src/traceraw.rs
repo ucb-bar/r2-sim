@@ -1,6 +1,9 @@
 //! The raw trace dump for the r2-vis converter (`--trace-raw DIR`).
 //!
-//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.7.
+//! The format belongs to r2-vis: `r2-vis/docs/trace-raw.md`, version 1.8
+//! (1.8: a forwarded VersionReset has an inbound_invokes entry that ends
+//! when it takes effect at the head of the owner's table, and the version
+//! entry it frees ends then).
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
 //! one file of fixed-size little-endian records per record type, and
 //! `summary.json` (written after the run, also after a fatal error).
@@ -2013,7 +2016,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         .collect();
     json!({
         "format": "r2raw",
-        "version": [1, 7],
+        "version": [1, 8],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

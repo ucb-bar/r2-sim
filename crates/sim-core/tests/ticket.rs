@@ -334,3 +334,45 @@ fn an_outbound_entry_frees_on_its_invoke_ack() {
     assert_eq!(stall, 66 - 16);
     assert_eq!(peak, 1);
 }
+
+#[test]
+fn a_version_reset_at_a_full_inbound_table_is_replayed_in_order() {
+    // M1 (version 1 of C) takes sm1's one inbound entry. sm0's
+    // VersionReset of C then finds the table full: sm1 answers RetryAck
+    // and sets sm0's bit (a VersionReset takes an entry like an Invoke,
+    // 2026-10-20). When M1 enters the scoreboard (200) the freed entry is
+    // granted, sm0 replays the VersionReset, and it frees C's version
+    // entry: M2, invoked after M1 is done, is version 1 again.
+    let b = built("ticket");
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
+    let at = move |i: u64| Range::from_len(s1 + i * MAT, MAT);
+    let atlas = "root.gpc0.sm1.atlas";
+    let prog1 = sm1_program(&b, at);
+    let c = at(2);
+    let (m1, m2) = (
+        matmul(&b, atlas, c, vec![], 2).with_inferred_version(1),
+        matmul(&b, atlas, c, vec![], 3).with_inferred_version(1),
+    );
+    let mut sim = b.sim;
+    sim.spawn(sm1, prog1);
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        ctx.invoke(m1).await;
+        ctx.vreset(c.base).await;
+        ctx.wait(c.base, 1).await;
+        ctx.invoke(m2).await;
+        ctx.wait(c.base, 1).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert!(s.unfinished.is_empty());
+    let v = |l: u64| s.tasks.iter().find(|t| t.label == Some(l)).unwrap().version;
+    assert_eq!((v(2), v(3)), (Some(1), Some(1)));
+    let k = &s.messages_by_kind;
+    assert_eq!(
+        (k.get("RetryAck"), k.get("PCrdGrant")),
+        (Some(&1), Some(&1))
+    );
+    assert_eq!(k.get("VersionReset"), Some(&2), "the reset and its replay");
+    assert_eq!(s.tickets[sm0.0 as usize], 1);
+}

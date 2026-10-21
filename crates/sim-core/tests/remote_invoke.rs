@@ -526,3 +526,56 @@ fn a_join_with_20_deps_travels_in_3_beats() {
     // The join, then the Await, AwaitAck and Resolve of sm0's wait.
     assert_eq!(s.beats, [3, 0, 1, 0]);
 }
+
+#[test]
+fn a_version_reset_takes_effect_after_the_invokes_before_it() {
+    // sm1's scoreboard holds one entry, taken by P2 until 200, so sm0's
+    // forwarded M1 and M2 (versions 1 and 2 of C) wait in sm1's inbound
+    // invoke table; sm0's VersionReset of C arrives behind them and waits
+    // too (all messages of the invoke protocol from one requester take
+    // effect in program order, 2026-10-20). It frees C's version entry
+    // only after M1 and M2 have entered, so M3, invoked after M2 is done,
+    // is version 1 again (an immediate free on arrival would have found no
+    // entry and M3 would be version 3).
+    let b = built_with(&["scoreboard=1"]);
+    let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
+    let s1 = b.memory("root.gpc0.sm1.smem").base;
+    let (x, y, c) = (
+        Range::from_len(s1, MAT),
+        Range::from_len(s1 + MAT, MAT),
+        Range::from_len(s1 + 2 * MAT, MAT),
+    );
+    let atlas = "root.gpc0.sm1.atlas";
+    let (p1, p2) = (matmul(&b, atlas, x, vec![]), matmul(&b, atlas, y, vec![]));
+    let ms: Vec<Descriptor> = (1..=3)
+        .map(|v| matmul(&b, atlas, c, vec![]).with_inferred_version(if v == 3 { 1 } else { v }))
+        .collect();
+    let mut sim = b.sim;
+    sim.set_timeline(true);
+    sim.spawn(sm1, move |ctx: NuCtx| async move {
+        ctx.invoke(p1).await;
+        ctx.invoke(p2).await;
+    });
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let mut ms = ms.into_iter();
+        ctx.invoke(ms.next().unwrap()).await;
+        ctx.invoke(ms.next().unwrap()).await;
+        ctx.vreset(c.base).await;
+        ctx.wait(c.base, 2).await;
+        ctx.invoke(ms.next().unwrap()).await;
+        ctx.wait(c.base, 1).await;
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    assert!(s.unfinished.is_empty());
+    let versions: Vec<u64> = s
+        .tasks
+        .iter()
+        .filter(|t| t.nu == sm1)
+        .skip(2)
+        .map(|t| t.version.unwrap())
+        .collect();
+    assert_eq!(versions, vec![1, 2, 1]);
+    // M1, M2 and the VersionReset were in the inbound table at once.
+    assert_eq!(s.inbound_invoke_peak[sm1.0 as usize], 3);
+}

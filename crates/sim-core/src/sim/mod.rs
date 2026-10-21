@@ -149,6 +149,23 @@ enum ExecutionWaiter {
     NoPe(TaskId),
 }
 
+/// An entry of a Neutrino's inbound invoke table. Invokes are most of
+/// the entries and kept inline as before (no allocation per forwarded
+/// invoke).
+#[allow(clippy::large_enum_variant)]
+enum Inbound {
+    /// A forwarded invoke: how it enters, and its descriptor.
+    Invoke(Entry, Descriptor),
+    /// A `VersionReset` of `addr` from `from` (its outbound entry `seq`):
+    /// it takes effect at the head of the table, in program order with the
+    /// requester's invokes (architecture Section 3.3).
+    VReset {
+        from: NeutrinoId,
+        seq: u64,
+        addr: u64,
+    },
+}
+
 struct Neutrino {
     id: NeutrinoId,
     cfg: NeutrinoConfig,
@@ -204,10 +221,10 @@ struct Neutrino {
     ticket_peak: usize,
     /// The most outbound invoke table entries in use at once.
     outbound_peak: usize,
-    /// Inbound invoke table: accepted forwarded invokes (how they enter,
-    /// and the descriptor) waiting for a scoreboard entry or for issue
-    /// headroom, in arrival order.
-    inbound: VecDeque<(Entry, Descriptor)>,
+    /// Inbound invoke table: accepted forwarded invokes waiting for a
+    /// scoreboard entry or for issue headroom, and `VersionReset`s waiting
+    /// for their turn, in arrival order.
+    inbound: VecDeque<Inbound>,
     /// The most entries the inbound invoke table held at once.
     inbound_peak: usize,
     /// A `DrainInbound` event is queued.

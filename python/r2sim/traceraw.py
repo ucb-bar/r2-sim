@@ -1,6 +1,6 @@
 """Check a raw trace dump (`r2sim run ... --trace-raw DIR`).
 
-The format is r2-vis's `trace-raw.md` (version 1.7; older versions read
+The format is r2-vis's `trace-raw.md` (version 1.8; older versions read
 as that document says). The checks are the ones of its Section 8, plus
 the file layout:
 
@@ -18,9 +18,11 @@ the file layout:
 * entries (version 1.3): end >= start; per Neutrino and table the open
   entries at any cycle are at most the table's capacity in the manifest;
   in a complete dump every gid has a task record, a pending entry that
-  left has the gid of its adopting task, an inbound invoke entry ends at
-  its task's invoke and an outbound one (not a VersionReset) starts at
-  its task's `queued`;
+  left has the gid of its adopting task, an inbound invoke entry of an
+  Invoke ends at its task's invoke and an outbound one (not a
+  VersionReset) starts at its task's `queued`; a VersionReset record
+  (flags bit 0) in inbound_invokes (version 1.8) or outbound_invokes has
+  gid null;
 * hash links (version 1.4): the rule's fields are consistent (equal
   range sizes, granule = the lowest bit of any mask, slice_bytes = size /
   2^masks, one drop bit per mask), and every write port (`wport`) has
@@ -324,9 +326,15 @@ def check_entries(r: Report, manifest: dict, recs: dict) -> None:
     p = (e["table"] == 0) & closed
     r.check(bool(named[p].all()), f"pending: {int(np.count_nonzero(p & ~named))} "
             "entries that left without an adopting task")
-    i = (e["table"] == 3) & closed & named & found
+    vr = (e["flags"] & VRESET) != 0
+    i = (e["table"] == 3) & ~vr & closed & named & found
     r.check(bool((e["end"][i] == task["invoke"][i]).all()),
             f"inbound_invokes: {int(np.count_nonzero(i))} end at their task's invoke")
+    v = ((e["table"] == 3) | (e["table"] == 5)) & vr
+    r.check(bool((~named[v]).all()),
+            f"VersionReset entries: {int(np.count_nonzero(v & (e['table'] == 3)))} inbound, "
+            f"{int(np.count_nonzero(v & (e['table'] == 5)))} outbound, "
+            f"{int(np.count_nonzero(v & named))} with a gid")
     o = (e["table"] == 5) & (e["flags"] & VRESET == 0) & named & found
     r.check(bool((e["start"][o] == task["queued"][o]).all()),
             f"outbound_invokes: {int(np.count_nonzero(o))} start at their task's queued")

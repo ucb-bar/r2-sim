@@ -32,15 +32,22 @@
 //! program order.
 //!
 //! A message is `ceil(bytes / msg_bytes)` beats of `msg_bytes`, at most 4.
-//! `VersionReset` travels in the invoke channel: it keeps program order with
-//! the requester's invokes to the same owner. A rejected `Await` is resent
+//! `VersionReset` travels in the invoke channel and takes an entry of the
+//! owner's inbound invoke table, as an `Invoke` does (ready/valid: it
+//! reserves the entry when it leaves the last stage; ticket flow: a full
+//! table answers it `RetryAck` and it is replayed). It takes effect when it
+//! reaches the head of the table: it frees the version entry of its base
+//! (absent: no-op) and needs no other resource. So a requester's
+//! `VersionReset` takes effect after its earlier invokes to that owner have
+//! entered (architecture Section 3.3; decided 2026-10-20). A local `vreset`
+//! is immediate. A rejected `Await` is resent
 //! after `t_retry`.
 
 use nu_model::{
     handle_await, AckAction, AwaitAck, AwaitMsg, Dep, NeutrinoId, Purpose, RequestId, TaskId,
 };
 
-use super::{trace, EnterFail, Entry, ProgState, Sim};
+use super::{trace, EnterFail, Entry, Inbound, ProgState, Sim};
 use crate::event::{Event, Stage};
 use crate::profile::{Descriptor, OpcodeId};
 use crate::program::{NuCtx, Response, StartFn};
@@ -551,9 +558,12 @@ impl Sim {
                 self.queue
                     .push(end + hop.latency, Event::HopArrive { msg: id });
             } else {
-                // The receiver. A ready/valid invoke needs a free entry in
-                // the owner's inbound invoke table.
-                let is_invoke = matches!(m.kind, MsgKind::Invoke { .. });
+                // The receiver. A ready/valid invoke or VersionReset needs a
+                // free entry in the owner's inbound invoke table.
+                let is_invoke = matches!(
+                    m.kind,
+                    MsgKind::Invoke { .. } | MsgKind::VersionReset { .. }
+                );
                 let lead = if m.hops.is_empty() { m.lead } else { 0 };
                 let free = (m.hops.is_empty() && self.tracer.is_some()).then(|| Who::Message {
                     kind,
@@ -781,20 +791,33 @@ impl Sim {
                     trace!(self, t => t.entry_open(&e, start));
                 }
                 let n = &mut self.nus[to.0 as usize];
-                n.inbound.push_back((Entry::Inbound(call), *desc));
+                n.inbound
+                    .push_back(Inbound::Invoke(Entry::Inbound(call), *desc));
                 n.inbound_peak = n.inbound_peak.max(n.inbound.len());
                 self.drain_inbound(to);
             }
             MsgKind::VersionReset { addr } => {
-                self.nus[to.0 as usize].tables.vreset(addr);
-                let now = self.now;
-                trace!(self, t => t.entry_close(&TableEntry {
-                    peer: Some(from),
-                    ..TableEntry::new(to, Table::Versions, addr)
-                }, now));
-                // A freed entry lets a forwarded invoke that waits for one
-                // enter.
-                self.unstall(to);
+                // An entry of the inbound invoke table; it takes effect at
+                // the head (drain_inbound), after the requester's earlier
+                // invokes have entered.
+                if self.flow == Flow::ReadyValid {
+                    self.nus[to.0 as usize].inbound_reserved -= 1;
+                }
+                let seq = msg.seq;
+                if self.tracer.is_some() {
+                    let e = TableEntry {
+                        base: addr,
+                        peer: Some(from),
+                        flags: tr::INVOKE_VRESET,
+                        ..TableEntry::new(to, Table::InboundInvokes, inbound_id(from, seq))
+                    };
+                    let start = msg.reserved.unwrap_or(self.now);
+                    trace!(self, t => t.entry_open(&e, start));
+                }
+                let n = &mut self.nus[to.0 as usize];
+                n.inbound.push_back(Inbound::VReset { from, seq, addr });
+                n.inbound_peak = n.inbound_peak.max(n.inbound.len());
+                self.drain_inbound(to);
             }
             MsgKind::Return { task } => self.complete_after_charge(to, task),
             MsgKind::InvokeAck => self.ack_arrive(to, from),
@@ -829,7 +852,11 @@ impl Sim {
             return MsgKind::Reject;
         }
         let full = n.inbound.len() + n.inbound_reserved >= n.cfg.inbound_invokes;
-        if matches!(msg.kind, MsgKind::Invoke { .. }) && full {
+        if matches!(
+            msg.kind,
+            MsgKind::Invoke { .. } | MsgKind::VersionReset { .. }
+        ) && full
+        {
             n.tickets.held.insert(req.0, 1);
             n.tickets.peak = n.tickets.peak.max(n.tickets.held.len());
             self.ticket_stats.tickets[req.0 as usize] += 1;
@@ -1327,7 +1354,28 @@ impl Sim {
             if n.inbound.is_empty() {
                 break;
             }
-            let (entry, desc) = n.inbound.pop_front().expect("inbound invoke");
+            let (entry, desc) = match n.inbound.pop_front().expect("inbound entry") {
+                Inbound::Invoke(entry, desc) => (entry, desc),
+                Inbound::VReset { from, seq, addr } => {
+                    // Frees the version entry of its base (absent: no-op);
+                    // needs no other resource.
+                    self.nus[nu.0 as usize].tables.vreset(addr);
+                    moved = true;
+                    let now = self.now;
+                    trace!(self, t => t.entry_close(&TableEntry {
+                        peer: Some(from),
+                        ..TableEntry::new(nu, Table::Versions, addr)
+                    }, now));
+                    trace!(self, t => t.entry_close(&TableEntry {
+                        flags: tr::INVOKE_VRESET,
+                        ..TableEntry::new(nu, Table::InboundInvokes, inbound_id(from, seq))
+                    }, now));
+                    // A freed version entry lets a local invoke that waits
+                    // for one enter.
+                    self.unstall(nu);
+                    continue;
+                }
+            };
             match self.enter_task(nu, desc, entry) {
                 Ok(e) => {
                     moved = true;
@@ -1345,7 +1393,9 @@ impl Sim {
                     }
                 }
                 Err(EnterFail::Refused(desc)) => {
-                    self.nus[nu.0 as usize].inbound.push_front((entry, *desc));
+                    self.nus[nu.0 as usize]
+                        .inbound
+                        .push_front(Inbound::Invoke(entry, *desc));
                     break;
                 }
                 Err(EnterFail::Fatal(e)) => return self.fatal(nu, None, e),
