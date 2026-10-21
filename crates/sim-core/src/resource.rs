@@ -1,7 +1,7 @@
-//! The resource plane (architecture Section 5).
+//! The resource plane (r2sim spec Section 5).
 //!
 //! A flow resource has a rate per cycle of its own clock, a clock ratio to
-//! the core clock and a capacity in slots per core cycle (Section 5.2): a
+//! the core clock and a capacity in slots per core cycle (r2sim spec Section 5.2): a
 //! slot moves one beat per core cycle. Its calendar holds the slots in use
 //! over time in fixed point ([`SCALE`] units per slot). A chunk holds a
 //! constant usage of slots for whole cycles, at least one, and nothing
@@ -10,7 +10,7 @@
 //!
 //! [`Resources::reserve`] co-charges a compute chunk over the resources of
 //! its demand vector and [`Resources::reserve_path`] places a transfer
-//! chunk hop by hop (Section 5.4); both return the granted interval and
+//! chunk hop by hop (r2sim spec Section 5.6); both return the granted interval and
 //! the culprit.
 
 use std::collections::VecDeque;
@@ -47,7 +47,7 @@ impl Kind {
 /// What a demand's amount is: bytes read, bytes written, or work (MACs,
 /// lane-ops, instructions). Every hop is charged in the direction the
 /// data moves; a write uses the write channel of a hop that has one
-/// (`wr_bytes`, architecture Section 3.5), a read the read channel. The
+/// (`wr_bytes`, Radiance 2 spec Section 3.4), a read the read channel. The
 /// direction is also recorded in the statistics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Dir {
@@ -73,12 +73,12 @@ pub struct Demand {
     pub resource: ResourceId,
     /// MACs, lane-ops, bytes, instructions.
     pub amount: u64,
-    /// Exclusive efficiency in (0, 1] (Section 5.6).
+    /// Exclusive efficiency in (0, 1] (r2sim spec Section 7.1).
     pub utilization: Ratio,
     /// Read, write or work.
     pub dir: Dir,
     /// The master's beat in bytes on a data resource (the chunk's beat
-    /// there is the smaller of it and the resource's beat; Section 5.4);
+    /// there is the smaller of it and the resource's beat; r2sim spec Section 5.6);
     /// 0: the resource's beat.
     pub beat: u64,
     /// The rate class of a work demand on a resource whose rate depends
@@ -162,12 +162,12 @@ pub struct Grant {
 }
 
 /// A flow resource: a rate, a clock ratio, a capacity in slots and a
-/// calendar of the slots in use over time (Section 5.2).
+/// calendar of the slots in use over time (r2sim spec Section 5.2).
 #[derive(Debug, Clone)]
 pub struct FlowResource {
     /// Units per cycle of the resource's own clock.
     rate: Ratio,
-    /// Its clock over the core clock (Section 4.1).
+    /// Its clock over the core clock (r2sim spec Section 2.1).
     clock: Ratio,
     /// The beat in bytes of a data resource (`beat_bytes`); `None`: one
     /// slot whose beat is the whole rate (a compute unit, or a data
@@ -177,7 +177,7 @@ pub struct FlowResource {
     /// `clock` without a beat (rounded down).
     cap: u64,
     /// The capacity as `(p, q)` when it is not an integer: its slots then
-    /// exist at fixed cycles (Section 5.2, whole slots by cycle), and a
+    /// exist at fixed cycles (r2sim spec Section 5.2, whole slots by cycle), and a
     /// window's length depends on its start. `None` for an integer
     /// capacity.
     frac: Option<(u64, u64)>,
@@ -271,7 +271,7 @@ impl FlowResource {
         assert!(self.cap > 0, "a flow resource with no capacity");
     }
 
-    /// The slots of the cycles `[0, t)`: `floor(t x C)` (Section 5.2).
+    /// The slots of the cycles `[0, t)`: `floor(t x C)` (r2sim spec Section 5.2).
     fn slots_to(t: Cycle, p: u64, q: u64) -> u128 {
         t as u128 * p as u128 / q as u128
     }
@@ -282,7 +282,7 @@ impl FlowResource {
         ceil_div((Self::slots_to(t0, p, q) + n) * q as u128, p as u128) as Cycle
     }
 
-    /// Whole cycles from `t0` for `beats` at `u` slots (Section 5.2): with
+    /// Whole cycles from `t0` for `beats` at `u` slots (r2sim spec Section 5.2): with
     /// an integer capacity `ceil(beats / u)`; otherwise the chunk moves u
     /// / C of the slots that exist in its window, so it needs `N =
     /// ceil(beats x C / u)` of them (`beats` when it holds the whole
@@ -354,14 +354,14 @@ impl FlowResource {
         (s, self.window(s, beats, u))
     }
 
-    /// Splits the rate into slots of `beat` bytes (Section 5.2).
+    /// Splits the rate into slots of `beat` bytes (r2sim spec Section 5.2).
     fn set_beat(&mut self, beat: u64) {
         assert!(beat > 0, "beat of 0 bytes");
         self.beat = Some(beat);
         self.set_cap();
     }
 
-    /// Sets the clock ratio (Section 4.1).
+    /// Sets the clock ratio (r2sim spec Section 2.1).
     fn set_clock(&mut self, clock: Ratio) {
         assert!(clock.num > 0, "clock 0");
         self.clock = clock;
@@ -737,7 +737,7 @@ pub struct ResourceStats {
     pub name: String,
     /// The resource's kind.
     pub kind: Kind,
-    /// Flow: slots per core cycle (Section 5.2). Occupancy: 0.
+    /// Flow: slots per core cycle (r2sim spec Section 5.2). Occupancy: 0.
     pub slots: f64,
     /// Flow: units (bytes, MACs, lane-ops, instructions) per core cycle.
     /// Occupancy: 0.
@@ -773,16 +773,16 @@ pub struct ResourceStats {
     pub delay_cycles: u64,
 }
 
-/// How one chunk charges the resources of its demand vector (Section 5.4).
+/// How one chunk charges the resources of its demand vector (r2sim spec Section 5.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CoCharge {
     /// Every resource over `[t, t + D)`, `D` the longest own duration (the
-    /// first rule of Section 5.4). A fast resource shared by slower paths is
+    /// first-draft rule, r2sim spec Section 5.7). A fast resource shared by slower paths is
     /// held for the slow duration.
     Longest,
     /// Each resource over its own duration from `t`; the chunk still ends at
     /// `t + D`. A fast shared resource can serve other chunks meanwhile. The
-    /// default (Section 5.4, decided 2026-09-22).
+    /// default (r2sim spec Section 5.7, decided 2026-09-22).
     #[default]
     Own,
 }
@@ -806,7 +806,7 @@ pub struct Resources {
     /// The (usage, length) of a compute chunk's narrow option (kept
     /// across chunks).
     narrow_plan: Vec<(u64, u64)>,
-    /// The in-flight pools (Section 5.4, data-path rule 7).
+    /// The in-flight pools (r2sim spec Section 5.6, Rule S5.11).
     pools: Vec<Pool>,
 }
 
@@ -822,11 +822,11 @@ pub struct PathHop {
     pub latency: Cycle,
     /// The in-flight pool whose hold ends with this hop's window: the
     /// chunk crossed the pool's link into its node before this hop
-    /// (Section 5.4, data-path rule 7).
+    /// (r2sim spec Section 5.6, Rule S5.11).
     pub pool: Option<PoolMark>,
 }
 
-/// A pool on a route (Section 5.4, data-path rule 7): its index, and the
+/// A pool on a route (r2sim spec Section 5.6, Rule S5.11): its index, and the
 /// route latency from the pool's link to the hop that carries the mark
 /// (0 when the hop is the link itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -835,8 +835,8 @@ pub struct PoolMark {
     pub skip: Cycle,
 }
 
-/// What the in-flight pools need of a transfer chunk (Section 5.4,
-/// data-path rule 7): its issue cycle, the latency of its source block,
+/// What the in-flight pools need of a transfer chunk (r2sim spec
+/// Section 5.6, Rule S5.11): its issue cycle, the latency of its source block,
 /// and a pool whose link the chunk crosses after its last hop (the hold
 /// then ends with the chunk).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -863,7 +863,7 @@ struct Own {
     /// The demand's rate class, for a tracer.
     class: Option<u8>,
     /// A work demand's amount and utilization (its window on a resource
-    /// with a fractional capacity, Section 5.2).
+    /// with a fractional capacity, r2sim spec Section 5.2).
     amount: u64,
     util: Ratio,
 }
@@ -961,12 +961,12 @@ impl Resources {
         self.res.is_empty()
     }
 
-    /// Splits flow resource `id` into slots of `beat` bytes (Section 5.2).
+    /// Splits flow resource `id` into slots of `beat` bytes (r2sim spec Section 5.2).
     pub fn set_beat(&mut self, id: ResourceId, beat: u64) {
         self.flow_mut(id).set_beat(beat);
     }
 
-    /// Sets the clock ratio of flow resource `id` (Section 4.1).
+    /// Sets the clock ratio of flow resource `id` (r2sim spec Section 2.1).
     pub fn set_clock(&mut self, id: ResourceId, clock: Ratio) {
         self.flow_mut(id).set_clock(clock);
     }
@@ -1002,7 +1002,7 @@ impl Resources {
         }
     }
 
-    /// Co-charges one chunk at or after `earliest` (Section 5.4). Demands on
+    /// Co-charges one chunk at or after `earliest` (r2sim spec Section 5.7). Demands on
     /// the same resource with the same utilization are summed. Returns
     /// `None` for an empty demand vector.
     pub fn reserve(&mut self, demand: &[Demand], earliest: Cycle) -> Option<Grant> {
@@ -1050,7 +1050,7 @@ impl Resources {
         }));
         let big_d = own.iter().map(|o| o.dur).max().expect("nonempty");
         // What each resource holds: a data resource the slots its own
-        // rate needs over D, `beats / D` (Section 5.4), for D; a work
+        // rate needs over D, `beats / D` (r2sim spec Section 5.7), for D; a work
         // resource its whole capacity for its own duration (or D under the
         // longest rule).
         let own_mode = self.cocharge == CoCharge::Own;
@@ -1092,7 +1092,7 @@ impl Resources {
             o.charged = self.own_len(o, o.usage, o.charged, t, own_mode);
         }
         let mut end = t + own.iter().map(|o| o.charged).max().expect("nonempty");
-        // Starting on the free slots (Section 5.4): a chunk that its full
+        // Starting on the free slots (r2sim spec Section 5.7): a chunk that its full
         // usage delays may start at `earliest` on the slots free there and
         // run longer, if it then ends strictly sooner.
         if own_mode && t > earliest {
@@ -1146,7 +1146,7 @@ impl Resources {
 
     /// The length of `o`'s window from `t` at `usage`: `fixed` on an
     /// integer capacity; on a fractional one the window that holds its
-    /// beats in the slots from `t` (Section 5.2), except a work demand
+    /// beats in the slots from `t` (r2sim spec Section 5.2), except a work demand
     /// charged the chunk's D under the longest rule.
     #[inline]
     fn own_len(&self, o: &Own, usage: u64, fixed: u64, t: Cycle, own_mode: bool) -> u64 {
@@ -1161,7 +1161,7 @@ impl Resources {
         }
     }
 
-    /// The narrow option of a compute chunk (Section 5.4, starting on the
+    /// The narrow option of a compute chunk (r2sim spec Section 5.7, starting on the
     /// free slots): on each data resource u' = the slots that stay free
     /// from `earliest` over the window (at most its full usage), found by
     /// shrinking u' while the window lengthens; D' = the longest of the
@@ -1284,7 +1284,7 @@ impl Resources {
         }
     }
 
-    /// Reserves a transfer chunk along `hops` in route order (Section 5.4,
+    /// Reserves a transfer chunk along `hops` in route order (r2sim spec Section 5.6,
     /// data-path rule) for a master that moves one beat of `beat` bytes
     /// per cycle. Hop 0 at or after `earliest`, hop i+1 at or after hop
     /// i's start plus its latency. The chunk's beat on hop i is the
@@ -1305,9 +1305,9 @@ impl Resources {
     }
 
     /// [`Resources::reserve_path`] for a master of `beat` bytes that moves
-    /// `rate` bytes per core cycle (a clocked engine, Section 4.1); the
-    /// in-flight pools of the hops take the chunk by `admit` (Section
-    /// 5.4, data-path rule 7).
+    /// `rate` bytes per core cycle (a clocked engine, r2sim spec Section 2.1); the
+    /// in-flight pools of the hops take the chunk by `admit` (r2sim spec
+    /// Section 5.6, Rule S5.11).
     pub fn reserve_path_at(
         &mut self,
         hops: &[PathHop],
@@ -1319,8 +1319,8 @@ impl Resources {
         self.place(hops, beat, rate, earliest, false, admit)
     }
 
-    /// Adds an in-flight pool of `bytes` named `name` (Section 5.4,
-    /// data-path rule 7): an occupancy resource for its statistics and as
+    /// Adds an in-flight pool of `bytes` named `name` (r2sim spec
+    /// Section 5.6, Rule S5.11): an occupancy resource for its statistics and as
     /// a queue culprit. Returns its index for [`PoolMark`].
     pub fn add_pool(&mut self, name: &str, bytes: u64) -> u32 {
         assert!(bytes > 0, "a pool of 0 bytes");
@@ -1337,7 +1337,7 @@ impl Resources {
     }
 
     /// Reserves a protocol message of `hop.amount` bytes on one hop
-    /// (Section 5.4, details): one slot, or the whole capacity of a hop
+    /// (r2sim spec Section 5.6): one slot, or the whole capacity of a hop
     /// with less than one, for the message's beats at the smaller of
     /// `beat` and the hop's beat; store and forward, so the sender's
     /// earlier hops do not narrow it.

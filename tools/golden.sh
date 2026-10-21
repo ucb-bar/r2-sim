@@ -1,28 +1,22 @@
 #!/bin/bash
-# Golden check of the headline: runs the 10 forward-pass rows of
-# docs/results.md Section 3 and compares them with a reference run.
+# Golden check of the headline: runs the 10 forward-pass rows
+# below and compares them with a reference run.
 #
 #   tools/golden.sh record DIR        # run the rows into DIR (the reference)
 #   tools/golden.sh check REF DIR     # run into DIR and compare with REF
 #
-# Run from r2-sim/ after a release build. R2SIM overrides the binary
-# (default ../build/target/release/r2sim); GOLDEN_ARGS adds arguments to
+# Run from the repository root after a release build. R2SIM overrides the
+# binary (default ${CARGO_TARGET_DIR:-target}/release/r2sim); GOLDEN_ARGS adds arguments to
 # every run (for example GOLDEN_ARGS="--set global.endpoint_charging=false").
 # The rows run the default hierarchical program (configs/forward.toml);
-# GOLDEN_ARGS="--param drivers=single" runs the single driver. References:
-# scratch/fwd23 (hierarchical), scratch/fwd23-single (a Muon read pays its
-# block's latency, 2026-10-21; fwd22 without it, with the control fabric of
-# 8 B/cycle of 2026-10-20; fwd21 with 64 B/cycle control crossbars and no
-# backward pass in the data-path rule, fwd20 with the backward pass, fwd19 with
-# integer lanes, fwd18 before a
-# transfer paid its source latency, fwd18-4bank the four-bank SMEM of
-# 2026-10-12, fwd17 before the banks, fwd16 before compute chunks start on
-# the free lanes, fwd15 with one SMEM port).
+# GOLDEN_ARGS="--param drivers=single" runs the single driver. REF is a
+# directory that `record` wrote from a known-good build, with the same
+# GOLDEN_ARGS.
 # "check" exits with 1 when a summary line or a JSON file differs; the
 # comparison leaves out the wall time and the functional worker's progress
 # at each load (thread timing).
 set -euo pipefail
-R2SIM=${R2SIM:-../build/target/release/r2sim}
+R2SIM=${R2SIM:-${CARGO_TARGET_DIR:-target}/release/r2sim}
 
 run_all() {
   local out=$1

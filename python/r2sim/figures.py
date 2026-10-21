@@ -1,11 +1,11 @@
 """Turns r2sim runs into paper figures (PDF plus 300 dpi PNG).
 
-Usage, from r2-sim/ with the workspace environment:
+Usage, from the repository root in the pixi environment:
 
     PYTHONPATH=python python -m r2sim.figures headline RUN.json ... --out DIR
     PYTHONPATH=python python -m r2sim.figures trace TRACE_DIR --out DIR
 
-The default output folder is ../scratch/figures (outside the repository).
+The default output folder is out/figures.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 from . import plots, style
 from .data import load_run, load_trace
 
-DEFAULT_OUT = Path("../scratch/figures")
+DEFAULT_OUT = Path("out/figures")
 
 
 def headline(runs: list[Path], out: Path) -> list[Path]:

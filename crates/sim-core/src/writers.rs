@@ -1,4 +1,4 @@
-//! Last-writer tracking for functional sync (architecture Section 4.4).
+//! Last-writer tracking for functional sync (r2sim spec Section 3.4).
 //!
 //! A map from disjoint address intervals to the func seq of the op that
 //! wrote them last and the gid of the task that completed last on them. A

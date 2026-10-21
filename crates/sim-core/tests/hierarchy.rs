@@ -1,4 +1,4 @@
-//! Step 4: configuration, fabric paths, spawn_child, remote dependencies,
+//! Configuration, fabric paths, spawn_child, remote dependencies,
 //! remote loads. Config: `configs/two_sm.yaml`.
 //!
 //! Paths used below. sm0 -> sm1: sm0's bridge up (32 B/cycle, 10), the
@@ -145,8 +145,11 @@ fn remote_dep(delay: u64) -> Stats {
     let p = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]);
     let q = matmul(&b, "root.gpc0.sm0.atlas", c, vec![v1(x)]);
     let mut sim = b.sim;
-    // Each producer program waits for its output: its return frees its
-    // version table (Section 3.2), which a later remote lookup needs.
+    // Each producer program waits for its output before it returns, as a
+    // program whose output another node reads would: a return does not wait
+    // for tracked tasks. The timing does not depend on this wait. The remote
+    // lookup finds P either way, because a return does not clear the
+    // version table; a program start does (Neutrino spec Section 8.5).
     sim.spawn(sm1, move |ctx: NuCtx| async move {
         if delay > 0 {
             ctx.cycles(delay).await;
@@ -386,7 +389,7 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     let t = &s.tasks[0];
     // Issue 8, sm1's SMEM latency 10 (the pipeline fill) and the engine
     // latency 100: the hops in route order from 118, at the engine's 64 B
-    // beat narrowed by each hop (Section 5.4): sm1's SMEM port (128
+    // beat narrowed by each hop (r2sim spec Section 5.6): sm1's SMEM port (128
     // B/cycle) at 64, one of its two slots, [118, 246); sm1's bridge up
     // (32 B/cycle, half a 64 B slot) [118, 374), latency 10; the crossbar
     // ports (64 B/cycle, one slot) narrowed to 32, half a slot, [128, 384);

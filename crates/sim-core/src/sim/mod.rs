@@ -1,5 +1,5 @@
 //! The timing plane: Neutrino and PE actors, the task lifecycle, and the
-//! run loop (architecture Section 4.2).
+//! run loop (r2sim spec Section 4).
 //!
 //! ```text
 //! program call -> cost on ScalarOps -> NuExec: tables.invoke/wait/version/vreset
@@ -165,7 +165,7 @@ enum Inbound {
     Invoke(Entry, Descriptor),
     /// A `VersionReset` of `addr` from `from` (its outbound entry `seq`):
     /// it takes effect at the head of the table, in program order with the
-    /// requester's invokes (architecture Section 3.3).
+    /// requester's invokes (Neutrino spec Section 9.6).
     VReset {
         from: NeutrinoId,
         seq: u64,
@@ -276,10 +276,10 @@ struct Running {
     /// Streaming: the latest end of the chunks issued so far.
     last_end: Cycle,
     /// No chunk starts before this cycle plus its own latency: the issue
-    /// plus the profile's pipeline fill (architecture Section 5.7).
+    /// plus the profile's pipeline fill (r2sim spec Section 5.9).
     fill: Cycle,
     /// The pipeline fill itself: the source block's latency (for the
-    /// in-flight pools, Section 5.4, rule 7).
+    /// in-flight pools, r2sim spec Section 5.6, Rule S5.11).
     src_latency: Cycle,
 }
 
@@ -289,7 +289,7 @@ struct Pe {
     /// Ready tasks as (tracking Neutrino, task).
     ready: VecDeque<(NeutrinoId, TaskId)>,
     running: Vec<Running>,
-    /// Atlas accumulator memory (H3): held C tiles (dst, bytes), most
+    /// Atlas accumulator memory: held C tiles (dst, bytes), most
     /// recent first.
     acc: Vec<(Range, u64)>,
 }
@@ -332,7 +332,7 @@ pub struct Sim {
     /// The hops of the transfer chunk being reserved (kept across chunks).
     hop_buf: Vec<PathHop>,
 
-    /// Hash links (architecture Section 3.1): fabric link index, owner,
+    /// Hash links (Radiance 2 spec Section 3.3): fabric link index, owner,
     /// fidelity, rule.
     hashes: Vec<HashLink>,
     profiles: ProfileRegistry,
@@ -353,7 +353,7 @@ pub struct Sim {
     /// Messages in flight, by id.
     msgs: Vec<Option<Msg>>,
     msg_free: Vec<u32>,
-    /// The channel stages (Section 3.3, ready/valid).
+    /// The channel stages (Neutrino spec Section 9.2, ready/valid).
     stages: HashMap<crate::event::Stage, remote::StageQ>,
     /// Messages a hop stage holds (a pipeline register).
     hop_queue: usize,
@@ -369,7 +369,7 @@ pub struct Sim {
     bus_wr_rates: Vec<Option<crate::time::Ratio>>,
     /// Beat of each bus's resources; `None`: one lane.
     bus_beats: Vec<Option<u64>>,
-    /// Per bus: its clock ratio (Section 4.1), for its resources.
+    /// Per bus: its clock ratio (r2sim spec Section 2.1), for its resources.
     bus_clocks: Vec<crate::time::Ratio>,
     /// Cycle of the last task issue or completion.
     last_progress: Cycle,
@@ -631,7 +631,7 @@ impl Sim {
 
     /// Splits the resources of `bus` into slots of `beat` bytes: its shared
     /// lane, and the ports of the attachments made from now on.
-    /// Gives a bus a write channel at `rate` (`wr_bytes`, Section 3.5): a
+    /// Gives a bus a write channel at `rate` (`wr_bytes`, Radiance 2 spec Section 3.4): a
     /// write lane for a `Shared` bus, write ports for the attachments of an
     /// `Xbar`. Call it after [`Sim::set_bus_beat`] and before any
     /// attachment on the bus.
@@ -668,7 +668,7 @@ impl Sim {
 
     /// Gives fabric link `link` an in-flight pool of `bytes` named `name`
     /// for the data moving from its `a` bus to its `b` bus (`ab`) or back
-    /// (Section 5.4, data-path rule 7).
+    /// (r2sim spec Section 5.6, Rule S5.11).
     pub fn set_link_pool(&mut self, link: usize, ab: bool, name: &str, bytes: u64) {
         let pool = self.res.add_pool(name, bytes);
         self.topo.set_link_pool(link, ab, pool);
@@ -686,7 +686,7 @@ impl Sim {
         }
     }
 
-    /// Sets the clock ratio of `bus` (Section 4.1): its shared resource,
+    /// Sets the clock ratio of `bus` (r2sim spec Section 2.1): its shared resource,
     /// and the ports of the attachments and the write channel made from
     /// now on.
     pub fn set_bus_clock(&mut self, bus: BusId, clock: crate::time::Ratio) {
@@ -915,7 +915,7 @@ impl Sim {
         }
     }
 
-    /// Sets `quantize` on every Atlas PE (Section 5.5 knob).
+    /// Sets `quantize` on every Atlas PE (r2sim spec Section 6.2 knob).
     pub fn set_atlas_quantize(&mut self, quantize: bool) {
         self.each_atlas(|q, _, _| *q = quantize);
     }
@@ -956,12 +956,12 @@ impl Sim {
         }
     }
 
-    /// Atlas accumulator memory in bytes (H3; 0 = none).
+    /// Atlas accumulator memory in bytes (0 = none).
     pub fn set_atlas_acc_buffer(&mut self, bytes: u64) {
         self.each_atlas(|_, a, _| *a = bytes);
     }
 
-    /// Atlas operand reuse (H1): keep the A row panel across a row's
+    /// Atlas operand reuse: keep the A row panel across a row's
     /// output tiles.
     pub fn set_atlas_row_panel(&mut self, on: bool) {
         self.each_atlas(|_, _, r| *r = on);
@@ -991,7 +991,7 @@ impl Sim {
         }));
     }
 
-    /// Adds the address rewrite of fabric link `link` (Section 3.1), whose
+    /// Adds the address rewrite of fabric link `link` (Radiance 2 spec Section 3.3), whose
     /// node `owner` owns its linear range.
     pub fn add_hash(&mut self, link: usize, owner: NeutrinoId, numeric: bool, hash: AddressHash) {
         self.hashes.push(HashLink {
@@ -1069,7 +1069,7 @@ impl Sim {
             self.topo.node(nu).children.clone(),
             n.cfg.costs.plan,
         );
-        // A program start resets the Neutrino's version table (Section 3.2).
+        // A program start resets the Neutrino's version table (Neutrino spec Section 7.7).
         n.tables.vreset_all();
         n.program = Some(Box::pin(program.run(ctx)));
         n.prog_name = name;
@@ -1339,7 +1339,7 @@ impl Sim {
         let n = &mut self.nus[nu.0 as usize];
         let parent = n.parent_task.take();
         // Program return frees the done unversioned entries
-        // (Section 3.2); the version table resets at the next start.
+        // (Neutrino spec Section 8.5); the version table resets at the next start.
         let fx = n.tables.program_returned();
         self.effects(nu, None, fx);
         if let Some((parent, task)) = parent {
@@ -1430,7 +1430,7 @@ impl Sim {
         self.granted(g, earliest, who)
     }
 
-    /// Reserves a transfer chunk along `path` in route order (Section 5.4,
+    /// Reserves a transfer chunk along `path` in route order (r2sim spec Section 5.6,
     /// data-path rule) for `who`, starting at or after `earliest`, for a
     /// master that moves one beat of `beat` bytes per cycle.
     fn reserve_path(
@@ -1462,8 +1462,8 @@ impl Sim {
         self.granted(g, earliest, who)
     }
 
-    /// Reserves a protocol message on one hop for `who` (Section 5.4,
-    /// details), its sender moving beats of `beat` bytes.
+    /// Reserves a protocol message on one hop for `who` (r2sim spec
+    /// Section 5.6), its sender moving beats of `beat` bytes.
     pub(crate) fn reserve_message(
         &mut self,
         hop: PathHop,
@@ -1661,7 +1661,7 @@ impl Sim {
         };
         let load = matches!(req, Request::Load { .. });
         // One piece per block it touches: a piece never crosses a block
-        // boundary (Section 5.3). The access is done when its last piece
+        // boundary (r2sim spec Section 5.4). The access is done when its last piece
         // is.
         let (mut a, stop, mut done) = (addr.0, addr.0 + len, self.now);
         loop {
@@ -1685,7 +1685,7 @@ impl Sim {
 
     /// The most a load or store piece at `a` in memory block `i` may move:
     /// the `block_bytes` grid of the block's port and of the route the
-    /// data takes (Section 5.3).
+    /// data takes (r2sim spec Section 5.4).
     fn mem_grid(&self, nu: NeutrinoId, i: usize, a: u64, load: bool) -> u64 {
         let mem = &self.memories[i];
         let hub = self.topo.data_hub(nu);
@@ -1702,7 +1702,7 @@ impl Sim {
     /// returns the cycle it is done.
     fn mem_piece(&mut self, nu: NeutrinoId, i: usize, n: u64, load: bool) -> Result<Cycle, String> {
         let mem = &self.memories[i];
-        // A transfer in data order (Section 5.4, data-path rule). A load:
+        // A transfer in data order (r2sim spec Section 5.6, data-path rule). A load:
         // the request takes the route to the block and the block latency,
         // then the data comes back from the port over the return route. A
         // store: the data takes the route to the block, then the port; the
@@ -1725,7 +1725,7 @@ impl Sim {
             latency,
             pool,
         };
-        // The in-flight pools (Section 5.4, rule 7): a load's source is the
+        // The in-flight pools (r2sim spec Section 5.6, Rule S5.11): a load's source is the
         // block; a store's is the Neutrino (no source latency).
         let mut admit = crate::resource::Admit {
             issue: self.now,
@@ -1787,7 +1787,7 @@ impl Sim {
         }
     }
 
-    /// A functional sync point (Section 4.4).
+    /// A functional sync point (r2sim spec Section 3.4).
     fn load(&mut self, nu: NeutrinoId, addr: Addr, len: u64) {
         let range = Range::from_len(addr.0, len);
         // Race check in the owner's tables (a debug check with no cost): a
@@ -1849,7 +1849,7 @@ impl Sim {
     }
 
     /// A `version` names a range that `nu` owns: versions of
-    /// another Neutrino's range are the program's inference (Section 3.2).
+    /// another Neutrino's range are the program's inference (Neutrino spec Section 7.8).
     fn own_range(&self, nu: NeutrinoId, range: Range, call: &str) -> Result<(), FatalError> {
         match self.owners.owner_of_range(&range) {
             None => Err(FatalError::Unowned(range)),
@@ -1932,7 +1932,7 @@ impl Sim {
             Entry::Inbound(call) => call,
         };
         if let Some(pe) = desc.pe {
-            // The PE must be the owner's (Section 3.3): a write into another
+            // The PE must be the owner's (Neutrino spec Section 3): a write into another
             // node's memory is a pull by that memory owner's DMA engine. An
             // untracked task enters at the invoking Neutrino, so its PE
             // must be the invoker's.
@@ -1998,7 +1998,7 @@ impl Sim {
             mask: desc.dst_mask,
             deps: local,
         };
-        // Debug check of the program's inference (Section 3.3): invokes of
+        // Debug check of the program's inference (Neutrino spec Section 7.8): invokes of
         // one requester reach the owner in program order, so the version
         // the program infers is the one the owner assigns (the counter + 1).
         if cfg!(debug_assertions) && desc.versioned {
@@ -2140,7 +2140,7 @@ impl Sim {
 
     /// A full scoreboard stalls the request. Everything else stops the run,
     /// including a full pending table: only this program can free a pending table slot, and it
-    /// is the one that would wait (Section 3.2).
+    /// is the one that would wait (Neutrino spec Section 6.11).
     fn dep_error(&mut self, nu: NeutrinoId, gid: Option<u64>, req: Request, e: DepError) {
         match e {
             DepError::ScoreboardFull => self.stall(nu, req, Stall::Scoreboard),
@@ -2431,7 +2431,7 @@ impl Sim {
         }
     }
 
-    /// Issues the next chunk of transfer `t` now (Section 5.3): reserves it
+    /// Issues the next chunk of transfer `t` now (r2sim spec Section 5.4.1): reserves it
     /// at or after now + its latency, and schedules the issue of the one
     /// after it at now + this chunk's bytes at the engine's beat rate.
     /// Without an outstanding cap only the last chunk gets an end event,
@@ -2594,7 +2594,7 @@ impl Sim {
 }
 
 /// The Atlas accumulator memory's decision for matmul `desc` issued on `p`
-/// (H3), and its new state: a held dst is read from the buffer; a `keep`
+/// and its new state: a held dst is read from the buffer; a `keep`
 /// task whose C fits stays in it; tiles evicted for room are written back.
 /// The rules of an untracked descriptor that hold before its PE is
 /// checked (2026-10-20): a PE, no join or spawn, not versioned.

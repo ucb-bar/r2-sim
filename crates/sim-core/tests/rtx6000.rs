@@ -1,4 +1,4 @@
-//! The RTX PRO 6000 configurations (architecture Section 8.3): they build,
+//! The RTX PRO 6000 configurations (r2sim spec Section 13.3): they build,
 //! the L2 hash link maps the granules verified on the card, and a DMA
 //! from the linear GDDR7 range is cut at the hash granule.
 
@@ -67,8 +67,8 @@ fn the_rtx6000_configurations_build() {
     }
 }
 
-/// Granules of page 0 on the card (scratch/probe-rtx6000/labels.txt, every
-/// 127th line from line 5): offset and slice index in the config's bit
+/// Granules of page 0 on the card (measured: every 127th granule from the
+/// fifth): offset and slice index in the config's bit
 /// order.
 const GRANULES: &[(u64, u64)] = &[
     (0x500, 3),

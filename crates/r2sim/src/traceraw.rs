@@ -339,7 +339,7 @@ pub const RECORD_TYPES: [&str; 8] = [
     "tasks", "chunks", "deps", "charges", "messages", "programs", "marks", "entries",
 ];
 
-/// Which records the dump keeps (architecture Section 7.3, trace-raw.md
+/// Which records the dump keeps (r2sim spec Section 11.5, trace-raw.md
 /// Section 1.1). Every filter is optional.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filter {
@@ -379,7 +379,7 @@ pub struct Opts {
     pub filter: Filter,
 }
 
-/// `trace.yaml` (architecture Section 7.5); every key is optional.
+/// `trace.yaml` (r2sim spec Section 11.5); every key is optional.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TraceConfig {
@@ -1924,7 +1924,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
                 row["ab_wr"] = json!(w.0);
                 row["ba_wr"] = json!(l.ba_wr.map(|r| r.0));
             }
-            // A hash link's address rewrite (architecture Section 3.1).
+            // A hash link's address rewrite (Radiance 2 spec Section 3.3).
             if let Some(h) = info.and_then(|x| x.hash.as_ref()) {
                 row["hash"] = json!({
                     "range": [hex(h.range.base), hex(h.range.bound)],

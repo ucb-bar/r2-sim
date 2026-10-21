@@ -1,4 +1,4 @@
-//! Radiance 2 simulator kernel (architecture Sections 4 to 6).
+//! Radiance 2 simulator kernel (r2sim spec Sections 2 to 6).
 //!
 //! * [`time`]: the global clock and exact rationals.
 //! * [`event`]: the event queue, ordered by (time, seq).

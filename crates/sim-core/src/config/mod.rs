@@ -1,12 +1,12 @@
 //! Static configuration of one simulation: the types that code or the TOML
-//! loader ([`yaml`], architecture Section 8) builds.
+//! loader ([`yaml`], r2sim spec Section 10) builds.
 
 use nu_model::{Addr, AddressSet, DepConfig, NeutrinoId, Range};
 
 use crate::resource::{Dir, ResourceId};
 use crate::time::{Cycle, Ratio};
 
-/// Cycle costs of the Neutrino instructions (Section 3.2). `complete` is
+/// Cycle costs of the Neutrino instructions (Neutrino spec Section 5.7). `complete` is
 /// charged on the completion port and `resolve` is a delay (no resource);
 /// the others are charged on the Neutrino's scalar resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +100,7 @@ pub struct NeutrinoConfig {
     pub t_retry: Cycle,
     /// Data width in bytes of the Neutrino as a master (loads, stores,
     /// protocol messages): the start of a transfer's narrowing chain
-    /// (Section 5.4).
+    /// (r2sim spec Section 5.6).
     pub beat_bytes: u64,
 }
 
@@ -141,15 +141,15 @@ pub enum PeParams {
         /// takes the fewest-link route from the source block to one of
         /// them and from one of them to the destination block.
         masters: Vec<crate::topology::AttachId>,
-        /// Latency of every chunk (Section 5.7).
+        /// Latency of every chunk (r2sim spec Section 5.9).
         latency: Cycle,
         /// Chunk size of every transfer (a transaction of the fabric);
         /// `None`: the descriptor's `tile_bytes`.
         burst: Option<u64>,
         /// Data width in bytes: the engine moves at most one beat per
-        /// cycle, the start of a transfer's narrowing chain (Section 5.4).
+        /// cycle, the start of a transfer's narrowing chain (r2sim spec Section 5.6).
         beat: u64,
-        /// Clock ratio to the core clock (Section 4.1): the engine moves
+        /// Clock ratio to the core clock (r2sim spec Section 2.1): the engine moves
         /// `beat x clock` bytes per core cycle.
         clock: Ratio,
     },
@@ -160,15 +160,15 @@ pub enum PeParams {
         array: ResourceId,
         /// Data width as a master (`beat_bytes`, default 64): operands and
         /// C move in beats of this size, or of the port's if smaller
-        /// (Section 5.4).
+        /// (r2sim spec Section 5.6).
         beat: u64,
-        /// MACs per cycle by operand type (Section 8.2); a GEMM whose
+        /// MACs per cycle by operand type (Radiance 2 spec Section 5.2); a GEMM whose
         /// slower operand type has rate r charges `MACs * max / r`. Empty:
         /// every type at the array rate.
         rates: Vec<(crate::profile::Dtype, Ratio)>,
         /// The SMEM port resource; `None` on a banked SMEM, whose operand
         /// and C bytes charge the ports of the banks by address
-        /// (architecture Section 5.5).
+        /// (r2sim spec Section 6.2).
         smem_port: Option<ResourceId>,
         /// The SMEM write port (`wr_bytes`), charged by C out and the
         /// flush instead of `smem_port`.
@@ -179,11 +179,11 @@ pub enum PeParams {
         /// tensor ops and operand bytes (K exact): a 51-token row costs a
         /// full 128-row tile. False counts the exact shape.
         quantize: bool,
-        /// Keep the A row panel across the output tiles of a row (H1,
-        /// Section 5.5): A is read from SMEM once per row panel instead of
+        /// Keep the A row panel across the output tiles of a row (r2sim
+        /// spec Section 6.2): A is read from SMEM once per row panel instead of
         /// once per output tile. Default false ("none").
         row_panel: bool,
-        /// Accumulator memory inside the Atlas, bytes (H3, Section 5.5;
+        /// Accumulator memory inside the Atlas, bytes (r2sim spec Section 6.2;
         /// default 0). A task marked `keep` leaves its C there; the next
         /// accumulate task on the same dst reads it from there. C goes to
         /// SMEM at the end of the chain or on eviction.
@@ -193,7 +193,7 @@ pub enum PeParams {
         /// charged there (its bytes are charged on the SMEM port).
         masters: Vec<crate::topology::AttachId>,
     },
-    /// A SIMT core modeled as an opaque vector PE (Section 3.4).
+    /// A SIMT core modeled as an opaque vector PE (r2sim spec Section 6.3).
     Muon {
         /// The vector-op resource (lane-ops per cycle).
         vector: ResourceId,
@@ -220,15 +220,15 @@ pub struct PeConfig {
     /// Tasks running at once on this PE.
     pub max_inflight: u32,
     /// A transfer (chunks with a fabric path): the cap on its chunks
-    /// issued and not ended, `u32::MAX` for none (Section 5.3,
-    /// issue-driven chunks). Another task: its chunks requested ahead.
+    /// issued and not ended, `u32::MAX` for none (r2sim spec Section
+    /// 5.4.1, issue-driven chunks). Another task: its chunks requested ahead.
     pub max_outstanding: u32,
     /// Kind-specific parameters.
     pub params: PeParams,
 }
 
 /// A memory block: its address sets and its port bandwidth resources.
-/// A banked memory is one block per bank (architecture Section 3.1).
+/// A banked memory is one block per bank (Radiance 2 spec Section 3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemBlock {
     /// Name, `<node path>.<memory name>`.
@@ -253,7 +253,7 @@ pub struct MemBlock {
     /// Write port (`wr_bytes`), charged by write demands.
     pub wport: Option<ResourceId>,
     /// Transaction size of the port(s) (`block_bytes`): a transfer is cut
-    /// at its multiples (architecture Section 5.3).
+    /// at its multiples (r2sim spec Section 5.4).
     pub block: Option<u64>,
     /// Latency of a Neutrino load or store before its port bandwidth.
     pub load_latency: Cycle,
@@ -333,7 +333,7 @@ impl MemBlock {
     }
 }
 
-/// What the timing plane does with a racy load (Section 4.4): a load of a
+/// What the timing plane does with a racy load (r2sim spec Section 3.4): a load of a
 /// range that a task writes while it is issued and not done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RaceCheck {

@@ -1,4 +1,4 @@
-//! The YAML hardware loader (architecture Section 8).
+//! The YAML hardware loader (r2sim spec Section 10).
 //!
 //! A file has two sections, `global` and `device` (the root node). Every
 //! node has the sections `fabric`, `memory`, `compute`, `neutrino` and
@@ -13,7 +13,7 @@
 //! Fabric: a bus is a data bus, or a control bus with `control: true`
 //! (protocol messages). A **link** is a fabric entry with `topology:
 //! link`, `from` and `to` (two buses, usually `$this.x` and `$parent.y`),
-//! `bw_bytes`, `beat_bytes`, `latency` and `control` (Section 8.2): full
+//! `bw_bytes`, `beat_bytes`, `latency` and `control` (r2sim spec Section 10.4): full
 //! duplex, one resource per direction, `<link>.ab` (from to to) and
 //! `<link>.ba`. A data link joins data buses and a control link control
 //! buses; every node but the root needs a data link and a control link to
@@ -33,7 +33,7 @@
 //! `*` matches any run of characters inside one component, and `[i]`
 //! indexes a list. VALUE is YAML.
 //!
-//! Keys beyond Section 8.1:
+//! Keys beyond the listing of r2sim spec Section 10.1:
 //!
 //! * `global`: `msg_latency` (extra cycles per remote-protocol message),
 //!   `cocharge` (own | longest),
@@ -44,13 +44,13 @@
 //!   not a buffer to size).
 //! * buses and links: a bus or link without `bw_bytes` is unlimited.
 //!   A data bus or data link with `bw_bytes` may have `wr_bytes`: a
-//!   separate write channel at that rate (Section 3.5): `<link>.ab.wr`
+//!   separate write channel at that rate (Radiance 2 spec Section 3.4): `<link>.ab.wr`
 //!   and `.ba.wr`, `<bus>.<attachment>.in.wr` and `.out.wr` on an
 //!   `xbar`, `<bus>.wr` on a `bus`. Writes (a DMA's destination half,
 //!   stores, result writes) use it, reads the read channel; without it
 //!   one channel carries both.
 //! * buses, links and memories (scratch, dram, cache; per bank too):
-//!   `block_bytes`, the transaction size (Section 5.3). A DMA chunk, or a
+//!   `block_bytes`, the transaction size (r2sim spec Section 5.4). A DMA chunk, or a
 //!   load or store piece, that passes through it ends at the next
 //!   multiple of it: the source address bounds the read half of the
 //!   route and the source port, the destination address the write half.
@@ -65,14 +65,14 @@
 //!   `complete_rate`), and `master`.
 //! * compute: `utilization` (tensor and vector), `inflight` (default 1),
 //!   `outstanding` (a DMA engine: a cap on chunks issued and not ended,
-//!   default none, Section 5.3 issue-driven chunks; another PE: chunks
+//!   default none, r2sim spec Section 5.4.1 issue-driven chunks; another PE: chunks
 //!   requested ahead, default 1), `burst_bytes` (dma: the chunk size of
 //!   every transfer; default the descriptor's tile; with `outstanding`
 //!   set, a warning in [`Built::warnings`] when `(outstanding - 1) x
 //!   burst_bytes` does not cover latency x rate of the engine's paths).
 //! * memories (scratch and dram): `wr_bytes` (a separate write port
 //!   `<mem>.wport` charged by write demands; without it `<mem>.port`
-//!   serves both directions); `banks: N` (architecture Section 3.1): N
+//!   serves both directions); `banks: N` (Radiance 2 spec Section 3.1): N
 //!   equal contiguous blocks `<mem>.b<i>`, each with its own ports,
 //!   latency and attachments; `bw_bytes`, `wr_bytes`, `latency`,
 //!   `beat_bytes` and `block_bytes` are per bank, and `bank: {b<i>:
@@ -82,7 +82,7 @@
 //!   experiment, `sim::cache`): its banks (slices) cache that DRAM; DRAM
 //!   bank (channel) c is cached by slice c mod slices, in lines of L
 //!   bytes (default 256), each slice holding its bank's bytes / L lines.
-//! * links: `hash: {range, to_range, index, drop}` (Section 3.1), ranges
+//! * links: `hash: {range, to_range, index, drop}` (Radiance 2 spec Section 3.3), ranges
 //!   in the node's own space. The node owns `range` (the linear range
 //!   programs address); a transfer to it is rewritten onto `to_range`,
 //!   which memory blocks behind the link cover exactly. The loader checks
@@ -95,7 +95,7 @@
 //! at a level is the parent's own space. Scratch, dram and sync ranges are
 //! offsets inside the node's own space; cache ranges are global. A node
 //! owns its scratch, dram and sync ranges. Ownership and blocks are
-//! address sets (Section 3.1): a range that is not a power-of-two size
+//! address sets (Neutrino spec Section 2.2): a range that is not a power-of-two size
 //! aligned to its base is decomposed into the fewest aligned sets.
 //!
 //! Rates and sizes: YAML numbers, or strings with a rational ("2/3") or a
@@ -503,12 +503,12 @@ struct BusSec {
     /// Transaction size: transfers through it are cut at its multiples.
     block_bytes: Option<Num>,
     /// The rate of a separate write channel (data buses and links with
-    /// `bw_bytes`; Section 3.5).
+    /// `bw_bytes`; Radiance 2 spec Section 3.4).
     wr_bytes: Option<Num>,
     /// A link's two buses (`topology: link` only).
     from: Option<String>,
     to: Option<String>,
-    /// A link's address rewrite (architecture Section 3.1).
+    /// A link's address rewrite (Radiance 2 spec Section 3.3).
     hash: Option<HashSec>,
 }
 
@@ -593,7 +593,7 @@ struct BankSec {
 }
 
 /// The write channel's rate (`wr_bytes`) of bus or link `name`: only on a
-/// data bus or link with `bw_bytes` (Section 3.5).
+/// data bus or link with `bw_bytes` (Radiance 2 spec Section 3.4).
 fn wr_of(b: &BusSec, name: &str) -> Result<Option<Ratio>, ConfigError> {
     let Some(w) = &b.wr_bytes else {
         return Ok(None);
@@ -609,7 +609,7 @@ fn wr_of(b: &BusSec, name: &str) -> Result<Option<Ratio>, ConfigError> {
     Ok(Some(w.rate()?))
 }
 
-/// `block_bytes` of `name`, if set: a power of two (Section 5.3: one grid
+/// `block_bytes` of `name`, if set: a power of two (r2sim spec Section 5.4: one grid
 /// per route half then holds every boundary of the half).
 fn block_of(b: &Option<Num>, name: &str) -> Result<Option<u64>, ConfigError> {
     match b {
@@ -1783,7 +1783,7 @@ impl Builder {
         Ok((port, wport))
     }
 
-    /// A banked memory (architecture Section 3.1): N equal contiguous
+    /// A banked memory (Radiance 2 spec Section 3.1): N equal contiguous
     /// blocks `<name>.b<i>`, each with its own ports, latency and
     /// attachments. The interleave over them, if any, is a hash link in
     /// front of their bus.
@@ -2072,10 +2072,10 @@ fn attach_name(link: &str, bus: &str) -> String {
 }
 
 /// The default beat of a bus, link, memory port, compute element or
-/// Neutrino (Section 5.4, data-path rule 3).
+/// Neutrino (r2sim spec Sections 5.2 and 5.6).
 const DEFAULT_BEAT: u64 = 64;
 
-/// The `clock` key of `what` (Section 4.1): a positive integer or "p/q",
+/// The `clock` key of `what` (r2sim spec Section 2.1): a positive integer or "p/q",
 /// default 1.
 fn clock_of(n: &Option<Num>, what: &str) -> Result<Ratio, ConfigError> {
     let bad = || {
@@ -2217,7 +2217,7 @@ fn check_bursts(sim: &Sim) -> Vec<String> {
     out
 }
 
-/// The table check of Section 3.3 (ready/valid): every owner takes at
+/// The table check of Neutrino spec Section 11.1 (ready/valid): every owner takes at
 /// least one invoke into its inbound invoke table, admits one into its
 /// scoreboard (execution table above the issue headroom), and every
 /// requester can hold one in its outbound invoke table.

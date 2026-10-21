@@ -1,4 +1,4 @@
-//! Neutrino programs as coroutines (architecture Section 6.1).
+//! Neutrino programs as coroutines (r2sim spec Section 4.2).
 //!
 //! A program is an `async fn` over a [`NuCtx`]. Every hardware operation is
 //! an awaited call. The call future puts a [`Request`] into the Neutrino's

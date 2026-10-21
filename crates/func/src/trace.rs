@@ -1,4 +1,4 @@
-//! The Trace backend (architecture Section 4.4) and the trace file format.
+//! The Trace backend (r2sim spec Section 3.1) and the trace file format.
 //!
 //! Trace: Numeric memory without compute. A DMA copies bytes and a store
 //! writes them. A task whose descriptor `label` has a record writes the

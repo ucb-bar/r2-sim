@@ -1,6 +1,6 @@
-# configs/2p.yaml as of step 5a (go-back-N then; ready/valid now), inbound_refs 32 and pending 64 at the
-# SMs, default table sizes at the device and the gpcs (the device runs
-# no program in 5a). Kept to reproduce the 5a and 5b item 0 numbers; the
+# An earlier configs/2p.yaml (go-back-N then; ready/valid now), inbound_refs 32 and pending 64 at the
+# SMs, default table sizes at the device and the gpcs (the device ran
+# no program then). Kept to reproduce the earlier numbers; the
 # current values are in 2p.yaml.
 #
 # SM Neutrino: scoreboard and execution table 256 (a window forwards about 250 tasks per SM),

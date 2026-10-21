@@ -1,5 +1,5 @@
-//! Fabric messages, the cross-Neutrino protocols (architecture Section
-//! 3.3), and `spawn_child` (Section 6.1).
+//! Fabric messages, the cross-Neutrino protocols (Neutrino spec Section
+//! 9), and `spawn_child` (r2sim spec Section 4.8).
 //!
 //! Every protocol class (invoke, dependency, hierarchy) has its own
 //! channel (ready/valid): per class a source queue at the sender, one
@@ -39,7 +39,7 @@
 //! reaches the head of the table: it frees the version entry of its base
 //! (absent: no-op) and needs no other resource. So a requester's
 //! `VersionReset` takes effect after its earlier invokes to that owner have
-//! entered (architecture Section 3.3; decided 2026-10-20). A local `vreset`
+//! entered (Neutrino spec Section 9.6; decided 2026-10-20). A local `vreset`
 //! is immediate. A rejected `Await` is resent
 //! after `t_retry`.
 
@@ -172,7 +172,7 @@ impl MsgKind {
     }
 }
 
-/// Flow control of forwarded invokes (Section 3.3).
+/// Flow control of forwarded invokes (Neutrino spec Sections 9.2 and 9.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Flow {
     /// Ready/valid: an invoke waits in the channel until the owner's
@@ -1140,8 +1140,8 @@ impl Sim {
         None
     }
 
-    /// Forwards an invoke whose `dst` `owner` owns (Section 3.3, remote
-    /// invoke). The program continues at once; the invoke waits in the
+    /// Forwards an invoke whose `dst` `owner` owns (Neutrino spec Section
+    /// 9.4). The program continues at once; the invoke waits in the
     /// outbound invoke table while the channel is busy.
     pub(super) fn forward_invoke(&mut self, nu: NeutrinoId, owner: NeutrinoId, desc: Descriptor) {
         if desc.opcode == OpcodeId::SPAWN {
@@ -1424,7 +1424,7 @@ impl Sim {
             self.topo.node(child).children.clone(),
             n.cfg.costs.plan,
         );
-        // A program start resets the Neutrino's version table (Section 3.2).
+        // A program start resets the Neutrino's version table (Neutrino spec Section 7.7).
         n.tables.vreset_all();
         n.program = Some((start.run)(ctx));
         n.prog_name = start.name;

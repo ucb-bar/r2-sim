@@ -2,13 +2,13 @@
 # gpc (5b item 2, gpc-cmem.yaml). The rest of this file is 2p.yaml.
 # Clock: 1 GHz reference, so 1 cycle = 1 ns.
 #
-# Flow control of forwarded invokes: ready/valid (2026-09-30; architecture
-# Section 3.3). Every protocol class has its own channel with one message
+# Flow control of forwarded invokes: ready/valid (2026-09-30; Neutrino spec
+# Section 9.2). Every protocol class has its own channel with one message
 # stage per hop of the control buses; an invoke waits in the channel until
 # the owner's inbound invoke table has room. `--set global.flow=ticket`
 # selects the ticket scheme for comparison.
 #
-# The tree (architecture Section 8): root (the device: its sync space and
+# The tree (r2sim spec Section 10): root (the device: its sync space and
 # its Neutrino), gpc0 and gpc1 (gpc.yaml, each with its HBM slice and four
 # SMs, sm.yaml), addressed root.gpc1.sm2. Data buses carry DMA chunks,
 # loads and stores; control buses carry the protocol messages.
@@ -19,10 +19,10 @@
 #   gpc g, SM s   ((g + 1) << 36) | ((s + 1) << 33)
 
 global:
-  neutrino_granule: 512    # Neutrino2 range alignment
+  neutrino_granule: 512    # range alignment (Neutrino spec Section 2.3)
   clock_ghz: 1.0
   msg_bytes: 64            # one beat of a protocol message
-  flow: readyvalid         # ready/valid channels (Section 3.3)
+  flow: readyvalid         # ready/valid channels (Neutrino spec Section 9.2)
   hop_queue: 1             # messages per hop stage and class (a pipeline register)
   address:
     fields: [{name: gpc, bits: 2}, {name: sm, bits: 3}]

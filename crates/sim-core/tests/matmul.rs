@@ -1,4 +1,4 @@
-//! The single-Neutrino matmul example of Neutrino2.md, end to end in
+//! The single-Neutrino matmul example of Neutrino spec Section 10.2, end to end in
 //! timing-only mode, and lifecycle tests around it. Rates and costs are in
 //! `common/mod.rs`.
 
@@ -33,7 +33,7 @@ fn matmul_end_to_end() {
     // invoke C [16,24), wait [24,26).
     let (ta, tb, tc) = (&s.tasks[0], &s.tasks[1], &s.tasks[2]);
     // DMA A: issue 8, the dram block's latency 100 (the pipeline fill,
-    // architecture Section 5.7) and the engine latency 100; hops in route
+    // r2sim spec Section 5.9) and the engine latency 100; hops in route
     // order from 208: dram port (64 B/cycle) [208, 336), link (32)
     // [208, 464), smem port narrowed to the link's 32 [208, 464); culprit
     // link (the first longest window).
@@ -197,7 +197,7 @@ fn join_fans_in() {
 #[test]
 fn same_base_different_bound_is_fatal() {
     // Two live versioned ranges at one base address with different bounds
-    // are a software error (Section 3.2, Versions).
+    // are a software error (Neutrino spec Section 7.2, Rule N7.3).
     let n = node(Knobs::default());
     let (d1, d2) = (n.dma(0, 0, KB8, KB8), n.dma(0, 0, 4096, 4096));
     let mut sim = n.sim;

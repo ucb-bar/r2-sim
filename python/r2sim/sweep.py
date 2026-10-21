@@ -2,7 +2,7 @@
 axes in parallel, collects each axis into one CSV, and plots the stages
 against the parameter with the bounds as references.
 
-Usage, from r2-sim/ in the workspace environment:
+Usage, from the repository root in the pixi environment:
 
     PYTHONPATH=python python -m r2sim.sweep run AXIS [AXIS ...] [--out DIR] [--jobs 16]
     PYTHONPATH=python python -m r2sim.sweep collect AXIS [AXIS ...] [--out DIR]
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -31,8 +32,8 @@ import numpy as np
 from . import style
 from .data import load_run
 
-R2SIM = "../build/target/release/r2sim"
-DEFAULT_OUT = Path("../scratch/sweeps")
+R2SIM = str(Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release" / "r2sim")
+DEFAULT_OUT = Path("out/sweeps")
 
 # Default point: 2p.yaml, mxfp4, 1 MiB accumulator buffer, seed 7.
 BASE = [

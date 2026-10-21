@@ -230,7 +230,7 @@ struct Spread {
 struct ResourceOut {
     name: String,
     kind: String,
-    /// Slots per core cycle (Section 5.2); `busy_cycles` counts
+    /// Slots per core cycle (r2sim spec Section 5.2); `busy_cycles` counts
     /// slot-cycles, rounded.
     slots: f64,
     busy_cycles: u64,
@@ -293,7 +293,7 @@ struct Out<'a> {
     /// All warnings; `stats.warnings` keeps the first 1000.
     warnings_total: usize,
     smem_port_util: Spread,
-    /// Atlas knobs of the run (H3 accumulator buffer, H1 row panel).
+    /// Atlas knobs of the run (accumulator buffer, row panel).
     acc_buffer: u64,
     row_panel: bool,
     /// Per interval between program marks (--phase-stats).

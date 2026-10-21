@@ -1,5 +1,5 @@
-//! The pool for data in flight into a node through a link (architecture
-//! Section 5.4, data-path rule 7): Little's law, the source latency, the
+//! The pool for data in flight into a node through a link (r2sim
+//! spec Section 5.6, Rule S5.11): Little's law, the source latency, the
 //! direction, the wait for room, loads, and a link without a rate.
 
 use nu_model::{Addr, Range};

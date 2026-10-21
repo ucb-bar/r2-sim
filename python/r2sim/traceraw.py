@@ -55,9 +55,9 @@ the file layout:
   span >= 1 and usage = 65536 (1.7; span = cycles before);
 * with `--reference FULL` (a complete dump of the same run): the dump
   holds exactly the records of FULL that the filters of its manifest keep
-  (architecture Section 7.3, trace-raw.md Section 1.1).
+  (r2sim spec Section 11.5, trace-raw.md Section 1.1).
 
-Usage, from r2-sim/ in the workspace environment:
+Usage, from the repository root in the pixi environment:
 
     PYTHONPATH=python python -m r2sim.traceraw DIR [--stats STATS.json] [--reference FULL]
 

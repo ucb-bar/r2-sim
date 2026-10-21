@@ -1,6 +1,6 @@
 //! Kernel sequences: a run of GPU-style kernels in launch order, to compare
 //! the model with a card that runs the same kernels with the same tiling
-//! (the RTX PRO 6000 configurations, architecture Section 8.3). The test
+//! (the RTX PRO 6000 configurations, r2sim spec Section 13.3). The test
 //! definitions stay outside the repository; they pass the parameters.
 //!
 //! Parameters (TOML):
@@ -52,7 +52,7 @@
 //! store's completion, and the device's Neutrino never sees it. This is a
 //! correlation-only convention for the card, whose SMs store into global
 //! memory: a Radiance 2 program writes into another node's memory only
-//! through a pull by the owner's engine (architecture Section 3.3).
+//! through a pull by the owner's engine (Neutrino spec Section 3).
 //!
 //! CTA contents:
 //!
@@ -84,7 +84,7 @@
 //!   normalization (the whole row's statistics before any output) is not
 //!   modeled. `simt_util` u (0 < u <= 1, default 1) charges the row op's
 //!   Muon tasks lane-ops / u, as a utilization of u (exclusive,
-//!   architecture Section 5.6); `softmax_util` does the same for
+//!   r2sim spec Section 7.1); `softmax_util` does the same for
 //!   attention's Muon tasks. The kernels report keeps the unscaled
 //!   lane-ops (`lane_ops`), the charged ones (`lane_ops_charged`) and the
 //!   value (`simt_util`).
@@ -852,7 +852,7 @@ impl Builder {
         let muon = sm.muon.ok_or_else(|| format!("{}: no muon", sm.path))?;
         let opcode = self.vector.ok_or("kernels: no muon.vector profile")?;
         // A utilization below 1 charges the lane-ops over it (exclusive
-        // utilization, architecture Section 5.6); the record keeps the work.
+        // utilization, r2sim spec Section 7.1); the record keeps the work.
         self.rec.lane_ops += ops;
         let ops = (ops as f64 / self.util).ceil() as u64;
         self.rec.lane_ops_charged += ops;

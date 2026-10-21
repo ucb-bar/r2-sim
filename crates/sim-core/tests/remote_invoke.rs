@@ -1,4 +1,4 @@
-//! Step 4b: forwarded invoke (architecture Section 3.3). Config and path
+//! Forwarded invoke (Neutrino spec Section 9.4). Config and path
 //! timings as in `hierarchy.rs`: a message of b 64 B beats between the SMs
 //! arrives 20 + 6b cycles after it is sent when the path is free; a 64^3
 //! bf16 matmul takes 192 cycles on smem.
@@ -211,7 +211,7 @@ fn a_full_scoreboard_holds_forwarded_invokes_in_the_inbound_table() {
 
 #[test]
 fn forwarded_invoke_of_a_matmul_on_the_invokers_atlas_is_fatal() {
-    // The descriptor's PE must be the owner's (Section 3.3).
+    // The descriptor's PE must be the owner's (Neutrino spec Section 3).
     let b = built_with(&[]);
     let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
     let c = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);

@@ -17,7 +17,7 @@
 //!   K/V blocks of `key_block` keys are streamed once per KV head per unit
 //!   (MQA: once for all 8 VLM heads), with an online softmax on the Muon.
 //! * Writes into HBM or cmem are tasks of the memory's owner on its own
-//!   copy engine, which pulls the SM out tile (Section 3.3): each depends on
+//!   copy engine, which pulls the SM out tile (Neutrino spec Section 3): each depends on
 //!   a fresh signal at the SM; the next writer of that tile depends on a
 //!   fresh signal at the owner (the write is done).
 //! * Tensor layout in HBM and cmem: column-block-major, `[C/128][N][128]`,
@@ -331,8 +331,8 @@ pub struct CostEnv {
     pub workers: u64,
     /// SMEM bytes per SM.
     pub budget: u64,
-    /// The SMEM is this many banks of `budget / banks` (architecture
-    /// Section 5.5; 0: one block): a grid fits when its buffers fit the
+    /// The SMEM is this many banks of `budget / banks` (r2sim
+    /// spec Section 12.3; 0: one block): a grid fits when its buffers fit the
     /// banks of their roles.
     pub banks: u64,
     /// The bank group that buffers of no operand role try first.
@@ -589,11 +589,11 @@ fn estimate(
     // in when accumulating (every chunk but the first of a pass).
     let (mt, nt) = (t.div_ceil(128), cw / 128);
     let rows = if e.quantize { mt * 128 } else { t };
-    // With a row panel (H1) the A tile is read once per row of tiles.
+    // With a row panel the A tile is read once per row of tiles.
     let a_mm = if e.sm.row_panel { 1 } else { nt } * rows * kc * 2;
     let b_mm = mt * nt * s.w.bytes_for(kc * 128);
     // C out per chunk and in per accumulate, unless the Atlas keeps the
-    // pass's accumulators (H3): then C goes out once.
+    // pass's accumulators: then C goes out once.
     // Weight-stationary keeps one token tile's accumulators at a time.
     let acc_rows = if ws { t.min(WS_TILE) } else { t };
     let c_pass = if mats * acc_rows * cw * 2 <= e.sm.acc_buffer {
@@ -1262,7 +1262,7 @@ impl Driver {
 
     /// Makes this the driver of gpc `g` (index in `Machine::gpcs`): it runs
     /// on the gpc's Neutrino and invokes only the tasks in the gpc's
-    /// subtree (Section 6.1, per-gpc drivers).
+    /// subtree (Radiance 2 spec Section 6.2, per-gpc drivers).
     pub(crate) fn for_gpc(&mut self, g: usize) -> Result<(), String> {
         let (own, subtree) = self.m.gpc_spaces[g];
         if !self.mem_nodes.iter().any(|n| n.nu == self.m.gpcs[g].0) {
@@ -2884,7 +2884,7 @@ fn vlm_tokens(p: &Params) -> u64 {
 }
 
 /// Marks a matmul to leave C in the Atlas accumulator for the next task of
-/// its chain (H3).
+/// its chain.
 fn keep(mut d: Descriptor, on: bool) -> Descriptor {
     if let Args::Matmul { keep, .. } = &mut d.args {
         *keep = on;

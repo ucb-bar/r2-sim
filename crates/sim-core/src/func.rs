@@ -1,5 +1,5 @@
-//! Functional plane interface and worker protocol (architecture Sections 4.4
-//! and 4.6).
+//! Functional plane interface and worker protocol (r2sim spec Sections 3.3
+//! and 2.3).
 //!
 //! The timing thread emits one [`FuncOp`] per issued PE task and per
 //! Neutrino store, in issue order, into a bounded op queue. One worker
@@ -9,7 +9,7 @@
 //! the slot between ops and serves the load as soon as it has applied that
 //! seq, whether or not it has applied more. For a race-free program the
 //! value is the same either way; the timing plane rejects racy loads
-//! (Section 4.4).
+//! (r2sim spec Section 3.4).
 //!
 //! A backend without data (`Null`) runs without a worker thread; a load is
 //! then an error.

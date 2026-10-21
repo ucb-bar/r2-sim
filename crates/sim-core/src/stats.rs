@@ -1,4 +1,4 @@
-//! Run outputs (architecture Section 7): plain structs that serialize to
+//! Run outputs (r2sim spec Section 11): plain structs that serialize to
 //! the `--stats` JSON.
 
 use nu_model::{Addr, DepError, NeutrinoId, OpenPending, Range, TaskId, Warning};

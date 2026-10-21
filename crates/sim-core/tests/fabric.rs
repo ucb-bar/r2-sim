@@ -1,4 +1,4 @@
-//! The YAML loader and the fabric (architecture Section 8) on
+//! The YAML loader and the fabric (r2sim spec Section 10) on
 //! tests/configs/two_sm.yaml and configs/2p.yaml: charging by bus
 //! topology, the per-type tensor rate, includes, names and child-entry
 //! overrides, NUMA slices, route selection by target address, and route
@@ -172,7 +172,7 @@ device:
 
 #[test]
 fn the_loader_rejects_tables_that_cannot_accept_an_invoke() {
-    // Section 3.3: an owner needs one inbound invoke entry, and an
+    // Neutrino spec Section 11.1: an owner needs one inbound invoke entry, and an
     // execution table above the issue headroom (2 on sm1, its 2 PEs).
     let e = two_sm(&["root.gpc0.sm1.neutrino.inbound_invokes=0"])
         .err()
@@ -234,7 +234,7 @@ fn dma_route(b: &Built, pe: &str, from: &str) -> Vec<String> {
 
 #[test]
 fn every_gpc_owns_its_hbm_slice() {
-    // NUMA (Section 8.2): each gpc owns an HBM slice in its own space; the
+    // NUMA (Radiance 2 spec Section 3.1): each gpc owns an HBM slice in its own space; the
     // device has none.
     let b = two_p();
     assert!(b.try_memory("root.hbm").is_none());
@@ -619,8 +619,8 @@ fn small_bursts_interleave_two_transfers_on_a_shared_bridge() {
         two_transfers("beat_bytes: 128, burst_bytes: 512, outstanding: 1"),
         (60, 64)
     );
-    // Chunks are issued one burst apart at the engine's beat (Section 5.3,
-    // issue-driven chunks), never two at once: with two chunks in flight
+    // Chunks are issued one burst apart at the engine's beat (r2sim spec Section
+    // 5.4.1, issue-driven chunks), never two at once: with two chunks in flight
     // allowed, or with no cap, the transfers still alternate bursts.
     assert_eq!(
         two_transfers("beat_bytes: 128, burst_bytes: 512, outstanding: 2"),
@@ -778,7 +778,7 @@ device:
 #[test]
 fn a_clock_key_scales_the_slots_of_its_element() {
     // configs/2p.yaml with clocks on an SMEM, a crossbar, a link and an
-    // Atlas (architecture Section 8.2): slots per core cycle are
+    // Atlas (r2sim spec Section 5.2): slots per core cycle are
     // `bw_bytes / beat_bytes x clock`, and `clock` for a compute unit.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
     let build = |sets: &[&str]| build_config_file(&path, sets, ProfileRegistry::with_builtins());

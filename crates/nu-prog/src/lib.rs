@@ -1,4 +1,4 @@
-//! Neutrino program library (architecture Section 6).
+//! Neutrino program library (r2sim spec Section 12.3).
 //!
 //! * [`adamoe`]: the AdaMoE action-expert workload.
 //! * [`prefill`]: the vision encoder and the VLM prefill.

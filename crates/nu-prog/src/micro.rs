@@ -1,6 +1,6 @@
 //! Micro-benchmarks: targeted tests that isolate a few parameters each, to
 //! compare the model with measurements on a card (the RTX PRO 6000
-//! configurations, architecture Section 8.3).
+//! configurations, r2sim spec Section 13.3).
 //!
 //! One mode per run (`mode`):
 //!
@@ -279,7 +279,7 @@ pub(crate) fn pick(all: &[Sm], count: usize, placement: &str) -> Result<Vec<Sm>,
 }
 
 /// The base of `s`'s sync-only range: joins (flags) go there (a join
-/// writes no data; architecture, sync-only space, 2026-10-20).
+/// writes no data; Neutrino spec Section 2.4).
 fn sync_of(s: &Sm) -> Result<u64, String> {
     s.sync
         .map(|r| r.base)

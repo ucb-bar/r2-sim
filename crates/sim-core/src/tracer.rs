@@ -1,4 +1,4 @@
-//! Observation points of the timing plane (architecture Section 7).
+//! Observation points of the timing plane (r2sim spec Section 11.5).
 //!
 //! The simulator calls a [`Tracer`] at fixed points and never reads
 //! anything back: no hook returns a value, so a traced run and an untraced

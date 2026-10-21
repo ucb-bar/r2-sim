@@ -9,7 +9,7 @@ fidelity: numeric
 fabric:
   # Data crossbar 512 B/cycle: four SM links at full rate, and the HBM
   # slice. The data crossbar and data link have separate read and write
-  # channels at the read rate (architecture Section 3.5).
+  # channels at the read rate (Radiance 2 spec Section 3.4).
   - {name: clsbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
   # Control crossbar 8 B/cycle per port (2026-10-20): a 64 B
   # message beat takes 8 cycles on each control hop.
@@ -19,7 +19,7 @@ fabric:
   - {name: clsbus_to_sbus, topology: link, from: $this.clsbus, to: $parent.sbus, bw_bytes: 256, wr_bytes: 256, latency: 20}
   - {name: clcbus_to_cbus, topology: link, from: $this.clcbus, to: $parent.cbus, bw_bytes: 8, beat_bytes: 8, latency: 20, control: true}
 memory:
-  # The gpc's HBM slice (NUMA, architecture Section 8.2): 4 GiB (one
+  # The gpc's HBM slice (NUMA, Radiance 2 spec Section 3.1): 4 GiB (one
   # address set), half of the 8 GiB of the 2p device; 512 B/cycle at 1 GHz, about the per-GPC
   # share of a GB200-class part (8 TB/s over 16 GPCs); latency 200 cycles:
   # DRAM access plus controller.
@@ -28,7 +28,7 @@ memory:
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 compute:
   # Copy engine: every write into the slice is a task of the gpc on it, a
-  # pull from the writing SM (Section 3.3); 8 transfers in flight, chunks
+  # pull from the writing SM (Neutrino spec Section 3); 8 transfers in flight, chunks
   # issued at the beat rate (see sm.yaml). No burst_bytes.
   # Beat 512 B: sized to the bus it masters (clsbus, 512 B/cycle).
   - {name: dma, type: dma, latency: 100, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}

@@ -60,7 +60,7 @@ fn run(tb: &mut DepTables, spec: TaskSpec) -> TaskId {
 #[test]
 fn unversioned_raw_chain_keeps_done_entries() {
     // Two producers write A and B; the consumer reads both and writes C.
-    // Unversioned done entries stay in the execution table (Section 3.2)
+    // Unversioned done entries stay in the execution table (Neutrino spec Section 6.3)
     // until a new producer of the range or the program return.
     let mut tb = tables();
     let (a, b, c) = (r(0, 4), r(4, 4), r(8, 4));
@@ -179,7 +179,7 @@ fn capacities() {
     tb.complete(b);
     assert_eq!(tb.execution_len(), 0);
 
-    // Issue headroom (Section 3.2): scoreboard plus execution table entries
+    // Issue headroom (Neutrino spec Section 6.2): scoreboard plus execution table entries
     // stay below the execution capacity (4) less the headroom (0 here).
     // Three done signals hold three execution entries.
     for i in 0..3 {
@@ -458,7 +458,7 @@ fn a_full_version_table_refuses_a_new_range() {
 
 #[test]
 fn program_return_keeps_the_version_table() {
-    // The version table resets at a program start (Section 3.2), not at a
+    // The version table resets at a program start (Neutrino spec Section 7.7), not at a
     // return.
     let mut tb = tables();
     let a = r(0, 4);

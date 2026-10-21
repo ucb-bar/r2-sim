@@ -204,7 +204,7 @@ fn cmem_moves_weight_traffic_off_hbm() {
     );
     assert_eq!(placed(&r3), 2 * (64 << 20));
     assert!(r3.cmem_bytes > 0 && r3.hbm_bytes > r1.hbm_bytes);
-    // Under the data-path rule (Section 5.4) HBM is not the bottleneck of
+    // Under the data-path rule (r2sim spec Section 5.6) HBM is not the bottleneck of
     // these two layers: a DMA's HBM hop does not wait for the slower SM
     // bridge, and the SMEM ports and SM bridges bind. cmem takes traffic
     // off HBM without slowing the run. With one SMEM port (before

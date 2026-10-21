@@ -2,7 +2,7 @@
 //!
 //! Addresses are 64 bit. The high bits are prefix fields that select a node
 //! of the hardware tree; the owner of an address is the Neutrino whose
-//! address sets contain it (architecture Section 3.1). The field layout
+//! address sets contain it (Neutrino spec Section 2.2). The field layout
 //! comes from the configuration, so this module only sees the result: the
 //! owners' address sets. Task write ranges and transfer spans stay
 //! contiguous [`Range`]s; ownership and memory blocks use [`AddressSet`]s.
@@ -190,7 +190,7 @@ impl fmt::Display for AddressSet {
     }
 }
 
-/// The address rewrite of a hash link (architecture Section 3.1): a
+/// The address rewrite of a hash link (Radiance 2 spec Section 3.3): a
 /// linear range onto a physical one. Slice index bit j is the parity of
 /// the linear address ANDed with `index[j]`; the offset inside the slice
 /// is the address relative to `range` with the `drop` bits removed;

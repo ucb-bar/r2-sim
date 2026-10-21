@@ -1,6 +1,6 @@
 # 2p.yaml with each gpc's HBM as 4 physical banks behind a hash link
-# (gpc-hbm-sliced.yaml): the chunking-cost measurement of docs/results.md
-# Section 8. offset_bits 34 makes room for the physical banks. A full file,
+# (gpc-hbm-sliced.yaml): the chunking-cost measurement.
+# offset_bits 34 makes room for the physical banks. A full file,
 # not `base: 2p.yaml`: overrides apply after the includes are expanded, so
 # they cannot change a child's file.
 

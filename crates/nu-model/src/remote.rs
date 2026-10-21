@@ -4,7 +4,7 @@
 //! done", where K is a version `(a, v)` or an unversioned address. B rejects
 //! (inbound ref table or pending table full), answers `Done` (K is done),
 //! or answers `Registered` and sends `Resolve` at completion. A retries on reject. The hardware mechanism is open; this is
-//! the working model of architecture Section 3.3.
+//! the working model of Neutrino spec Section 9.3.
 //!
 //! This module holds the requester-side bookkeeping ([`OutboundDeps`])
 //! and the owner-side entry point ([`handle_await`]); the inbound ref table
@@ -200,7 +200,7 @@ impl OutboundDeps {
 
 /// Owner-side handling of one incoming `await` message.
 ///
-/// Looks the key up in the owner's tables (Section 3.3): the pending table
+/// Looks the key up in the owner's tables (Neutrino spec Section 7.4): the pending table
 /// and the version table for a version, the containing producer for an
 /// unversioned address. A full
 /// inbound ref table or a full pending table gives `Reject`. A done key gives

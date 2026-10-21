@@ -4,7 +4,7 @@
 //! HBM slice is a block named `hbm` (one per gpc under NUMA, or one at the
 //! device).
 //!
-//! Placement rule for HBM (architecture Section 8.2, NUMA): a tensor goes
+//! Placement rule for HBM (r2sim spec Section 12.3): a tensor goes
 //! to the slice of the gpc whose SMs read it most ([`Machine::slice_for`]);
 //! a tie goes to the lower slice, and a slice without room passes the
 //! tensor to the next one.
@@ -56,9 +56,9 @@ pub struct SmRates {
     /// Atlas MACs per cycle by operand type, in [`Dtype`] order (bf16,
     /// f32, fp8, mxfp4); 0: `mac`.
     pub mac_by_type: [f64; 4],
-    /// The Atlas keeps the A row panel across a row's output tiles (H1).
+    /// The Atlas keeps the A row panel across a row's output tiles.
     pub row_panel: bool,
-    /// Atlas accumulator memory, bytes (H3).
+    /// Atlas accumulator memory, bytes.
     pub acc_buffer: u64,
     /// The SM Neutrino's execution table capacity (executing and done tasks).
     pub execution: u64,
@@ -70,7 +70,7 @@ pub struct SmRates {
 
 impl SmRates {
     /// Atlas MACs per cycle on operands of types `a` and `b`: the slower
-    /// type's rate (architecture Section 5.5).
+    /// type's rate (r2sim spec Section 6.2).
     pub fn mac_for(&self, a: Dtype, b: Dtype) -> f64 {
         let r = |d: Dtype| match self.mac_by_type[d as usize] {
             x if x > 0.0 => x,
@@ -516,7 +516,7 @@ impl Machine {
     }
 
     /// [`Machine::matmul`] on operands that may be split over a bank pair
-    /// (Args::Matmul, architecture Section 5.5): A from `a`, B from `b`.
+    /// (Args::Matmul, Neutrino spec Section 4.2.2): A from `a`, B from `b`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn matmul_split(
         &self,
@@ -621,7 +621,7 @@ pub(crate) fn with_b_dtype(dtype: Dtype, mut d: Descriptor) -> Descriptor {
 }
 
 /// A ring of signal ranges in one node's sync-only space. Joins are
-/// versioned (Section 3.2, Versions), so a range is reused at once: a
+/// versioned (Neutrino spec Section 7), so a range is reused at once: a
 /// consumer names the join's version, not the range alone.
 #[derive(Debug, Clone)]
 pub(crate) struct SyncPool {
@@ -751,7 +751,7 @@ impl Split {
 }
 
 /// Bump allocator over one SM's SMEM, for the fixed buffer layout
-/// (architecture Section 5.5, banked SMEM). On a banked SMEM each role has
+/// (r2sim spec Section 12.3, banked SMEM). On a banked SMEM each role has
 /// a bank group: with two banks, activations bank 0 and weights bank 1;
 /// with four, banks 0 and 1 and banks 2 and 3. An operand buffer goes to
 /// its role's group: whole in the emptier bank of the group, or with four

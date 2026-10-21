@@ -22,7 +22,7 @@ pub enum Event {
         task: TaskId,
     },
     /// The next chunk of transfer `task` on `pe` is due for issue
-    /// (Section 5.3, issue-driven chunks).
+    /// (r2sim spec Section 5.4.1, issue-driven chunks).
     ChunkIssue {
         pe: PeId,
         nu: NeutrinoId,
@@ -56,7 +56,7 @@ pub enum Event {
     StageFree { stage: Stage },
 }
 
-/// A message stage of one protocol class (Section 3.3, ready/valid): the
+/// A message stage of one protocol class (Neutrino spec Section 9.2, ready/valid): the
 /// requester's source queue (for invokes its outbound invoke table), or
 /// the one-message stage at the end of a hop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -1,16 +1,16 @@
 # RTX PRO 6000 Blackwell Workstation Edition (GB202) as a Radiance 2 device:
-# the correlation reference (architecture Section 8.3). Caches are modeled
+# the correlation reference (r2sim spec Section 13.3). Caches are modeled
 # as scratch memories of the same capacity at the same place: the L2 is a
 # 128 MB scratch of 64 contiguous physical slices behind the device
 # crossbar, reached through a link that carries the address hash, and
 # each SM's L1/shared block is its smem. Data is where the programs put it.
 #
-# Physical configuration (2026-10-14, slots model, architecture Section
-# 5.4): every value is a hardware number or the result of a test that
+# Physical configuration (2026-10-14, slots model, r2sim spec Sections
+# 5.2 and 5.6): every value is a hardware number or the result of a test that
 # isolates it; none is set to make another test match. One cycle is an SM
 # cycle. The card was measured with its clocks locked by NCU at the boost
 # point: SM 2.61 GHz, L2 2.29 GHz (7/8 of the SM clock), GDDR7 13.35 GHz
-# (5.1 times); r2-sim scratch/corr/ubench suite6 (clock domains) and suite8.
+# (5.1 times); microbenchmark suites 6 (clock domains) and 8 on the card.
 #
 # Ownership: the root owns the L2 and the GDDR7 (the GPU has one crossbar
 # and no NUMA), so every dependency on them registers at the root Neutrino;
@@ -52,7 +52,7 @@ device:
     - {name: cbus, topology: xbar, bw_bytes: 64, control: true}
     - {name: l2bus, topology: xbar}
     - {name: mbus, topology: xbar}
-    # The L2 address hash (architecture Section 3.1): linear [128 MiB, 256
+    # The L2 address hash (Radiance 2 spec Section 3.3): linear [128 MiB, 256
     # MiB) to the 64 physical slices at 4 GiB (not at 0: no node owns the
     # null address, 2026-10-20; the index bits are 8 to 20, so the slices
     # and offsets are those of [0, 128 MiB)). Slice index bit j is the parity

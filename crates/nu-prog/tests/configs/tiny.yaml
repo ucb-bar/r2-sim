@@ -21,7 +21,7 @@ device:
     - {name: hbm, type: dram, addr: [[0x400000, 0xC00000]], bw_bytes: 64, latency: 100, slave: $this.sbus}
     - {name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}
   compute:
-    # Copy engine: writes into HBM are its pulls (Section 3.3).
+    # Copy engine: writes into HBM are its pulls (Neutrino spec Section 3).
     - {name: dma, type: dma, latency: 50, inflight: 2, outstanding: 1, master: [$this.sbus]}
   neutrino: {c_base: 0, c_dep: 0, c_word: 0}
   children:

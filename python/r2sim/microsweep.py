@@ -8,7 +8,7 @@ zero`), so that the control cost is visible. A line holds the point
 object of the run's `--stats` JSON (nu-prog `micro::result`), or the
 error of a run that failed.
 
-Usage, from r2-sim/ in the workspace environment:
+Usage, from the repository root in the pixi environment:
 
     PYTHONPATH=python python -m r2sim.microsweep --config CONFIG.yaml \\
         --out points.jsonl [--modes stream,latency] [--sms-max 96] [--jobs 16]
@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -104,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", required=True, type=Path)
-    ap.add_argument("--binary", default="../build/target/release/r2sim")
+    default_binary = Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "release" / "r2sim"
+    ap.add_argument("--binary", default=str(default_binary))
     ap.add_argument("--modes", default="stream,latency,atlas,muon,pingpong,barrier,invoke")
     ap.add_argument("--sms-max", type=int, default=96)
     ap.add_argument("--costs", default="default,zero")

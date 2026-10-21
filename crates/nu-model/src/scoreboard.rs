@@ -1,4 +1,4 @@
-//! The dependency tables of one Neutrino (architecture Section 3.2).
+//! The dependency tables of one Neutrino (Neutrino spec Section 6).
 //!
 //! A task lives in three phases:
 //!
@@ -118,7 +118,7 @@ pub struct TaskSpec {
     /// The granules of `dst` the task holds ([`FULL_MASK`]: all; Neutrino
     /// spec, granules and destination ranges).
     pub mask: u32,
-    /// An untracked task (Section 3.2, untracked tasks): no version, no
+    /// An untracked task (Neutrino spec Section 3.1): no version, no
     /// lookup finds it, it adopts and supersedes nothing, and it retires at
     /// completion. The tables count it until it retires (the fence).
     pub untracked: bool,
@@ -188,7 +188,7 @@ pub struct DepConfig {
     pub version_capacity: usize,
     /// Owner-side inbound ref table entries.
     pub inbound_ref_capacity: usize,
-    /// Execution table entries kept for issue (Section 3.2): an invoke
+    /// Execution table entries kept for issue (Neutrino spec Section 6.2): an invoke
     /// enters the scoreboard only while scoreboard and execution table
     /// entries together stay below `execution_capacity - issue_headroom`.
     pub issue_headroom: usize,
@@ -1030,7 +1030,7 @@ impl DepTables {
     }
 
     /// Covering writers that are executing (issued, not done). Two or more
-    /// at one lookup are unordered writers (Section 3.2); covers still in the
+    /// at one lookup are unordered writers (Neutrino spec Section 7.4); covers still in the
     /// scoreboard are ordered by their deps and do not count.
     fn executing_count(&self, tags: &[Tag]) -> u32 {
         tags.iter()

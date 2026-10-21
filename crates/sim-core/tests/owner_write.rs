@@ -1,4 +1,4 @@
-//! Writes into another node's memory (Section 3.3): a DMA task invoked at
+//! Writes into another node's memory (Neutrino spec Section 3): a DMA task invoked at
 //! the memory's owner (forwarded there) runs on the owner's copy engine as
 //! a pull from the source node. configs/two_sm.yaml: first co-charge rule,
 //! control links at the data rate; a 64 B message between an SM and the
@@ -71,7 +71,7 @@ fn a_write_into_hbm_is_a_pull_by_the_device() {
     assert_eq!((t.invoke, t.ready, t.issue), (43, Some(43), Some(43)));
     // sm0's SMEM latency 10 (the pipeline fill) and the engine latency
     // 100: the hops in route order from 153 at the engine's 64 B beat,
-    // narrowed by each hop (Section 5.4): sm0's SMEM port (one of its two
+    // narrowed by each hop (r2sim spec Section 5.6): sm0's SMEM port (one of its two
     // slots) [153, 1177); sm0's bridge up (32 B/cycle) [153, 2201),
     // latency 10; the crossbar ports and gpc0's bridge up narrowed to 32,
     // [163, 2211), latency 20; the HBM port [183, 2231). The chunk runs

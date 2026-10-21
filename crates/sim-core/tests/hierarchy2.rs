@@ -1,4 +1,4 @@
-//! Per-gpc drivers (architecture Section 6.1): a device program that
+//! Per-gpc drivers (Radiance 2 spec Section 6.2): a device program that
 //! starts a program on each gpc, cross-gpc waits, the version table reset
 //! at Start, and two gpc programs as requesters of one owner.
 //! Config `tests/configs/two_gpc.yaml`; control runs at the data rate.

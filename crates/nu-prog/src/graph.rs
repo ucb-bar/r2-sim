@@ -1,6 +1,6 @@
 //! A window of the task graph, built before it is invoked, so that every
-//! dependency can name the version its producer gets (Section 3.2,
-//! Versions).
+//! dependency can name the version its producer gets (Neutrino spec
+//! Section 7).
 //!
 //! Rules the builder relies on:
 //! * Every task is versioned: data ranges, and joins over a ring of sync
@@ -55,7 +55,7 @@ pub(crate) fn with_deps(mut desc: Descriptor, deps: &[Option<Range>], label: u64
     desc
 }
 
-/// The most bytes of one message: 4 beats of 64 bytes (Section 3.3).
+/// The most bytes of one message: 4 beats of 64 bytes (Neutrino spec Section 4.3).
 const WIRE_LIMIT: u64 = 256;
 
 /// The most deps of one join: its descriptor (20 bytes plus 8 per dep)

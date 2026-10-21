@@ -449,7 +449,7 @@ fn whole_end(r: &mut Resources, port: ResourceId, beat: u64, beats: u64, t0: u64
 
 #[test]
 fn a_fractional_capacity_has_whole_slots_by_cycle() {
-    // Section 5.2: k(t) = floor((t + 1) C) - floor(t C) slots at cycle t.
+    // r2sim spec Section 5.2: k(t) = floor((t + 1) C) - floor(t C) slots at cycle t.
     // A chunk that holds the whole capacity from 0 ends at the first cycle
     // whose slots hold its beats. Each case runs on a new resource.
     let ends = |bw: u64, beat: u64, n: u64| -> Vec<u64> {

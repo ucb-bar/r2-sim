@@ -1,4 +1,4 @@
-//! Functional backends (architecture Section 4.4).
+//! Functional backends (r2sim spec Section 3.1).
 //!
 //! * [`Numeric`]: executes ops on byte memory (DMA copy, GEMM, stores).
 //! * [`Trace`]: the same memory without compute; labeled tasks write

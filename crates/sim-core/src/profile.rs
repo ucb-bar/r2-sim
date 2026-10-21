@@ -1,4 +1,4 @@
-//! Descriptors and demand profiles (architecture Section 5.5).
+//! Descriptors and demand profiles (r2sim spec Section 6).
 //!
 //! Every leaf opcode registers one function from a descriptor and the node
 //! configuration to a [`Profile`]: the chunks of the task, each with a
@@ -51,7 +51,7 @@ pub enum Args {
     /// in elements; C is at `dst.base`. One chunk per `tile[0] x tile[1]`
     /// output tile over the full `k`.
     ///
-    /// Split operands (banked SMEM, architecture Section 5.5): with `a2`,
+    /// Split operands (banked SMEM, Neutrino spec Section 4.2.2): with `a2`,
     /// the rows of A are in two half matrices. Row `r` of A, with
     /// `t = r / tile[0]` and `j = r % tile[0]`, is row `t * h + j` of the
     /// matrix at `a` when `j < h = tile[0] / 2`, else row `t * h + j - h`
@@ -88,7 +88,7 @@ pub enum Args {
         /// `C = C + A * B` instead of `C = A * B`.
         accumulate: bool,
         /// Leave C in the Atlas accumulator for the next accumulate task on
-        /// the same dst (H3); without an accumulator memory, no effect.
+        /// the same dst; without an accumulator memory, no effect.
         keep: bool,
         /// Output tile shape `[rows, columns]`: one chunk per tile.
         tile: [u64; 2],
@@ -161,7 +161,7 @@ pub struct Descriptor {
     pub pe: Option<PeId>,
     /// The range the task writes; later lookups of it depend on the task.
     pub dst: Range,
-    /// `dst` is a versioned data range (Section 3.2, Versions); false for
+    /// `dst` is a versioned data range (Neutrino spec Section 7); false for
     /// a signal in the sync-only space.
     pub versioned: bool,
     /// An untracked task (2026-10-20): it runs on a PE of the invoking
@@ -237,7 +237,7 @@ impl Descriptor {
         self
     }
 
-    /// Bytes of the descriptor in an `Invoke` message (Section 3.3):
+    /// Bytes of the descriptor in an `Invoke` message (Neutrino spec Section 4.3):
     /// opcode 2, PE 2, `dst` base and length 16, 8 per dependency (address
     /// and version packed in 64 bits), and the request data (DMA 32,
     /// matmul 52 plus 8 per high-half address, vector 24, join 0, spawn 4).
@@ -274,7 +274,7 @@ pub struct Occupancy {
 
 /// One timing-only subdivision of a task: a compute chunk (`demand`,
 /// co-charged from one start) or a transfer chunk (`path`, reserved hop by
-/// hop in route order; Section 5.4).
+/// hop in route order; r2sim spec Section 5.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     /// Compute: co-charged over one interval.
@@ -285,7 +285,7 @@ pub struct Chunk {
     /// Transfer: the master's beat rate, the start of the narrowing chain.
     pub rate: Ratio,
     /// Cycles after the request before the demand (or the first hop) may
-    /// start (Section 5.7).
+    /// start (r2sim spec Section 5.9).
     pub latency: Cycle,
     /// The fabric routes the chunk's bytes take, for a tracer (the
     /// unlimited links of a route have no demand).
@@ -293,7 +293,7 @@ pub struct Chunk {
 }
 
 /// One half of a transfer's route between a memory block and a DMA
-/// engine (Section 5.3, routing function), computed once per engine and
+/// engine (r2sim spec Section 5.5), computed once per engine and
 /// block: the hops with no amount, and the half's transaction grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Half {
@@ -312,7 +312,7 @@ pub struct Half {
     /// every boundary of the half.
     pub grid: u64,
     /// Read half: a pool whose link the route crosses after its last hop
-    /// (Section 5.4, rule 7); its hold ends with the write half's first
+    /// (r2sim spec Section 5.6, Rule S5.11); its hold ends with the write half's first
     /// hop.
     pub pool_after: Option<crate::resource::PoolMark>,
 }
@@ -356,7 +356,7 @@ impl TransferChunk {
     }
 }
 
-/// The routing function of transfers (Section 5.3): memory blocks by
+/// The routing function of transfers (r2sim spec Section 5.5): memory blocks by
 /// address, a hash link's linear range as one entry rewritten onto its
 /// physical block in one step, and per DMA engine and block the two route
 /// halves, in dense tables built once per run.
@@ -438,7 +438,7 @@ impl TransferRoutes {
                         pool_after,
                     })
                 });
-                // The write half on the write channels (Section 3.5).
+                // The write half on the write channels (Radiance 2 spec Section 3.4).
                 let write = topo.best_path(masters, &m.attach).map(|p| {
                     let mut hops: Vec<PathHop> = p
                         .hops_for(Dir::Write)
@@ -548,7 +548,7 @@ pub struct Profile {
     pub chunks: Vec<Chunk>,
     /// Occupancy held from issue to completion.
     pub holds: Vec<Occupancy>,
-    /// A transfer's pipeline fill (architecture Section 5.7, source memory
+    /// A transfer's pipeline fill (r2sim spec Section 5.9, source
     /// latency): no chunk starts before the task's issue plus this many
     /// cycles plus the chunk's own latency. 0 for a compute task.
     pub fill: Cycle,
@@ -567,11 +567,11 @@ pub struct NodeConfig<'a> {
     pub memories: &'a [MemBlock],
     /// The fabric topology.
     pub topology: &'a Topology,
-    /// Atlas accumulator memory (H3) decisions for this task.
+    /// Atlas accumulator memory decisions for this task.
     pub acc: AccFlags,
 }
 
-/// What the Atlas accumulator memory does for one task (H3): the C read
+/// What the Atlas accumulator memory does for one task: the C read
 /// comes from it, the C write stays in it, and bytes of evicted tiles are
 /// written back to SMEM before the task.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -678,7 +678,7 @@ impl ProfileRegistry {
 /// is the engine latency; each hop carries the route latency to the next
 /// hop. The engine's beat rate starts the narrowing chain. The transfer's
 /// pipeline fill is the latency of the block of its first source byte
-/// (architecture Section 5.7, source memory latency).
+/// (r2sim spec Section 5.9, source latency).
 pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Dma {
         src,
@@ -703,7 +703,7 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     // transaction, whatever the program's tile.
     let tile_bytes = burst.unwrap_or(tile_bytes);
     assert!(tile_bytes > 0, "dma with tile_bytes 0");
-    // The chunk loop is arithmetic (Section 5.3, routing function): the
+    // The chunk loop is arithmetic (r2sim spec Section 5.5): the
     // block and route half of a side are looked up only when its address
     // leaves the block's run (a block or a hash granule), and a chunk
     // ends at the first block, grid or tile boundary of either side.
@@ -776,8 +776,8 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
 /// operand plus C bytes on SMEM. With one SMEM port (`smem_port`), all
 /// bytes are on that port. On a banked SMEM (`smem_port` is `None`), each
 /// operand and C range of the chunk charges the ports of the blocks it
-/// overlaps, in proportion to its bytes in each (architecture Section
-/// 5.5, banked SMEM); the demands of one chunk are co-charged.
+/// overlaps, in proportion to its bytes in each (r2sim spec Section
+/// 6.2, banked SMEM); the demands of one chunk are co-charged.
 pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let Args::Matmul {
         a,
@@ -1133,7 +1133,7 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             demand.push(Demand::new(*r, bytes, dir));
         }
         // A banked block: the bytes spread over the banks of the range
-        // (architecture Section 5.5); otherwise the block's port.
+        // (r2sim spec Section 6.3); otherwise the block's port.
         let base = if to {
             desc.dst.base
         } else {

@@ -1,4 +1,4 @@
-//! Read and write channels (architecture Section 3.5): with `wr_bytes` a
+//! Read and write channels (Radiance 2 spec Section 3.4): with `wr_bytes` a
 //! bus or link carries reads and writes on separate channels.
 
 use nu_model::{Addr, Range};

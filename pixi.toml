@@ -1,0 +1,22 @@
+[workspace]
+name = "r2-sim"
+description = "Radiance 2 simulator: Rust discrete-event model, Python analysis tools"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+rust = ">=1.85"
+python = "3.12.*"
+numpy = ">=2"
+matplotlib = ">=3.9"
+pandas = ">=2.2"
+
+[activation.env]
+PYTHONPATH = "$PIXI_PROJECT_ROOT/python"
+
+[tasks]
+build = "cargo build --release"
+test = "cargo test --release"
+check = "cargo clippy --release --all-targets -- -D warnings"
+fmt = "cargo fmt --all"
+golden = { cmd = "tools/golden.sh", depends-on = ["build"] }

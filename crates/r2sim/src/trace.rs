@@ -1,4 +1,4 @@
-//! Tracer export (architecture Section 7): per-resource utilization over
+//! Tracer export (r2sim spec Section 11.5): per-resource utilization over
 //! time, per-task and per-chunk timelines, program marks and phases, and
 //! the culprit tree, as CSV.gz and JSON files in one directory.
 //!

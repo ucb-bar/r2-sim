@@ -3,7 +3,7 @@
 //! tokens attending to a `prefix`-entry KV cache, and a top-1 MoE FFN with
 //! `experts` routed experts plus one shared expert.
 //!
-//! Structure (step 5a of the architecture plan):
+//! Structure:
 //! * One driver program on the home SM. Every other task is forwarded to
 //!   the SM that owns its `dst` (compute follows data).
 //! * Weights stream from HBM through two staging slots per SM, one block
@@ -105,7 +105,7 @@ pub struct Params {
     pub block_cols: u64,
     /// Keys per prefix KV block.
     pub key_block: u64,
-    /// DMA chunk (Section 5.3).
+    /// DMA chunk (r2sim spec Section 5.4).
     pub dma_chunk: u64,
     /// Gather buffers at home for partial sums.
     pub gather_bufs: usize,
@@ -538,7 +538,7 @@ impl Driver {
     /// Makes this the driver of gpc `g` (index in `Machine::gpcs`): it runs
     /// on the gpc's Neutrino and invokes only the tasks in the gpc's
     /// subtree. The router stays on the home SM; the other gpcs' drivers
-    /// wait for its output by version and load it (Section 6.1).
+    /// wait for its output by version and load it (Radiance 2 spec Section 6.2).
     pub(crate) fn for_gpc(&mut self, g: usize) {
         let (own, subtree) = self.m.gpc_spaces[g];
         self.g = Graph::new(own, self.m.versions.clone());
@@ -2031,7 +2031,7 @@ pub struct ActionMap {
     pub(crate) weight_bytes: u64,
 }
 
-/// The action expert's HBM map (architecture Section 8.2, NUMA). Every
+/// The action expert's HBM map (r2sim spec Section 12.3). Every
 /// weight block goes to the slice of the gpc of the SMs that read it
 /// ([`Machine::slice_for`]): a query or output head block to its head SM's
 /// gpc, an expert block to the gpc of the SM of its hidden block, and the

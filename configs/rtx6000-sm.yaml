@@ -1,7 +1,7 @@
 # One SM of the RTX PRO 6000 Blackwell (GB202) reference configuration
-# (architecture Section 8.3). One cycle is an SM cycle; the card's numbers
+# (r2sim spec Section 13.3). One cycle is an SM cycle; the card's numbers
 # are from microbenchmarks with the clocks locked by NCU at the boost point
-# (SM 2.61 GHz, L2 2.29 GHz; r2-sim scratch/corr/ubench suite8, 2026-10-14).
+# (SM 2.61 GHz, L2 2.29 GHz; microbenchmark suite 8 on the card, 2026-10-14).
 # Every value is a hardware number or the result of a test that isolates
 # it; none is set to make another test match.
 #

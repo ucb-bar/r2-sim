@@ -1,4 +1,4 @@
-//! The driver's version bookkeeping (architecture Section 3.2, Versions),
+//! The driver's version bookkeeping (Neutrino spec Section 7),
 //! shared by every graph of one program.
 //!
 //! * The owner assigns the version of every invoke. For a forwarded invoke

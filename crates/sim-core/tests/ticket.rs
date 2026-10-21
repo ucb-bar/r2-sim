@@ -1,4 +1,4 @@
-//! Ticket flow (Section 3.3) on configs/two_sm.yaml. Path timings as in
+//! Ticket flow (Neutrino spec Section 9.5) on configs/two_sm.yaml. Path timings as in
 //! `hierarchy.rs`: a message of b beats between the SMs arrives 20 + 6b
 //! cycles after it is sent when the path is free (a 72 B matmul
 //! descriptor: 2 beats, 32 cycles; `InvokeAck`, `RetryAck`, `Reject` and

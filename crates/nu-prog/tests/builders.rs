@@ -76,8 +76,8 @@ fn one_linear_layer() {
     //   58, 90, 170 (up bridge from 8, 32, 64; the third is a 2-beat
     //   matmul descriptor (88 B) with the slots 79 and 95, ports to 136,
     //   down bridge [136, 160)), sm2 at 170, 202, 282 (from 120, 144, 176).
-    // * DMAs (Section 5.4, data-path rule): hops in route order after the
-    //   source block's latency (SMEM 10, HBM 100; Section 5.7) and the
+    // * DMAs (r2sim spec Section 5.6, data-path rule): hops in route order after the
+    //   source block's latency (SMEM 10, HBM 100; r2sim spec Section 5.9) and the
     //   engine latency 50, at the engine's 64 B beat narrowed by each hop.
     //   x to sm1 (8 KiB): sm0's SMEM port [118, 246) on one of its two
     //   slots, sm0's bridge up (32 B/cycle) [118, 374), sm1's bridge down
@@ -167,7 +167,7 @@ fn one_moe_dispatch() {
     // Expert 1 on sm2 (2 tokens): its gate weight crosses sm2's bridge
     // [2672, 4720) and reaches SMEM at 4730. The up weight's DMA then holds
     // 0.5 SMEM slot (32 B/cycle) until 6778, so the gate matmul starts on
-    // the 1.5 free slots (Section 5.4, starting on the free slots): its
+    // the 1.5 free slots (r2sim spec Section 5.7, starting on the free slots): its
     // 1048 slot-cycles take 699 cycles, [4734, 5433). The down weight's DMA
     // waits for sm2's bridge behind the up weight: [6768, 8816), SMEM to
     // 8826. The up matmul (after the up weight, 6782) also runs on the 1.5
@@ -276,7 +276,7 @@ fn matmul(b: &Built, pe: &str, c: nu_model::Range, n: u64, deps: Vec<nu_model::D
 
 #[test]
 fn an_invoke_to_a_full_owner_delays_an_invoke_to_a_free_owner() {
-    // Head-of-line blocking (Section 3.3): sm1 has one scoreboard entry and
+    // Head-of-line blocking (Neutrino spec Section 9.2): sm1 has one scoreboard entry and
     // one inbound invoke entry; P1 (128^3) runs and P2 holds the scoreboard
     // entry until P1 is done, at T = 1292. sm0 forwards M1..M4 to sm1 at
     // 8, .., 32 and M5 to sm2 at 40 (72 B matmul descriptors, 2 beats).

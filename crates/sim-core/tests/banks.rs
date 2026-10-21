@@ -1,7 +1,7 @@
-//! Address sets of memory blocks and hash links (architecture Section
-//! 3.1): banked memories, the address rewrite of a link, the chunk clamp at
-//! a block boundary and at the hash granule (Section 5.3), and the write
-//! port (Section 8.2).
+//! Address sets of memory blocks and hash links (Radiance 2 spec Sections
+//! 3.1 and 3.3): banked memories, the address rewrite of a link, the chunk clamp at
+//! a block boundary and at the hash granule (r2sim spec Section 5.4), and the write
+//! port (Radiance 2 spec Section 3.1).
 
 use nu_model::{Addr, AddressSet, Range};
 use sim_core::{build_config, Args, Built, Descriptor, NuCtx, ProfileRegistry, Ratio, Stats};
@@ -512,7 +512,7 @@ fn a_bus_with_block_bytes_cuts_chunks_at_its_grid() {
 #[test]
 fn chunks_of_a_transfer_are_issued_at_the_beat_rate() {
     // 4 KiB from HBM (64 B/cycle) in two 2 KiB bursts, engine beat 256
-    // B/cycle, latency 10 (Section 5.3, issue-driven chunks). Chunk 0 is
+    // B/cycle, latency 10 (r2sim spec Section 5.4.1, issue-driven chunks). Chunk 0 is
     // issued at the task's issue and takes the HBM port over [10, 42);
     // chunk 1 is issued 2048 / 256 = 8 cycles later, so it waits for the
     // port only: [42, 74). The latency is paid once.

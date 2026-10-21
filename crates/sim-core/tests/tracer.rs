@@ -1,4 +1,4 @@
-//! The observation points (architecture Section 7): a traced run ends at
+//! The observation points (r2sim spec Section 11.5): a traced run ends at
 //! the same cycle as an untraced run, and the hooks see the tasks, the
 //! charges, the remote dependencies and the programs. Configs and timings
 //! as in `remote_invoke.rs` (two_sm.yaml) and `hierarchy2.rs`

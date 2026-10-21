@@ -60,7 +60,7 @@ pub struct Params {
     pub action: adamoe::Params,
     /// "hierarchical" (the default): the device program starts, per
     /// stage, one driver per gpc on the gpc's Neutrino, each invoking the
-    /// tasks of its gpc (Section 6.1); "single": one driver on the home SM
+    /// tasks of its gpc (Radiance 2 spec Section 6.2); "single": one driver on the home SM
     /// runs the three stages. "gpc" is a deprecated name of
     /// "hierarchical".
     pub drivers: String,
@@ -70,7 +70,7 @@ pub struct Params {
     pub slice_writes: String,
     /// On a banked SMEM, the bank group that buffers of no operand role
     /// (accumulators, residual, statistics) try first: "act" (the
-    /// activation banks) or "weights" (architecture Section 5.5).
+    /// activation banks) or "weights" (r2sim spec Section 12.3).
     pub smem_whole: String,
     /// The SMEM term of the prefill grid cost model: "role" (the default)
     /// or "port" (`prefill::Params::smem_cost`); copied to both prefill

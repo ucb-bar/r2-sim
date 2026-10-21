@@ -2,10 +2,10 @@
 # sweep). Its HBM slice holds the whole 7.5 GiB at 512 B/cycle.
 
 global:
-  neutrino_granule: 512    # Neutrino2 range alignment
+  neutrino_granule: 512    # range alignment (Neutrino spec Section 2.3)
   clock_ghz: 1.0
   msg_bytes: 64            # one beat of a protocol message
-  flow: readyvalid         # ready/valid channels (Section 3.3)
+  flow: readyvalid         # ready/valid channels (Neutrino spec Section 9.2)
   hop_queue: 1             # messages per hop stage and class (a pipeline register)
   address:
     fields: [{name: gpc, bits: 2}, {name: sm, bits: 3}]

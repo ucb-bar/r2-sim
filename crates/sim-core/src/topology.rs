@@ -1,8 +1,8 @@
-//! The hardware tree and the fabric (architecture Sections 3.1, 3.5 and 8).
+//! The hardware tree and the fabric (Radiance 2 spec Sections 2 and 3.4, r2sim spec Section 10).
 //!
 //! The tree has one node per Neutrino. The fabric is a graph of buses:
 //! every bus is a vertex, and a **link** (a `topology: link` fabric entry,
-//! architecture Section 8.2) is an edge between two buses: usually a
+//! r2sim spec Section 10.4) is an edge between two buses: usually a
 //! child's bus to its parent's bus, or a cache that is a slave on one bus
 //! and a master on another. A bus is a data bus or a control bus; data
 //! links join data buses and control links control buses, so data and
@@ -11,13 +11,13 @@
 //! transfers go from one attachment to another. A compute master's
 //! attachment has no port.
 //!
-//! What a transfer charges on a bus depends on its topology (Section 3.5):
+//! What a transfer charges on a bus depends on its topology (Radiance 2 spec Section 3.4):
 //! an `xbar` has per attachment an ingress and an egress resource, and a
 //! transfer from attachment s to attachment d charges s's ingress and d's
 //! egress; a `bus` has one shared resource. A bus without a rate is
 //! unlimited. A link keeps one resource per direction (full duplex). A
 //! bus or link with `wr_bytes` has a second, write channel beside each of
-//! these (Section 3.5): a write moves its data over the write channel, a
+//! these (Radiance 2 spec Section 3.4): a write moves its data over the write channel, a
 //! read over the read channel, and a route has a resource list per
 //! channel ([`Path::hops_for`]).
 //!
@@ -60,7 +60,7 @@ pub struct AttachId(pub u32);
 /// unlimited.
 pub type Lane = Option<ResourceId>;
 
-/// How a bus charges a transfer (Section 3.5).
+/// How a bus charges a transfer (Radiance 2 spec Section 3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusTopology {
     /// Per attachment an ingress and an egress resource.
@@ -85,7 +85,7 @@ pub struct Bus {
     /// A control bus (protocol messages); otherwise a data bus.
     pub control: bool,
     /// Transaction size: a transfer through the bus is cut at multiples
-    /// of it (architecture Section 5.3).
+    /// of it (r2sim spec Section 5.4).
     pub block: Option<u64>,
 }
 
@@ -122,8 +122,8 @@ pub struct FabricLink {
     pub latency: Cycle,
     /// Transaction size, as [`Bus::block`].
     pub block: Option<u64>,
-    /// The in-flight pool of each direction (`ab`, `ba`; Section 5.4,
-    /// rule 7).
+    /// The in-flight pool of each direction (`ab`, `ba`; r2sim spec
+    /// Section 5.6, Rule S5.11).
     pub pool: [Option<u32>; 2],
 }
 
@@ -149,7 +149,7 @@ pub struct Hop {
     /// Cycles from the end of the transmission to the next stage.
     pub latency: Cycle,
     /// The in-flight pool whose hold ends with this hop: the route crossed
-    /// the pool's link into its node before it (Section 5.4, rule 7).
+    /// the pool's link into its node before it (r2sim spec Section 5.6, Rule S5.11).
     pub pool: Option<PoolMark>,
 }
 

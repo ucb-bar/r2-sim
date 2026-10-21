@@ -3,3 +3,6 @@ target/
 __pycache__/
 *.pyc
 .pixi/
+out/
+# Internal design notes stay local; docs/ holds only the spec PDFs.
+docs/*.md
