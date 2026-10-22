@@ -21,6 +21,7 @@
 pub mod adamoe;
 pub mod forward;
 mod graph;
+pub mod hello;
 pub mod kernels;
 pub mod kv;
 pub mod label;
@@ -70,6 +71,29 @@ pub struct Launch {
     pub kernels: Option<Rc<RefCell<kernels::Report>>>,
 }
 
+impl Launch {
+    /// The program `name` on `nu`, which also drives it, with no
+    /// program-specific report.
+    pub fn new(
+        nu: NeutrinoId,
+        name: &'static str,
+        program: impl sim_core::NeutrinoProgram + 'static,
+    ) -> Self {
+        Self {
+            nu,
+            drivers: vec![nu],
+            home: nu,
+            program: Box::new(move |ctx| Box::pin(program.run(ctx))),
+            name,
+            report: Default::default(),
+            prefill: None,
+            forward: None,
+            micro: None,
+            kernels: None,
+        }
+    }
+}
+
 /// Parses program parameters: TOML text, then `key=value` overrides
 /// (values in TOML syntax: `steps=2`, `expert_sms=[[1,2],[3]]`).
 pub fn params<T: serde::de::DeserializeOwned>(
@@ -101,6 +125,7 @@ pub fn launch(
     overrides: &[String],
 ) -> Result<Launch, String> {
     match name {
+        "hello" => hello::launch(built),
         "adamoe" => {
             let p: adamoe::Params = params(params_text, overrides)?;
             let m = Machine::from_built(built, granule)?;
@@ -194,7 +219,7 @@ pub fn launch(
             })
         }
         _ => Err(format!(
-            "unknown program {name:?} (known: adamoe, prefill, forward, micro, kernels)"
+            "unknown program {name:?} (known: hello, adamoe, prefill, forward, micro, kernels)"
         )),
     }
 }

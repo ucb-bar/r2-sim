@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use nu_model::{Addr, AddressHash, Dep, NeutrinoId, Range};
+use nu_model::{Addr, AddressHash, Dep, NeutrinoId, Range, FULL_MASK};
 
 use crate::config::{MemBlock, PeConfig, PeParams};
 use crate::resource::{Demand, Dir, PathHop, ResourceId};
@@ -26,6 +26,13 @@ impl OpcodeId {
     /// `spawn_child`: a task in the parent's tables that completes when the
     /// child program returns. No PE, no profile.
     pub const SPAWN: OpcodeId = OpcodeId(1);
+    /// `dma`, the first built-in profile of
+    /// [`ProfileRegistry::with_builtins`].
+    pub const DMA: OpcodeId = OpcodeId(2);
+    /// `atlas.matmul`, a built-in profile.
+    pub const MATMUL: OpcodeId = OpcodeId(3);
+    /// `muon.vector`, a built-in profile.
+    pub const VECTOR: OpcodeId = OpcodeId(4);
 }
 
 /// Index of a PE or DMA engine.
@@ -187,6 +194,171 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
+    /// A versioned task on `pe` that writes `dst`: full mask, no
+    /// dependencies, no label.
+    fn task(opcode: OpcodeId, pe: PeId, dst: Range, args: Args) -> Self {
+        Self {
+            opcode,
+            pe: Some(pe),
+            dst,
+            versioned: true,
+            untracked: false,
+            dst_mask: FULL_MASK,
+            inferred_version: None,
+            deps: Vec::new(),
+            label: None,
+            args,
+        }
+    }
+
+    /// A DMA on engine `pe` of `bytes` from `src` to the start of `dst`, in
+    /// one tile. The engine must belong to the owner of `dst` (a write into
+    /// another node's memory is a pull by its owner; Neutrino spec), unless
+    /// the task is [untracked](Descriptor::untracked).
+    pub fn dma(pe: PeId, src: u64, dst: Range, bytes: u64) -> Self {
+        Self::task(
+            OpcodeId::DMA,
+            pe,
+            dst,
+            Args::Dma {
+                src: Addr(src),
+                dst: Addr(dst.base),
+                bytes,
+                tile_bytes: bytes,
+            },
+        )
+    }
+
+    /// A matmul on the Atlas `pe`: C (`m` x `n`, at the start of `c`) = A
+    /// (`m` x `k` at `a`) B (`k` x `n` at `b`), all of type `dtype`,
+    /// row-major with leading dimensions `k`, `n` and `n`; no
+    /// accumulation, C not kept; output tiles of at most 128 x 128.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul(
+        pe: PeId,
+        a: u64,
+        b: u64,
+        c: Range,
+        m: u64,
+        n: u64,
+        k: u64,
+        dtype: Dtype,
+    ) -> Self {
+        Self::task(
+            OpcodeId::MATMUL,
+            pe,
+            c,
+            Args::Matmul {
+                a: Addr(a),
+                b: Addr(b),
+                a2: None,
+                b2: None,
+                lda: k,
+                ldb: n,
+                ldc: n,
+                m,
+                n,
+                k,
+                in_dtype: dtype,
+                b_dtype: dtype,
+                out_dtype: dtype,
+                accumulate: false,
+                keep: false,
+                tile: [m.min(128), n.min(128)],
+            },
+        )
+    }
+
+    /// A vector task on the Muon `pe` of `ops` lane-ops that reads
+    /// `bytes_in` (from `dst` unless [`Descriptor::with_src`]) and writes
+    /// `bytes_out` to `dst`.
+    pub fn vector(pe: PeId, dst: Range, ops: u64, bytes_in: u64, bytes_out: u64) -> Self {
+        Self::task(
+            OpcodeId::VECTOR,
+            pe,
+            dst,
+            Args::Vector {
+                ops,
+                bytes_in,
+                bytes_out,
+                src: None,
+            },
+        )
+    }
+
+    /// Sets the dependencies.
+    pub fn with_deps(mut self, deps: Vec<Dep>) -> Self {
+        self.deps = deps;
+        self
+    }
+
+    /// Marks `dst` as an unversioned range (a signal, or a writer whose
+    /// consumers name an address).
+    pub fn unversioned(mut self) -> Self {
+        self.versioned = false;
+        self
+    }
+
+    /// A DMA's chunk size in bytes.
+    pub fn with_tile_bytes(mut self, n: u64) -> Self {
+        if let Args::Dma { tile_bytes, .. } = &mut self.args {
+            *tile_bytes = n;
+        }
+        self
+    }
+
+    /// A matmul's output tile, `[rows, columns]`.
+    pub fn with_tile(mut self, rows: u64, cols: u64) -> Self {
+        if let Args::Matmul { tile, .. } = &mut self.args {
+            *tile = [rows, cols];
+        }
+        self
+    }
+
+    /// A matmul's leading dimensions, in elements.
+    pub fn with_ld(mut self, a: u64, b: u64, c: u64) -> Self {
+        if let Args::Matmul { lda, ldb, ldc, .. } = &mut self.args {
+            (*lda, *ldb, *ldc) = (a, b, c);
+        }
+        self
+    }
+
+    /// A matmul's operand and output types.
+    pub fn with_types(mut self, a: Dtype, b: Dtype, out: Dtype) -> Self {
+        if let Args::Matmul {
+            in_dtype,
+            b_dtype,
+            out_dtype,
+            ..
+        } = &mut self.args
+        {
+            (*in_dtype, *b_dtype, *out_dtype) = (a, b, out);
+        }
+        self
+    }
+
+    /// A matmul that adds to C (`accumulate`) and keeps C in the
+    /// accumulator (`keep`).
+    pub fn with_acc(mut self, accumulate: bool, keep: bool) -> Self {
+        if let Args::Matmul {
+            accumulate: a,
+            keep: k,
+            ..
+        } = &mut self.args
+        {
+            (*a, *k) = (accumulate, keep);
+        }
+        self
+    }
+
+    /// A vector task's source address.
+    pub fn with_src(mut self, src: u64) -> Self {
+        if let Args::Vector { src: s, .. } = &mut self.args {
+            *s = Some(Addr(src));
+        }
+        self
+    }
+
     /// A `join` task on `dst` that depends on `deps`.
     pub fn join(dst: Range, deps: Vec<Dep>) -> Self {
         Self {
@@ -628,9 +800,9 @@ impl ProfileRegistry {
     /// `muon.vector`.
     pub fn with_builtins() -> Self {
         let mut r = Self::default();
-        r.register("dma", dma_profile);
-        r.register("atlas.matmul", matmul_profile);
-        r.register("muon.vector", vector_profile);
+        assert_eq!(r.register("dma", dma_profile), OpcodeId::DMA);
+        assert_eq!(r.register("atlas.matmul", matmul_profile), OpcodeId::MATMUL);
+        assert_eq!(r.register("muon.vector", vector_profile), OpcodeId::VECTOR);
         r
     }
 
