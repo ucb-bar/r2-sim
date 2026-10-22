@@ -40,7 +40,7 @@ pub fn launch(b: &Built) -> Result<Launch, String> {
         }
         // The matmul runs on that SM's Atlas once both loads are done. The
         // device names their keys with the versions it infers (version 1
-        // of each range; Neutrino spec Section 5.2).
+        // of each range; Neutrino spec Section 7.8).
         let mm = Descriptor::matmul(atlas, a.base, bb.base, c, N, N, N, Dtype::Bf16)
             .with_deps(vec![v1(a), v1(bb)])
             .with_inferred_version(1);

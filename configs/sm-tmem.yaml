@@ -1,8 +1,9 @@
 # One SM of the 2p family with a tensor memory (tmem model, 2026-10-21):
-# sm.yaml plus a tmem of four banks on lbus. The Atlas reads A, B and C
-# from the tmem and writes C into it, so it has no accumulator buffer
-# (acc_buffer 0; a nonzero one is a configuration error). The data paths
-# are provisional. The rest is sm.yaml:
+# sm.yaml plus a tmem of four banks on lbus. The Atlas reads A and B from
+# the tmem and is output stationary: the partial C of a chain stays in its
+# accumulator (acc_buffer 65536, one 128 x 128 fp32 tile), and the last
+# task writes C in its output type into the tmem. The data paths are
+# provisional. The rest is sm.yaml:
 #
 # * Bridge to the gpc: 128 B/cycle each way (half the SMEM's two read
 #   ports together, so one SM cannot saturate the gpc crossbar alone),
@@ -28,8 +29,8 @@
 #   bf16 8192, fp8 16384, mxfp4 32768 (30840 would saturate exactly, so a
 #   pure mxfp4 tile is about 6 % SMEM-bound). A tile of mixed types runs at
 #   the slower operand's rate. quantize = tile charges a 51-token row as a
-#   full 128-row tile (the padding-waste assumption of workload 1). A 1 MiB
-#   accumulator (acc_buffer).
+#   full 128-row tile (the padding-waste assumption of workload 1). Here
+#   the accumulator holds one fp32 output tile (see the head of the file).
 # * Muon: 256 lane-op/cycle (a 16 x 16 SIMT core), overhead 50 cycles per
 #   task for launch and the reduction tail.
 # * DMA: latency 100 cycles, 4 transfers in flight. Chunks are issued at
@@ -65,7 +66,7 @@ memory:
   - {name: tmem, type: tmem, addr: [[0x1000000, 0x1040000]], banks: 4, bw_bytes: 128, wr_bytes: 128, latency: 5, slave: [$this.lbus]}
 compute:
   - {name: atlas, type: tensor, rate: {bf16: 8192, fp8: 16384, mxfp4: 32768},
-     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+     quantize: tile, operand_reuse: none, acc_buffer: 65536, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 256}, overhead: 50, master: [$this.lbus, $this.smsbus]}
   # DMA beat 256 B: the two SMEM banks together (its buses are
   # unlimited); one transfer writes one bank at 128 B/cycle.

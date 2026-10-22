@@ -93,9 +93,6 @@ pub struct Params {
     pub kc: u64,
     /// `tmem`: the A and B buffers in the tmem.
     pub stages: usize,
-    /// `tmem`: 1 (a C buffer in each of banks 2 and 3, by turns) or 2 (one C
-    /// buffer across banks 2 and 3).
-    pub c_banks: usize,
     /// `tmem`: the 128 x 128 output tiles, each a chain over k.
     pub tiles: usize,
     /// Output tile of a matmul `[rows, columns]`.
@@ -130,7 +127,6 @@ impl Default for Params {
             b_dtype: String::new(),
             kc: 128,
             stages: 2,
-            c_banks: 2,
             tiles: 4,
             tile: [128, 128],
             lane_ops: 1 << 16,
@@ -847,37 +843,46 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                 [x, y, ..] => (*x, *y),
                 _ => (s.smem, s.smem),
             };
-            // The tmem layout: the A stages from the base of bank 0, the B
-            // stages from the base of bank 1, C (fp32) in banks 2 and 3.
+            // The tmem layout (output stationary, 2026-10-21): the A stages
+            // only in the A banks (0, then 2) and the B stages only in the B
+            // banks (1, then 3), from each bank's base; two C buffers in the
+            // output type (one tile drains while the next accumulates) in
+            // what is left (banks 2, 3, 0, 1 in turn).
             const T: u64 = 128;
-            let fit = |what: &str, need: u64, room: u64| {
-                if need > room {
-                    Err(format!(
-                        "tmem: {what} of {need} B does not fit in {room} B (k = {k}, kc = {kc}, stages = {}, c_banks = {})",
-                        p.stages, p.c_banks
-                    ))
-                } else {
-                    Ok(())
-                }
-            };
             let a_bytes = a_t.bytes_for(T * kc);
             let b_bytes = b_t.bytes_for(kc * T);
             let a_slot = a_bytes.div_ceil(GRANULE) * GRANULE;
             let b_slot = b_bytes.div_ceil(GRANULE) * GRANULE;
-            fit("the A stages", p.stages as u64 * a_slot, tb[0].len())?;
-            fit("the B stages", p.stages as u64 * b_slot, tb[1].len())?;
-            let c_bytes = T * T * 4;
-            let c_bufs: Vec<u64> = match p.c_banks {
-                1 => {
-                    fit("a C buffer", c_bytes, tb[2].len())?;
-                    vec![tb[2].base, tb[3].base]
+            let c_bytes = T * T * Dtype::Bf16.bytes();
+            let mut used = [0u64; 4];
+            let mut place = |what: &str, banks: &[usize], slot: u64, n: usize| {
+                let mut at = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let b = banks
+                        .iter()
+                        .copied()
+                        .find(|&b| used[b] + slot <= tb[b].len())
+                        .ok_or_else(|| {
+                            format!(
+                                "tmem: {what} ({n} of {slot} B) do not fit in banks {banks:?} \
+                                 (k = {k}, kc = {kc}, stages = {})",
+                                p.stages
+                            )
+                        })?;
+                    at.push(tb[b].base + used[b]);
+                    used[b] += slot;
                 }
-                2 => {
-                    let at = tb[3].base - c_bytes / 2 / GRANULE * GRANULE;
-                    fit("the C buffer", c_bytes, tb[3].bound - at)?;
-                    vec![at]
+                Ok::<_, String>(at)
+            };
+            let a_at = place("the A stages", &[0, 2], a_slot, p.stages)?;
+            let b_at = place("the B stages", &[1, 3], b_slot, p.stages)?;
+            let c_bufs = place("the C buffers", &[2, 3, 0, 1], c_bytes, 2)?;
+            let fit = |what: &str, need: u64, room: u64| {
+                if need > room {
+                    Err(format!("tmem: {what} of {need} B does not fit in {room} B"))
+                } else {
+                    Ok(())
                 }
-                c => return Err(format!("tmem: c_banks {c} (1 or 2)")),
             };
             // The sources: one fixed range in SMEM bank 0 (A) and bank 1
             // (B), the same for every chunk (time, not data); each C
@@ -925,10 +930,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                 let mut prev: Option<Dep> = None;
                 for x in 0..k / kc {
                     let st = i % p.stages;
-                    let (a_at, b_at) = (
-                        tb[0].base + st as u64 * a_slot,
-                        tb[1].base + st as u64 * b_slot,
-                    );
+                    let (a_at, b_at) = (a_at[st], b_at[st]);
                     let war: Vec<Dep> = stage_reader[st].into_iter().collect();
                     let role = |r| Meta {
                         role: r,

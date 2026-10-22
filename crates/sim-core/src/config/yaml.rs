@@ -1267,7 +1267,6 @@ impl Builder {
         self.built.layout.memories.extend(syncs);
         self.built.sim.finish_fabric().map_err(ConfigError)?;
         check_tables(&self.table_sizes)?;
-        self.built.sim.check_acc_buffers().map_err(ConfigError)?;
         self.built.warnings.extend(check_bursts(&self.built.sim));
         self.built.warnings.extend(check_beats(&self.built.sim));
         Ok(self.built)

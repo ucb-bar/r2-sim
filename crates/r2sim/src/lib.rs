@@ -322,7 +322,7 @@ pub fn run(o: &Options) -> Result<(), String> {
         b.sim.set_atlas_row_panel(on);
     }
     if let Some(bytes) = a.acc_buffer {
-        b.sim.set_atlas_acc_buffer(bytes)?;
+        b.sim.set_atlas_acc_buffer(bytes);
     }
     let launch = nu_prog::launch(&program, &b, granule, &params_text, &overrides)?;
     let cfg = cfg_path.display().to_string();
@@ -351,7 +351,7 @@ pub fn run_program(
         b.sim.set_atlas_row_panel(on);
     }
     if let Some(bytes) = o.acc_buffer {
-        b.sim.set_atlas_acc_buffer(bytes)?;
+        b.sim.set_atlas_acc_buffer(bytes);
     }
     let launch = launch(&b)?;
     let program = launch.name.to_string();

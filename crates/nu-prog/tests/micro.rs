@@ -157,7 +157,7 @@ fn tmem_chains_on_one_sm() {
     // A layout that does not fit stops with what does not fit.
     let e = tmem_launch(&["mode=\"tmem\"", "kc=1024"]).unwrap_err();
     assert!(
-        e.contains("the A stages") && e.contains("does not fit"),
+        e.contains("the A stages") && e.contains("do not fit"),
         "{e}"
     );
 }

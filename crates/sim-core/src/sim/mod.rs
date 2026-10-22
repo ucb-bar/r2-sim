@@ -957,9 +957,8 @@ impl Sim {
     }
 
     /// Atlas accumulator memory in bytes (0 = none).
-    pub fn set_atlas_acc_buffer(&mut self, bytes: u64) -> Result<(), String> {
+    pub fn set_atlas_acc_buffer(&mut self, bytes: u64) {
         self.each_atlas(|_, a, _| *a = bytes);
-        self.check_acc_buffers()
     }
 
     /// The span of the blocks of kind `kind` that `nu` owns, if any (a
@@ -974,22 +973,6 @@ impl Sim {
         Some(it.fold(first, |a, r| {
             Range::new(a.base.min(r.base), a.bound.max(r.bound))
         }))
-    }
-
-    /// An SM with a tmem keeps C in the tmem: its Atlas has no accumulator
-    /// buffer (tmem model, 2026-10-21).
-    pub fn check_acc_buffers(&self) -> Result<(), String> {
-        for p in &self.pes {
-            if let crate::config::PeParams::Atlas { acc_buffer, .. } = p.cfg.params {
-                if acc_buffer > 0 && self.span_of(p.nu, "tmem").is_some() {
-                    return Err(format!(
-                        "{}: an accumulator buffer of {acc_buffer} B on an SM with a tmem",
-                        p.cfg.name
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 
     /// The access rules of the tmem (tmem model, 2026-10-21), in one place:
@@ -2450,7 +2433,10 @@ impl Sim {
                     return self.fatal(nu, Some(gid), FatalError::Invalid(msg));
                 }
                 let n = &self.nus[nu.0 as usize];
-                let acc = acc_flags(&mut self.pes[pe.0 as usize], &n.rec(t).desc);
+                // On an SM with a tmem the accumulator holds fp32 partial
+                // tiles (tmem model, 2026-10-21).
+                let fp32 = self.span_of(self.pes[pe.0 as usize].nu, "tmem").is_some();
+                let acc = acc_flags(&mut self.pes[pe.0 as usize], &n.rec(t).desc, fp32);
                 let p = &self.pes[pe.0 as usize];
                 let node = NodeConfig {
                     pe: &p.cfg,
@@ -2714,7 +2700,7 @@ fn untracked_check(desc: &Descriptor) -> Result<(), String> {
     }
 }
 
-fn acc_flags(p: &mut Pe, desc: &Descriptor) -> crate::profile::AccFlags {
+fn acc_flags(p: &mut Pe, desc: &Descriptor, fp32: bool) -> crate::profile::AccFlags {
     let mut f = crate::profile::AccFlags::default();
     let crate::config::PeParams::Atlas { acc_buffer, .. } = p.cfg.params else {
         return f;
@@ -2733,7 +2719,7 @@ fn acc_flags(p: &mut Pe, desc: &Descriptor) -> crate::profile::AccFlags {
     if acc_buffer == 0 {
         return f;
     }
-    let bytes = m * n * out_dtype.bytes();
+    let bytes = m * n * if fp32 { 4 } else { out_dtype.bytes() };
     let held = p.acc.iter().position(|x| x.0 == desc.dst);
     if let Some(i) = held {
         p.acc.remove(i);

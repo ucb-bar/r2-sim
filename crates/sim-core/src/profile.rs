@@ -983,6 +983,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         ref rates,
         ref masters,
         beat,
+        acc_buffer,
         ..
     } = node.pe.params
     else {
@@ -1041,10 +1042,11 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     };
     let acc = node.acc;
     let es = out_dtype.bytes();
-    // On an SM with a tmem, C is in the tmem (tmem model, 2026-10-21): the
-    // partial C of a chain is fp32 (read when accumulating, written when
-    // kept); the last task writes C in its output type. The task pays the
-    // tmem's latency once, before its first output tile.
+    // On an SM with a tmem, C is in the tmem (tmem model, 2026-10-21): a
+    // partial C that is not in the accumulator is fp32 (read when
+    // accumulating, written when kept); the last task writes C in its
+    // output type. The task pays the tmem's latency once, before its first
+    // output tile.
     let tmem = node
         .memories
         .iter()
@@ -1053,6 +1055,12 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         Some(_) => (4, if keep { 4 } else { es }),
         None => (es, es),
     };
+    // Output stationary (2026-10-21): an accumulator that holds one fp32
+    // output tile frees it only once its C is written, so the last task of
+    // a chain writes C after the tile's compute, as a tail that holds the
+    // Atlas. With room for two or more tiles the next tile accumulates
+    // while C drains: the write overlaps the compute.
+    let tail = tmem.is_some() && !keep && acc_buffer > 0 && acc_buffer < 2 * tile[0] * tile[1] * 4;
     let mut chunks = Vec::new();
     for mi in (0..m).step_by(tile[0] as usize) {
         let tm = tile[0].min(m - mi);
@@ -1144,6 +1152,26 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             // The array's operand and C bytes move in its beats.
             for d in demand.iter_mut().filter(|d| d.dir != Dir::Work) {
                 d.beat = beat;
+            }
+            if tail {
+                // The compute and the reads, then the C write.
+                let (writes, rest): (Vec<Demand>, Vec<Demand>) =
+                    demand.into_iter().partition(|d| d.dir == Dir::Write);
+                chunks.push(Chunk {
+                    demand: rest,
+                    transfer: None,
+                    rate: Ratio::ONE,
+                    latency: 0,
+                    routes: [use_of(smem_route.0, read, Dir::Read), None],
+                });
+                chunks.push(Chunk {
+                    demand: writes,
+                    transfer: None,
+                    rate: Ratio::ONE,
+                    latency: 0,
+                    routes: [None, use_of(smem_route.1, write, Dir::Write)],
+                });
+                continue;
             }
             chunks.push(Chunk {
                 demand,

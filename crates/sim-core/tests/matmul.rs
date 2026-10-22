@@ -604,7 +604,7 @@ fn an_accumulator_buffer_keeps_c_across_a_chain() {
             *accumulate = true;
         }
         let mut sim = n.sim;
-        sim.set_atlas_acc_buffer(buffer).unwrap();
+        sim.set_atlas_acc_buffer(buffer);
         sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
             ctx.invoke(first).await;
             ctx.invoke(second).await;
