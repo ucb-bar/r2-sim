@@ -122,3 +122,42 @@ fn bad_parameters_are_errors() {
     assert!(err(&["sms=9"]).contains("the machine has 3 SMs"));
     assert!(err(&["mem=\"l3\""]).contains("unknown mem"));
 }
+
+/// Launches `micro` with `params` on configs/2p-tmem.yaml.
+fn tmem_launch(params: &[&str]) -> Result<Value, String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p-tmem.yaml");
+    let mut b =
+        build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).expect("config");
+    let ov: Vec<String> = params.iter().map(|s| s.to_string()).collect();
+    let l = nu_prog::launch("micro", &b, 512, "", &ov)?;
+    b.sim.set_timeline(true);
+    let mut sim = b.sim;
+    sim.spawn_named(l.nu, l.name, l.program);
+    let s = sim.run();
+    assert_eq!(s.fatal, None, "{:?}", s.fatal);
+    assert!(s.unfinished.is_empty(), "{:?}", s.unfinished);
+    Ok(nu_prog::micro::result(
+        &l.micro.expect("micro report").borrow(),
+        &s,
+    ))
+}
+
+#[test]
+fn tmem_chains_on_one_sm() {
+    // Two tiles of a 128 x 128 x 512 bf16 GEMM in chains of 4 matmuls of
+    // kc 128 on 2p-tmem.yaml (tmem model, 2026-10-21): 16,777,216 MACs at
+    // 8192 per cycle, 2048 cycles at best.
+    let r = tmem_launch(&["mode=\"tmem\"", "k=512", "tiles=2"]).unwrap();
+    assert_eq!(r["macs"], 2 * 128 * 128 * 512);
+    let u = f(&r, "atlas_utilization");
+    assert!(u > 0.1 && u <= 1.0, "{u}");
+    assert!(f(&r, "end_cycles") >= 2048.0);
+    assert_eq!(r["tile_tail_cycles"].as_array().unwrap().len(), 2);
+    assert!(r["tmem_busiest"].as_str().unwrap().contains(".tmem.b"));
+    // A layout that does not fit stops with what does not fit.
+    let e = tmem_launch(&["mode=\"tmem\"", "kc=1024"]).unwrap_err();
+    assert!(
+        e.contains("the A stages") && e.contains("does not fit"),
+        "{e}"
+    );
+}

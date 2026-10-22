@@ -82,8 +82,22 @@ pub struct Params {
     pub inflight: usize,
     pub m: u64,
     pub n: u64,
-    pub k: u64,
+    /// The k of a matmul (`atlas`, default 1024) or of a chain (`tmem`,
+    /// default 2048).
+    pub k: Option<u64>,
     pub dtype: String,
+    /// `tmem`: the type of B when it differs from `dtype` (for example
+    /// mxfp4 with bf16 A).
+    pub b_dtype: String,
+    /// `tmem`: the k of each matmul task of a chain.
+    pub kc: u64,
+    /// `tmem`: the A and B buffers in the tmem.
+    pub stages: usize,
+    /// `tmem`: 1 (a C buffer in each of banks 2 and 3, by turns) or 2 (one C
+    /// buffer across banks 2 and 3).
+    pub c_banks: usize,
+    /// `tmem`: the 128 x 128 output tiles, each a chain over k.
+    pub tiles: usize,
     /// Output tile of a matmul `[rows, columns]`.
     pub tile: [u64; 2],
     pub lane_ops: u64,
@@ -111,8 +125,13 @@ impl Default for Params {
             inflight: 4,
             m: 128,
             n: 128,
-            k: 1024,
+            k: None,
             dtype: "bf16".into(),
+            b_dtype: String::new(),
+            kc: 128,
+            stages: 2,
+            c_banks: 2,
+            tiles: 4,
             tile: [128, 128],
             lane_ops: 1 << 16,
             bytes_out: 0,
@@ -124,6 +143,13 @@ impl Default for Params {
             l2: "root.l2".into(),
             dram: "root.hbm".into(),
         }
+    }
+}
+
+impl Params {
+    /// `k`, or `default` when it is not given.
+    fn k_or(&self, default: u64) -> u64 {
+        self.k.unwrap_or(default)
     }
 }
 
@@ -153,6 +179,10 @@ enum Role {
     Flag,
     /// The join of `barrier`.
     Join,
+    /// `tmem`: a matmul of a chain.
+    Matmul,
+    /// `tmem`: the copy of a tile's C from the tmem to the SMEM.
+    Copy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +204,10 @@ pub struct Report {
     driver_end: u64,
     /// The driver's cycle after each invoke call returned.
     invoked_at: Vec<u64>,
+    /// `tmem`: the chains' MACs and the Atlas rate (MACs per cycle) of
+    /// their operand types.
+    macs: u64,
+    rate: f64,
 }
 
 /// One task of the program: its descriptor, the window it counts in (at
@@ -338,17 +372,18 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
     let sms;
     let mut p = p;
     if p.driver.is_empty() {
-        p.driver = if matches!(p.mode.as_str(), "stream" | "untracked") {
-            "sms"
-        } else {
-            "root"
+        p.driver = match p.mode.as_str() {
+            "stream" | "untracked" => "sms",
+            "tmem" => "sm",
+            _ => "root",
         }
         .into();
     }
     let per_sm = matches!(
         p.mode.as_str(),
-        "stream" | "latency" | "atlas" | "muon" | "untracked"
+        "stream" | "latency" | "atlas" | "muon" | "untracked" | "tmem"
     );
+    let (mut macs, mut rate) = (0u64, 0f64);
     let mut signals = Vec::new();
     let driver = match p.driver.as_str() {
         "root" | "sms" if p.driver == "root" || per_sm => NeutrinoId(0),
@@ -544,12 +579,12 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                                 b: Addr(s.smem.base),
                                 a2: None,
                                 b2: None,
-                                lda: p.k,
+                                lda: p.k_or(1024),
                                 ldb: p.n,
                                 ldc: p.n,
                                 m: p.m,
                                 n: p.n,
-                                k: p.k,
+                                k: p.k_or(1024),
                                 in_dtype: d,
                                 b_dtype: d,
                                 out_dtype: Dtype::Bf16,
@@ -778,9 +813,222 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                 signals.push(signal);
             }
         }
+        "tmem" => {
+            let s = pick(&all, 1, &p.placement)?.remove(0);
+            sms = vec![s.clone()];
+            let atlas = *s.atlas.first().ok_or_else(|| format!("{}: no atlas", s.path))?;
+            let a_t = parse_dtype(&p.dtype)?;
+            let b_t = if p.b_dtype.is_empty() {
+                a_t
+            } else {
+                parse_dtype(&p.b_dtype)?
+            };
+            let (k, kc) = (p.k_or(2048), p.kc);
+            if kc == 0 || !k.is_multiple_of(kc) || p.stages == 0 || p.tiles == 0 {
+                return Err("tmem: kc divides k, and stages and tiles are positive".into());
+            }
+            let banks_of = |name: &str| -> Vec<Range> {
+                let mut v: Vec<Range> = b
+                    .sim
+                    .memories()
+                    .iter()
+                    .filter(|m| m.name.starts_with(&format!("{}.{name}.b", s.path)))
+                    .map(|m| m.range)
+                    .collect();
+                v.sort_by_key(|r| r.base);
+                v
+            };
+            let tb = banks_of("tmem");
+            if tb.len() != 4 {
+                return Err(format!("tmem: {} needs a tmem of four banks", s.path));
+            }
+            let sb = banks_of("smem");
+            let (s0, s1) = match sb.as_slice() {
+                [x, y, ..] => (*x, *y),
+                _ => (s.smem, s.smem),
+            };
+            // The tmem layout: the A stages from the base of bank 0, the B
+            // stages from the base of bank 1, C (fp32) in banks 2 and 3.
+            const T: u64 = 128;
+            let fit = |what: &str, need: u64, room: u64| {
+                if need > room {
+                    Err(format!(
+                        "tmem: {what} of {need} B does not fit in {room} B (k = {k}, kc = {kc}, stages = {}, c_banks = {})",
+                        p.stages, p.c_banks
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            let a_bytes = a_t.bytes_for(T * kc);
+            let b_bytes = b_t.bytes_for(kc * T);
+            let a_slot = a_bytes.div_ceil(GRANULE) * GRANULE;
+            let b_slot = b_bytes.div_ceil(GRANULE) * GRANULE;
+            fit("the A stages", p.stages as u64 * a_slot, tb[0].len())?;
+            fit("the B stages", p.stages as u64 * b_slot, tb[1].len())?;
+            let c_bytes = T * T * 4;
+            let c_bufs: Vec<u64> = match p.c_banks {
+                1 => {
+                    fit("a C buffer", c_bytes, tb[2].len())?;
+                    vec![tb[2].base, tb[3].base]
+                }
+                2 => {
+                    let at = tb[3].base - c_bytes / 2 / GRANULE * GRANULE;
+                    fit("the C buffer", c_bytes, tb[3].bound - at)?;
+                    vec![at]
+                }
+                c => return Err(format!("tmem: c_banks {c} (1 or 2)")),
+            };
+            // The sources: one fixed range in SMEM bank 0 (A) and bank 1
+            // (B), the same for every chunk (time, not data); each C
+            // buffer's copy goes to SMEM bank 0 after the A source.
+            let out_bytes = T * T * Dtype::Bf16.bytes();
+            let outs: Vec<u64> = (0..c_bufs.len() as u64)
+                .map(|i| s0.base + a_slot + i * out_bytes.div_ceil(GRANULE) * GRANULE)
+                .collect();
+            fit(
+                "the A source and the C copies",
+                outs[outs.len() - 1] + out_bytes - s0.base,
+                s0.len(),
+            )?;
+            fit("the B source", b_slot, s1.len())?;
+            let (dma, mm) = (op("dma")?, op("atlas.matmul")?);
+            let key = |items: &[Item], base: u64| Dep::Versioned {
+                addr: base,
+                version: versions_peek(items, base),
+            };
+            let copy = |src: u64, dst: u64, bytes: u64, deps: Vec<Dep>| Descriptor {
+                opcode: dma,
+                pe: Some(s.dma),
+                dst: dst_range(dst, bytes),
+                versioned: true,
+                untracked: false,
+                dst_mask: nu_model::FULL_MASK,
+                inferred_version: None,
+                deps,
+                label: None,
+                args: Args::Dma {
+                    src: Addr(src),
+                    dst: Addr(dst),
+                    bytes,
+                    tile_bytes: bytes,
+                },
+            };
+            // Per stage: the matmul that last read it; per C buffer: the
+            // copy that last read it.
+            let mut stage_reader: Vec<Option<Dep>> = vec![None; p.stages];
+            let mut c_reader: Vec<Option<Dep>> = vec![None; c_bufs.len()];
+            let mut i = 0usize;
+            for t in 0..p.tiles {
+                let cb = t % c_bufs.len();
+                let c = c_bufs[cb];
+                let mut prev: Option<Dep> = None;
+                for x in 0..k / kc {
+                    let st = i % p.stages;
+                    let (a_at, b_at) = (
+                        tb[0].base + st as u64 * a_slot,
+                        tb[1].base + st as u64 * b_slot,
+                    );
+                    let war: Vec<Dep> = stage_reader[st].into_iter().collect();
+                    let role = |r| Meta {
+                        role: r,
+                        sm: 0,
+                        bytes: 0,
+                    };
+                    push(
+                        &mut items,
+                        &mut metas,
+                        copy(s0.base, a_at, a_bytes, war.clone()),
+                        0,
+                        Meta {
+                            bytes: a_bytes,
+                            ..role(Role::Data)
+                        },
+                    );
+                    let ka = key(&items, a_at);
+                    push(
+                        &mut items,
+                        &mut metas,
+                        copy(s1.base, b_at, b_bytes, war),
+                        0,
+                        Meta {
+                            bytes: b_bytes,
+                            ..role(Role::Data)
+                        },
+                    );
+                    let kb = key(&items, b_at);
+                    let mut deps = vec![ka, kb];
+                    deps.extend(prev);
+                    if x == 0 {
+                        deps.extend(c_reader[cb]);
+                    }
+                    let last = x + 1 == k / kc;
+                    let desc = Descriptor {
+                        opcode: mm,
+                        pe: Some(atlas),
+                        dst: dst_range(c, c_bytes),
+                        versioned: true,
+                        untracked: false,
+                        dst_mask: nu_model::FULL_MASK,
+                        inferred_version: None,
+                        deps,
+                        label: None,
+                        args: Args::Matmul {
+                            a: Addr(a_at),
+                            b: Addr(b_at),
+                            a2: None,
+                            b2: None,
+                            lda: kc,
+                            ldb: T,
+                            ldc: T,
+                            m: T,
+                            n: T,
+                            k: kc,
+                            in_dtype: a_t,
+                            b_dtype: b_t,
+                            out_dtype: Dtype::Bf16,
+                            accumulate: x > 0,
+                            keep: !last,
+                            tile: [T, T],
+                        },
+                    };
+                    push(&mut items, &mut metas, desc, 0, role(Role::Matmul));
+                    let km = key(&items, c);
+                    stage_reader[st] = Some(km);
+                    prev = Some(km);
+                    i += 1;
+                    if last {
+                        push(
+                            &mut items,
+                            &mut metas,
+                            copy(c, outs[cb], out_bytes, vec![km]),
+                            0,
+                            Meta {
+                                bytes: out_bytes,
+                                ..role(Role::Copy)
+                            },
+                        );
+                        c_reader[cb] = Some(key(&items, outs[cb]));
+                    }
+                }
+            }
+            macs = p.tiles as u64 * T * T * k;
+            rate = match &b.sim.pe_config(atlas).params {
+                sim_core::PeParams::Atlas { rates, .. } => {
+                    let r = |d: Dtype| {
+                        rates
+                            .iter()
+                            .find(|x| x.0 == d)
+                            .map_or(0.0, |x| x.1.num as f64 / x.1.den as f64)
+                    };
+                    r(a_t).min(r(b_t))
+                }
+                _ => 0.0,
+            };
+        }
         m => {
             return Err(format!(
-                "unknown mode {m:?} (stream, latency, atlas, muon, pingpong, barrier, invoke, untracked)"
+                "unknown mode {m:?} (stream, latency, atlas, muon, pingpong, barrier, invoke, untracked, tmem)"
             ))
         }
     }
@@ -817,6 +1065,8 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
         params: Some(p),
         sms,
         metas,
+        macs,
+        rate,
         ..Report::default()
     }));
     Ok(Run {
@@ -1054,7 +1304,7 @@ pub fn result(r: &Report, stats: &Stats) -> Value {
                 });
                 if p.mode == "atlas" {
                     row["mac_per_cycle"] =
-                        json!((n * p.m * p.n * p.k) as f64 / cycles.max(1) as f64);
+                        json!((n * p.m * p.n * p.k_or(1024)) as f64 / cycles.max(1) as f64);
                 }
                 rows.push(row);
             }
@@ -1159,6 +1409,45 @@ pub fn result(r: &Report, stats: &Stats) -> Value {
             out["invoke_messages"] =
                 json!(stats.messages_by_kind.get("Invoke").copied().unwrap_or(0));
             out["per_sm"] = Value::Array(per);
+        }
+        "tmem" => {
+            let end = stats.end_time;
+            out["end_cycles"] = json!(end);
+            out["macs"] = json!(r.macs);
+            out["atlas_rate"] = json!(r.rate);
+            out["atlas_utilization"] = json!(r.macs as f64 / (r.rate * end.max(1) as f64));
+            // The busiest port of the tmem banks.
+            let sm = r.sms.first().map_or("", |x| x.path.as_str());
+            let prefix = format!("{sm}.tmem.b");
+            let util = |x: &sim_core::ResourceStats| {
+                x.busy_slot_cycles / (x.slots.max(f64::MIN_POSITIVE) * end.max(1) as f64)
+            };
+            let busiest = stats
+                .resources
+                .iter()
+                .filter(|x| x.name.starts_with(&prefix))
+                .max_by(|x, y| util(x).total_cmp(&util(y)));
+            if let Some(x) = busiest {
+                out["tmem_busiest"] = json!(x.name);
+                out["tmem_busiest_utilization"] = json!(util(x));
+            }
+            // Per tile: from the completion of its last matmul to the end of
+            // its C copy.
+            let mut tails = Vec::new();
+            let mut last_mm: Option<u64> = None;
+            for (i, m) in r.metas.iter().enumerate() {
+                match m.role {
+                    Role::Matmul => last_mm = task(i).and_then(|t| t.complete),
+                    Role::Copy => {
+                        let end = task(i).and_then(last_end);
+                        if let (Some(a), Some(e)) = (last_mm, end) {
+                            tails.push(e.saturating_sub(a));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out["tile_tail_cycles"] = json!(tails);
         }
         _ => {}
     }

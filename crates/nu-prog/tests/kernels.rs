@@ -17,7 +17,7 @@ fn run_with(config: &str, params: &str, sets: &[&str]) -> (Stats, Report) {
         .join(config);
     let mut b = build_config_file(&path, sets, ProfileRegistry::with_builtins()).expect("config");
     // C stays in the Atlas accumulator until the last k-tile.
-    b.sim.set_atlas_acc_buffer(1 << 17);
+    b.sim.set_atlas_acc_buffer(1 << 17).unwrap();
     let l = nu_prog::launch("kernels", &b, 512, params, &[]).expect("launch");
     let mut sim = b.sim;
     sim.set_timeline(true);
@@ -343,7 +343,7 @@ fn attention_holds_s_and_o_in_the_accumulator_by_default() {
     let built = |acc: u64| {
         let mut b =
             build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).unwrap();
-        b.sim.set_atlas_acc_buffer(acc);
+        b.sim.set_atlas_acc_buffer(acc).unwrap();
         b
     };
     let b = built(1 << 18);

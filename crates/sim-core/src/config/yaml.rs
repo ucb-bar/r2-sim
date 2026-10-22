@@ -809,7 +809,7 @@ pub struct LinkInfo {
 pub struct MemInfo {
     pub path: String,
     pub node: NeutrinoId,
-    /// "scratch", "dram", "cache" or "sync".
+    /// "scratch", "dram", "tmem", "cache" or "sync".
     pub kind: &'static str,
     /// Global address ranges.
     pub ranges: Vec<Range>,
@@ -968,6 +968,15 @@ fn resolve(name: &str, this: &str, parent: Option<&str>) -> Result<String, Confi
         return Ok(format!("{p}{rest}"));
     }
     Ok(name.to_string())
+}
+
+/// The static name of a block's memory type.
+fn mem_kind(kind: &str) -> &'static str {
+    match kind {
+        "scratch" => "scratch",
+        "tmem" => "tmem",
+        _ => "dram",
+    }
 }
 
 /// A memory block whose buses are resolved at the end.
@@ -1186,6 +1195,7 @@ impl Builder {
         }
         for m in std::mem::take(&mut self.mems) {
             let mut block = m.block;
+            block.kind = m.kind;
             let short = block.name.rsplit('.').next().unwrap_or("").to_string();
             for slave in &m.slaves {
                 let bus = self.bus(slave, &block.name)?;
@@ -1257,6 +1267,7 @@ impl Builder {
         self.built.layout.memories.extend(syncs);
         self.built.sim.finish_fabric().map_err(ConfigError)?;
         check_tables(&self.table_sizes)?;
+        self.built.sim.check_acc_buffers().map_err(ConfigError)?;
         self.built.warnings.extend(check_bursts(&self.built.sim));
         self.built.warnings.extend(check_beats(&self.built.sim));
         Ok(self.built)
@@ -1308,7 +1319,7 @@ impl Builder {
                 if b <= a {
                     return err(format!("{path}.{}: empty range", m.name));
                 }
-                let local = matches!(m.kind.as_str(), "scratch" | "dram" | "sync");
+                let local = matches!(m.kind.as_str(), "scratch" | "dram" | "tmem" | "sync");
                 let r = if local {
                     Range::new(base + a, base + b)
                 } else {
@@ -1318,7 +1329,7 @@ impl Builder {
                     return err(format!("{path}.{}: {r} is outside its space {own}", m.name));
                 }
                 match m.kind.as_str() {
-                    "scratch" | "dram" => owned.push(r),
+                    "scratch" | "dram" | "tmem" => owned.push(r),
                     "sync" => {
                         if sync.replace((r, format!("{path}.{}", m.name))).is_some() {
                             return err(format!("{path}: more than one sync range"));
@@ -1626,9 +1637,11 @@ impl Builder {
                 }
                 continue;
             }
-            if m.kind != "scratch" && m.kind != "dram" && (banked || m.wr_bytes.is_some()) {
+            if !matches!(m.kind.as_str(), "scratch" | "dram" | "tmem")
+                && (banked || m.wr_bytes.is_some())
+            {
                 return err(format!(
-                    "{name}: banks and wr_bytes are keys of a scratch or dram block"
+                    "{name}: banks and wr_bytes are keys of a scratch, dram or tmem block"
                 ));
             }
             if banked {
@@ -1649,7 +1662,7 @@ impl Builder {
                 .map(|b| resolve(b, path, ppath))
                 .collect::<Result<_, _>>()?;
             match m.kind.as_str() {
-                "scratch" | "dram" => {
+                "scratch" | "dram" | "tmem" => {
                     if m.master.is_some() {
                         return err(format!("{name}: only a cache has a master bus"));
                     }
@@ -1664,11 +1677,7 @@ impl Builder {
                     }
                     self.built.memories.insert(name.clone(), range);
                     self.mems.push(PendingMem {
-                        kind: if m.kind == "scratch" {
-                            "scratch"
-                        } else {
-                            "dram"
-                        },
+                        kind: mem_kind(&m.kind),
                         block: MemBlock {
                             numeric,
                             wport,
@@ -1852,11 +1861,7 @@ impl Builder {
             }
             let r = Range::from_len(range.base + i * size, size);
             self.mems.push(PendingMem {
-                kind: if m.kind == "scratch" {
-                    "scratch"
-                } else {
-                    "dram"
-                },
+                kind: mem_kind(&m.kind),
                 block: MemBlock {
                     numeric,
                     banked: true,

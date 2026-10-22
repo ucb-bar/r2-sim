@@ -400,7 +400,7 @@ fn run(argv: &[String]) -> Result<(), String> {
         b.sim.set_atlas_row_panel(on);
     }
     if let Some(bytes) = a.acc_buffer {
-        b.sim.set_atlas_acc_buffer(bytes);
+        b.sim.set_atlas_acc_buffer(bytes)?;
     }
     let launch = nu_prog::launch(&program, &b, granule, &params_text, &overrides)?;
     // HBM rate for the bound: every slice.

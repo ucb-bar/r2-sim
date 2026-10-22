@@ -1,0 +1,74 @@
+# One SM of the 2p family with a tensor memory (tmem model, 2026-10-21):
+# sm.yaml plus a tmem of four banks on lbus. The Atlas reads A, B and C
+# from the tmem and writes C into it, so it has no accumulator buffer
+# (acc_buffer 0; a nonzero one is a configuration error). The data paths
+# are provisional. The rest is sm.yaml:
+#
+# * Bridge to the gpc: 128 B/cycle each way (half the SMEM's two read
+#   ports together, so one SM cannot saturate the gpc crossbar alone),
+#   latency 10 cycles.
+# * smsbus: the SM's data bus to the gpc (unlimited); lbus: local scratch
+#   (unlimited). The SMEM ports are the only limit on SMEM traffic. SMEM is
+#   a slave on lbus and smsbus: local units reach it over lbus, other nodes
+#   over smsbus.
+# * Control fabric (2026-10-20): smcbus, the SM's control bus,
+#   and the control link to the gpc move 8 B/cycle per port and per
+#   direction, as the gpc and device control crossbars; a 64 B message beat
+#   takes 8 cycles on each control hop.
+# * SMEM: 1 MiB as two contiguous banks of 512 KiB (`banks: 2`, smem.b0
+#   and smem.b1), each with one read port and one write port at 128
+#   B/cycle, latency 10 cycles; no hash link (2026-10-13;
+#   Radiance 2 spec Section 3.1, banks). The builders keep activations
+#   (Atlas operand A, Muon inputs) in bank 0 and weights (operand B) in
+#   bank 1, so each operand role reads at 128 B/cycle. The data link to
+#   the gpc has separate read and write channels at 128 B/cycle each
+#   (Radiance 2 spec Section 3.4).
+# * Atlas: rates sized from the SMEM read bandwidth with 128 x 128 tiles,
+#   R = 32768 / (sA + sB) MAC/cycle for operand sizes sA and sB in bytes:
+#   bf16 8192, fp8 16384, mxfp4 32768 (30840 would saturate exactly, so a
+#   pure mxfp4 tile is about 6 % SMEM-bound). A tile of mixed types runs at
+#   the slower operand's rate. quantize = tile charges a 51-token row as a
+#   full 128-row tile (the padding-waste assumption of workload 1). A 1 MiB
+#   accumulator (acc_buffer).
+# * Muon: 256 lane-op/cycle (a 16 x 16 SIMT core), overhead 50 cycles per
+#   task for launch and the reduction tail.
+# * DMA: latency 100 cycles, 4 transfers in flight. Chunks are issued at
+#   the engine's beat rate (r2sim spec Section 5.4.1, issue-driven
+#   chunks), so the latency is paid once per transfer; `outstanding` (a cap
+#   on chunks issued and not ended) is not set. The chunk is the program's
+#   tile (64 KiB): `burst_bytes` is not set (measured 2026-10-05:
+#   smaller bursts made the forward pass slower
+#   under the earlier completion-driven issue).
+# * Neutrino: the table sizes of Neutrino spec Section 11.1
+#   (2026-09-24): scoreboard 128, pending table 256, execution table 256,
+#   inbound ref table 128, inbound invoke table 64, outbound dep table 128,
+#   outbound invoke table 32; c_invoke 8 cycles. Version table 256
+#   (2026-09-28; the gpcs have 1024). The outbound and inbound invoke
+#   tables count messages (a multi-beat message is one entry). The 5a
+#   values are in 2p-smallrefs.yaml.
+
+fabric:
+  - {name: smsbus, topology: xbar}
+  - {name: smcbus, topology: xbar, bw_bytes: 8, beat_bytes: 8, control: true}
+  - {name: lbus, topology: xbar}
+  # Links to the gpc (Radiance 2 spec Section 3.4), latency 10 cycles: data
+  # 128 B/cycle per direction; control 8 B/cycle per direction.
+  - {name: smsbus_to_clsbus, topology: link, from: $this.smsbus, to: $parent.clsbus, bw_bytes: 128, wr_bytes: 128, latency: 10}
+  - {name: smcbus_to_clcbus, topology: link, from: $this.smcbus, to: $parent.clcbus, bw_bytes: 8, beat_bytes: 8, latency: 10, control: true}
+memory:
+  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], banks: 2, bw_bytes: 128, wr_bytes: 128, latency: 10,
+     slave: [$this.lbus, $this.smsbus]}
+  - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  # The tensor memory (tmem model, 2026-10-21): four banks of 64 KiB, each
+  # with a read port and a write port of 128 B/cycle, read latency 5. A
+  # slave on lbus only: the SM's own DMA engine reaches it, no other node.
+  - {name: tmem, type: tmem, addr: [[0x1000000, 0x1040000]], banks: 4, bw_bytes: 128, wr_bytes: 128, latency: 5, slave: [$this.lbus]}
+compute:
+  - {name: atlas, type: tensor, rate: {bf16: 8192, fp8: 16384, mxfp4: 32768},
+     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+  - {name: muon, type: vector, rate: {lane_op: 256}, overhead: 50, master: [$this.lbus, $this.smsbus]}
+  # DMA beat 256 B: the two SMEM banks together (its buses are
+  # unlimited); one transfer writes one bank at 128 B/cycle.
+  - {name: dma, type: dma, latency: 100, inflight: 4, beat_bytes: 256, master: [$this.lbus, $this.smsbus]}
+neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
+           c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}

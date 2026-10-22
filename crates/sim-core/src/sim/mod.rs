@@ -957,8 +957,103 @@ impl Sim {
     }
 
     /// Atlas accumulator memory in bytes (0 = none).
-    pub fn set_atlas_acc_buffer(&mut self, bytes: u64) {
+    pub fn set_atlas_acc_buffer(&mut self, bytes: u64) -> Result<(), String> {
         self.each_atlas(|_, a, _| *a = bytes);
+        self.check_acc_buffers()
+    }
+
+    /// The span of the blocks of kind `kind` that `nu` owns, if any (a
+    /// banked memory's banks are contiguous).
+    fn span_of(&self, nu: NeutrinoId, kind: &str) -> Option<Range> {
+        let mut it = self
+            .memories
+            .iter()
+            .filter(|m| m.owner == nu && m.kind == kind)
+            .map(|m| m.range);
+        let first = it.next()?;
+        Some(it.fold(first, |a, r| {
+            Range::new(a.base.min(r.base), a.bound.max(r.bound))
+        }))
+    }
+
+    /// An SM with a tmem keeps C in the tmem: its Atlas has no accumulator
+    /// buffer (tmem model, 2026-10-21).
+    pub fn check_acc_buffers(&self) -> Result<(), String> {
+        for p in &self.pes {
+            if let crate::config::PeParams::Atlas { acc_buffer, .. } = p.cfg.params {
+                if acc_buffer > 0 && self.span_of(p.nu, "tmem").is_some() {
+                    return Err(format!(
+                        "{}: an accumulator buffer of {acc_buffer} B on an SM with a tmem",
+                        p.cfg.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The access rules of the tmem (tmem model, 2026-10-21), in one place:
+    /// on an SM with a tmem, an Atlas task's A, B and C are in that tmem;
+    /// a DMA that reads a tmem writes only the SMEM of the same SM
+    /// (provisional).
+    fn tmem_rules(&self, desc: &Descriptor) -> Result<(), String> {
+        let Some(pe) = desc.pe else {
+            return Ok(());
+        };
+        let nu = self.pes[pe.0 as usize].nu;
+        match desc.args {
+            Args::Matmul {
+                a,
+                b,
+                a2,
+                b2,
+                lda,
+                ldb,
+                m,
+                n,
+                k,
+                in_dtype,
+                b_dtype,
+                ..
+            } => {
+                let Some(tmem) = self.span_of(nu, "tmem") else {
+                    return Ok(());
+                };
+                let a_len = in_dtype.bytes_for(m.saturating_sub(1) * lda + k);
+                let b_len = b_dtype.bytes_for(k.saturating_sub(1) * ldb + n);
+                let mut parts = vec![
+                    ("A", Range::from_len(a.0, a_len)),
+                    ("B", Range::from_len(b.0, b_len)),
+                    ("C", desc.dst),
+                ];
+                parts.extend(a2.map(|x| ("A", Range::from_len(x.0, a_len))));
+                parts.extend(b2.map(|x| ("B", Range::from_len(x.0, b_len))));
+                for (what, r) in parts {
+                    if !tmem.covers(&r) {
+                        return Err(format!(
+                            "matmul on an SM with a tmem: {what} {r} is not in its tmem {tmem}"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Args::Dma {
+                src, dst, bytes, ..
+            } => {
+                let Some(m) = self.memories.iter().find(|m| m.is_tmem() && m.holds(src)) else {
+                    return Ok(());
+                };
+                let to = Range::from_len(dst.0, bytes);
+                match self.span_of(m.owner, "scratch") {
+                    Some(smem) if smem.covers(&to) => Ok(()),
+                    _ => Err(format!(
+                        "a DMA from the tmem {} writes {to}, not the SMEM of its SM",
+                        m.memory_name()
+                    )),
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Atlas operand reuse: keep the A row panel across a row's
@@ -1947,6 +2042,9 @@ impl Sim {
         }
         if forwarded && desc.opcode == OpcodeId::SPAWN {
             return Err(EnterFail::Fatal(FatalError::Unsupported("remote spawn")));
+        }
+        if let Err(msg) = self.tmem_rules(&desc) {
+            return Err(EnterFail::Fatal(FatalError::Invalid(msg)));
         }
         // A join writes no data: its range is in its owner's sync-only
         // space (2026-10-20; local and forwarded joins enter here).

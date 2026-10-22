@@ -794,6 +794,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         b_dtype,
         out_dtype,
         accumulate,
+        keep,
         tile,
         ..
     } = desc.args
@@ -868,6 +869,18 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     };
     let acc = node.acc;
     let es = out_dtype.bytes();
+    // On an SM with a tmem, C is in the tmem (tmem model, 2026-10-21): the
+    // partial C of a chain is fp32 (read when accumulating, written when
+    // kept); the last task writes C in its output type. The task pays the
+    // tmem's latency once, before its first output tile.
+    let tmem = node
+        .memories
+        .iter()
+        .find(|m| m.is_tmem() && m.holds(Addr(desc.dst.base)));
+    let (es_in, es_out) = match tmem {
+        Some(_) => (4, if keep { 4 } else { es }),
+        None => (es, es),
+    };
     let mut chunks = Vec::new();
     for mi in (0..m).step_by(tile[0] as usize) {
         let tm = tile[0].min(m - mi);
@@ -883,7 +896,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             ops.utilization = utilization;
             ops.class = class;
             // Operands in, C out, and C in when accumulating. C is exact.
-            let c_bytes = tm * tn * es;
+            let (c_bytes, c_in_bytes) = (tm * tn * es_out, tm * tn * es_in);
             // With a row panel, A is read at the first output tile of the row.
             let a_bytes = if row_panel && ni > 0 {
                 0
@@ -893,7 +906,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             let b_bytes = b_dtype.bytes_for(k * qn);
             let c_out = if acc.skip_write { 0 } else { c_bytes };
             let c_in = if accumulate && !acc.skip_read {
-                c_bytes
+                c_in_bytes
             } else {
                 0
             };
@@ -907,7 +920,8 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             let read = a_bytes + b_bytes + c_in;
             let write = c_out + flush;
             let mut demand = vec![ops];
-            match smem_port {
+            // A tmem's banks take the bytes, whatever the SMEM's ports.
+            match smem_port.filter(|_| tmem.is_none()) {
                 Some(port) => demand.extend([
                     Demand::read(port, read),
                     Demand::write(smem_wport.unwrap_or(port), write),
@@ -917,10 +931,12 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                     // columns; C: the tile. A half of a split operand is
                     // in one bank by layout: its bytes go to the bank of
                     // its first byte.
-                    let c = Range::from_len(
-                        desc.dst.base + (mi * ldc + ni) * es,
-                        ((tm - 1) * ldc + tn) * es,
-                    );
+                    let c_at = |es: u64| {
+                        Range::from_len(
+                            desc.dst.base + (mi * ldc + ni) * es,
+                            ((tm - 1) * ldc + tn) * es,
+                        )
+                    };
                     for (part, bytes) in rows_split(a, a2, mi, qm, tile[0], a_bytes)
                         .into_iter()
                         .flatten()
@@ -941,8 +957,8 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                         );
                         operand(node, r, b2.is_some(), bytes, &mut demand);
                     }
-                    spread(node, c, c_in, Dir::Read, &mut demand);
-                    spread(node, c, write, Dir::Write, &mut demand);
+                    spread(node, c_at(es_in), c_in, Dir::Read, &mut demand);
+                    spread(node, c_at(es_out), write, Dir::Write, &mut demand);
                 }
             }
             let use_of = |p: Option<(AttachId, AttachId)>, bytes, dir| {
@@ -972,7 +988,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     Profile {
         chunks,
         holds: Vec::new(),
-        fill: 0,
+        fill: tmem.map_or(0, |m| m.load_latency),
     }
 }
 

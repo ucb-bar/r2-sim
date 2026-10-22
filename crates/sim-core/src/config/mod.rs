@@ -257,6 +257,9 @@ pub struct MemBlock {
     pub block: Option<u64>,
     /// Latency of a Neutrino load or store before its port bandwidth.
     pub load_latency: Cycle,
+    /// The memory type: "scratch", "dram" or "tmem" (an SM's tensor
+    /// memory, tmem model, 2026-10-21).
+    pub kind: &'static str,
 }
 
 impl MemBlock {
@@ -280,7 +283,13 @@ impl MemBlock {
             wport: None,
             block: None,
             load_latency,
+            kind: "scratch",
         }
+    }
+
+    /// True for a block of an SM's tensor memory (tmem model, 2026-10-21).
+    pub fn is_tmem(&self) -> bool {
+        self.kind == "tmem"
     }
 
     /// The name of the memory: the block's, or for a bank

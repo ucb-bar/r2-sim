@@ -1,0 +1,49 @@
+# 2p.yaml with a tensor memory in every SM (gpc-tmem.yaml, sm-tmem.yaml;
+# tmem model, 2026-10-21; the data paths are provisional). The rest of
+# this file is 2p.yaml.
+#
+# Radiance-2P for the pi0 forward-pass study. Every number is a knob to be
+# swept; the comments give the reason for the starting value. Clock: 1 GHz
+# reference, so 1 cycle = 1 ns.
+#
+# Flow control of forwarded invokes: ready/valid (2026-09-30; Neutrino spec
+# Section 9.2). Every protocol class has its own channel with one message
+# stage per hop of the control buses; an invoke waits in the channel until
+# the owner's inbound invoke table has room. `--set global.flow=ticket`
+# selects the ticket scheme for comparison.
+#
+# The tree (r2sim spec Section 10): root (the device: its sync space and
+# its Neutrino), gpc0 and gpc1 (gpc.yaml, each with its HBM slice and four
+# SMs, sm.yaml), addressed root.gpc1.sm2. Data buses carry DMA chunks,
+# loads and stores; control buses carry the protocol messages.
+#
+# Own spaces (offset_bits 33 = 8 GiB per node; fields gpc:2, sm:3):
+#   root          0x00_0000_0000   the device sync space
+#   gpc g         (g + 1) << 36    its HBM slice and its sync space
+#   gpc g, SM s   ((g + 1) << 36) | ((s + 1) << 33)
+
+global:
+  neutrino_granule: 512    # range alignment (Neutrino spec Section 2.3)
+  clock_ghz: 1.0
+  msg_bytes: 64            # one beat of a protocol message
+  flow: readyvalid         # ready/valid channels (Neutrino spec Section 9.2)
+  hop_queue: 1             # messages per hop stage and class (a pipeline register)
+  address:
+    fields: [{name: gpc, bits: 2}, {name: sm, bits: 3}]
+    offset_bits: 33
+
+device:
+  name: root
+  fabric:
+    # Data between the gpcs: 512 B/cycle per port, with separate read and
+    # write channels at that rate (Radiance 2 spec Section 3.4).
+    - {name: sbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
+    # Control between the gpcs: 8 B/cycle per port (2026-10-20):
+    # a 64 B message beat takes 8 cycles on each control hop.
+    - {name: cbus, topology: xbar, bw_bytes: 8, beat_bytes: 8, control: true}
+  memory:
+    - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
+  children:
+    - {name: gpc0, config: gpc-tmem.yaml}
+    - {name: gpc1, config: gpc-tmem.yaml}
