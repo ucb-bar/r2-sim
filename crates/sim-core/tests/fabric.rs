@@ -329,13 +329,14 @@ fn a_muon_reads_smem_over_lbus_and_a_remote_range_over_smsbus() {
     // One SM under the device. The Muon masters lbus and smsbus; SMEM is a
     // slave on both (latency 5); HBM is at the device (latency 40). A task
     // starts after its 10-cycle overhead and the longer path latency: the
-    // read's is its block's latency plus the route's (2026-10-21), the
-    // write's the route's only. V1 reads and writes SMEM: the SMEM port
+    // read's is its request's trip to the block, the block's latency and
+    // the route's (2026-10-21), the write's the route's only. V1 reads and writes SMEM: the SMEM port
     // only (2048 B at 128 B/cycle = 16 cycles), after 10 + 5. V2 reads
     // 1024 B of HBM and writes 1024 B of SMEM: the read takes the route
     // over smsbus and the SM's bridge down (16 B/cycle: 64 cycles, latency
-    // 20; the HBM port, 64 B/cycle, takes 16), so it starts 10 + 40 + 20
-    // cycles after its issue and lasts 64. V3 reads nothing and writes
+    // 20; the HBM port, 64 B/cycle, takes 16), so it starts 10 + 20 (the
+    // request over the bridge up) + 40 + 20 cycles after its issue and
+    // lasts 64. V3 reads nothing and writes
     // 1024 B of SMEM: no read latency, 8 cycles after 10. V4 (untracked)
     // reads SMEM and writes 1024 B of HBM over the bridge up: 10 + max(5,
     // 20), not HBM's 40; 64 cycles.
@@ -418,7 +419,7 @@ device:
         (c.start - t.issue.unwrap(), c.end - c.start)
     };
     assert_eq!(span(0), (15, 16));
-    assert_eq!(span(1), (70, 64));
+    assert_eq!(span(1), (90, 64));
     assert_eq!(span(2), (10, 8));
     assert_eq!(span(3), (30, 64));
 }

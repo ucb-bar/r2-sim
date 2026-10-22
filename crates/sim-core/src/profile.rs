@@ -724,6 +724,10 @@ pub struct Profile {
     /// latency): no chunk starts before the task's issue plus this many
     /// cycles plus the chunk's own latency. 0 for a compute task.
     pub fill: Cycle,
+    /// The part of `fill` that is the read request's trip to the source
+    /// block (2026-10-21); the rest is the block's latency, which the
+    /// in-flight pools take as the source latency.
+    pub request: Cycle,
 }
 
 /// What a profile function sees of the hardware.
@@ -934,13 +938,18 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             latency: *latency,
         });
     }
-    let fill = r
-        .locate(src.0)
-        .map_or(0, |(b, _)| node.memories[b].load_latency);
+    // The pipeline fill: the request's trip to the block of the first
+    // source byte (propagation only, 2026-10-21), then the block's
+    // latency.
+    let (request, fill) = r.locate(src.0).map_or((0, 0), |(b, _)| {
+        let leg = request_leg(node.topology, node.pe, &node.memories[b]);
+        (leg, leg + node.memories[b].load_latency)
+    });
     Profile {
         chunks,
         holds: Vec::new(),
         fill,
+        request,
     }
 }
 
@@ -1189,6 +1198,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         chunks,
         holds: Vec::new(),
         fill: tmem.map_or(0, |m| m.load_latency),
+        request: 0,
     }
 }
 
@@ -1280,6 +1290,17 @@ fn spread(node: &NodeConfig, range: Range, amount: u64, dir: Dir, out: &mut Vec<
     }
 }
 
+/// The propagation latency of a read request from the PE `pe` to the
+/// block `m`: the sum of the hop latencies of the route from the PE's
+/// master buses to the block (2026-10-21). The request takes no resource,
+/// no beat time, and waits for nothing.
+pub(crate) fn request_leg(topo: &Topology, pe: &PeConfig, m: &MemBlock) -> Cycle {
+    let (PeParams::Dma { masters, .. }
+    | PeParams::Muon { masters, .. }
+    | PeParams::Atlas { masters, .. }) = &pe.params;
+    topo.best_path(masters, &m.attach).map_or(0, |p| p.latency)
+}
+
 /// Muon vector task: one chunk; lane-ops on the vector resource at the
 /// configured utilization, plus the task's bytes on the port of the block
 /// that holds `dst` and on the route to it, after the fixed overhead and
@@ -1327,12 +1348,13 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             .topology
             .best_path(from, dest)
             .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
-        // A read pays its source block's latency, as a DMA's fill and a
-        // load do; a task that reads nothing has no input path.
+        // A read pays its request's trip to the source block and the
+        // block's latency, as a DMA's fill and a load do (2026-10-21); a
+        // task that reads nothing has no input path.
         let block_latency = if to || bytes == 0 {
             0
         } else {
-            block.load_latency
+            request_leg(node.topology, node.pe, block) + block.load_latency
         };
         latency = latency.max(block_latency + route.latency);
         let dir = if to { Dir::Write } else { Dir::Read };
@@ -1374,6 +1396,7 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         }],
         holds: Vec::new(),
         fill: 0,
+        request: 0,
     }
 }
 

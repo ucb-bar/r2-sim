@@ -21,7 +21,7 @@ memory:
      slave: $this.hbmbus}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 compute:
-  - {name: dma, type: dma, latency: 100, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
+  - {name: dma, type: dma, latency: 10, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
 children:
   - {name: sm0, config: sm.yaml}

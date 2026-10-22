@@ -387,17 +387,19 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let t = &s.tasks[0];
-    // Issue 8, sm1's SMEM latency 10 (the pipeline fill) and the engine
-    // latency 100: the hops in route order from 118, at the engine's 64 B
-    // beat narrowed by each hop (r2sim spec Section 5.6): sm1's SMEM port (128
-    // B/cycle) at 64, one of its two slots, [118, 246); sm1's bridge up
-    // (32 B/cycle, half a 64 B slot) [118, 374), latency 10; the crossbar
-    // ports (64 B/cycle, one slot) narrowed to 32, half a slot, [128, 384);
-    // sm0's bridge down [128, 384), latency 10; sm0's SMEM port narrowed to
-    // 32, [138, 394). The bridges and the ports each hold half a slot for
-    // 256 cycles: 128 slot-cycles.
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (118, 394));
-    assert_eq!(t.complete, Some(398));
+    // Issue 8, the request's trip from sm0's engine to sm1's SMEM (sm0's
+    // bridge up and sm1's bridge down, 10 each; 2026-10-21), sm1's SMEM
+    // latency 10 (the pipeline fill) and the engine latency 100: the hops
+    // in route order from 138, at the engine's 64 B beat narrowed by each
+    // hop (r2sim spec Section 5.6): sm1's SMEM port (128 B/cycle) at 64, one of its two
+    // slots, [138, 266); sm1's bridge up (32 B/cycle, half a 64 B slot)
+    // [138, 394), latency 10; the crossbar ports (64 B/cycle, one slot)
+    // narrowed to 32, half a slot, [148, 404); sm0's bridge down
+    // [148, 404), latency 10; sm0's SMEM port narrowed to 32, [158, 414).
+    // The bridges and the ports each hold half a slot for 256 cycles: 128
+    // slot-cycles.
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (138, 414));
+    assert_eq!(t.complete, Some(418));
     for name in [
         "root.gpc0.sm1.smsbus_to_clsbus.ab",
         "root.gpc0.clsbus.sm1.smsbus_to_clsbus.in",

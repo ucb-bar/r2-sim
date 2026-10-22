@@ -31,7 +31,7 @@ compute:
   # pull from the writing SM (Neutrino spec Section 3); 8 transfers in flight, chunks
   # issued at the beat rate (see sm.yaml). No burst_bytes.
   # Beat 512 B: sized to the bus it masters (clsbus, 512 B/cycle).
-  - {name: dma, type: dma, latency: 100, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
+  - {name: dma, type: dma, latency: 10, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
 # Version table 1024: one entry per HBM output block in flight (up to 896
 # per window with the current write granularity, one DMA per 128-column
 # block per token tile).

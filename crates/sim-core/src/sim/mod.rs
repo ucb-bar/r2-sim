@@ -2485,7 +2485,11 @@ impl Sim {
 
             let nchunks = profile.chunks.len();
             let stream = profile.chunks.iter().any(|c| c.transfer.is_some());
-            let fill = if self.zero_time { 0 } else { profile.fill };
+            let (fill, request) = if self.zero_time {
+                (0, 0)
+            } else {
+                (profile.fill, profile.request)
+            };
             let p = &mut self.pes[pe.0 as usize];
             p.running.push(Running {
                 nu,
@@ -2498,7 +2502,9 @@ impl Sim {
                 held: false,
                 last_end: 0,
                 fill: self.now + fill,
-                src_latency: fill,
+                // The pools take the block's latency; the request's trip
+                // to the block is in their own back-off (rule 7).
+                src_latency: fill.saturating_sub(request),
             });
             if nchunks == 0 {
                 self.finish_task(pe, nu, t);

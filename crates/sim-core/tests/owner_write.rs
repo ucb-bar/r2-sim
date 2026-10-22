@@ -69,20 +69,21 @@ fn a_write_into_hbm_is_a_pull_by_the_device() {
     // and issues the task on its copy engine at 43.
     let t = &s.tasks[0];
     assert_eq!((t.invoke, t.ready, t.issue), (43, Some(43), Some(43)));
-    // sm0's SMEM latency 10 (the pipeline fill) and the engine latency
-    // 100: the hops in route order from 153 at the engine's 64 B beat,
-    // narrowed by each hop (r2sim spec Section 5.6): sm0's SMEM port (one of its two
-    // slots) [153, 1177); sm0's bridge up (32 B/cycle) [153, 2201),
-    // latency 10; the crossbar ports and gpc0's bridge up narrowed to 32,
-    // [163, 2211), latency 20; the HBM port [183, 2231). The chunk runs
-    // from its first hop's start to its last hop's end; c_complete 4 at
-    // the device: 2235.
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (153, 2231));
-    assert_eq!(t.complete, Some(2235));
+    // The request's trip from the device's engine to sm0's SMEM (gpc0's
+    // bridge down 20 and sm0's bridge down 10: 30; 2026-10-21), sm0's SMEM
+    // latency 10 (the pipeline fill) and the engine latency 100: the hops
+    // in route order from 183 at the engine's 64 B beat, narrowed by each
+    // hop (r2sim spec Section 5.6): sm0's SMEM port (one of its two slots) [183, 1207);
+    // sm0's bridge up (32 B/cycle) [183, 2231), latency 10; the crossbar
+    // ports and gpc0's bridge up narrowed to 32, [193, 2241), latency 20;
+    // the HBM port [213, 2261). The chunk runs from its first hop's start
+    // to its last hop's end; c_complete 4 at the device: 2265.
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (183, 2261));
+    assert_eq!(t.complete, Some(2265));
     // sm0's wait: Await sent 10 in the dependency channel (independent of
-    // the invoke channel), registered at 45; Resolve sent 2235, arrives
-    // 2270. No other message kinds (no acknowledgement of invokes).
-    assert_eq!(s.end_time, 2270);
+    // the invoke channel), registered at 45; Resolve sent 2265, arrives
+    // 2300. No other message kinds (no acknowledgement of invokes).
+    assert_eq!(s.end_time, 2300);
     let kinds: Vec<&str> = s.messages_by_kind.keys().map(String::as_str).collect();
     assert_eq!(kinds, vec!["Await", "AwaitAck", "Invoke", "Resolve"]);
 }
@@ -115,9 +116,9 @@ fn a_consumer_of_a_write_registers_at_the_owner() {
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
     let (tw, tg) = (&s.tasks[0], &s.tasks[1]);
     assert_eq!(tg.nu, sm1);
-    // The write completes at 2235 as above; Resolve to sm1 takes 35 cycles.
-    assert_eq!(tw.complete, Some(2235));
-    assert_eq!(tg.ready, Some(2270));
+    // The write completes at 2265 as above; Resolve to sm1 takes 35 cycles.
+    assert_eq!(tw.complete, Some(2265));
+    assert_eq!(tg.ready, Some(2300));
     assert_eq!(s.warnings.len(), 0);
 }
 
@@ -143,8 +144,8 @@ fn a_task_on_a_pe_of_another_neutrino_is_fatal() {
 fn message_latency_adds_to_every_protocol_message() {
     // As a_write_into_hbm_is_a_pull_by_the_device with msg_latency 10:
     // Invoke and Resolve are on the critical path, 2 x 10 cycles:
-    // 2270 -> 2290.
+    // 2300 -> 2320.
     let s = write_into_hbm(&["global.msg_latency=10"]);
     assert_eq!(s.fatal, None);
-    assert_eq!(s.end_time, 2290);
+    assert_eq!(s.end_time, 2320);
 }

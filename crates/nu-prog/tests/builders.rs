@@ -77,42 +77,45 @@ fn one_linear_layer() {
     //   matmul descriptor (88 B) with the slots 79 and 95, ports to 136,
     //   down bridge [136, 160)), sm2 at 170, 202, 282 (from 120, 144, 176).
     // * DMAs (r2sim spec Section 5.6, data-path rule): hops in route order after the
-    //   source block's latency (SMEM 10, HBM 100; r2sim spec Section 5.9) and the
-    //   engine latency 50, at the engine's 64 B beat narrowed by each hop.
-    //   x to sm1 (8 KiB): sm0's SMEM port [118, 246) on one of its two
-    //   slots, sm0's bridge up (32 B/cycle) [118, 374), sm1's bridge down
-    //   and SMEM port to 394. x to sm2: its SMEM hop [230, 358) on the
-    //   other slot; sm0's bridge is busy until 374, so the data waits and
-    //   crosses it [374, 630): chunk [230, 650), end at sm2's SMEM port.
-    // * W0 (64 KiB from HBM to sm1): HBM (64 B/cycle) [240, 1264), not held
+    //   engine latency 50, the request's trip to the source block (the hop
+    //   latencies from the engine, 2026-10-21: 20 from sm1 or sm2 to sm0's
+    //   SMEM over the two SM bridges, 10 to the HBM over the SM's bridge)
+    //   and the source block's latency (SMEM 10, HBM 100; r2sim spec Section 5.9),
+    //   at the engine's 64 B beat narrowed by each hop.
+    //   x to sm1 (8 KiB): sm0's SMEM port [138, 266) on one of its two
+    //   slots, sm0's bridge up (32 B/cycle) [138, 394), sm1's bridge down
+    //   and SMEM port to 414. x to sm2: its SMEM hop [250, 378) on the
+    //   other slot; sm0's bridge is busy until 394, so the data waits and
+    //   crosses it [394, 650): chunk [250, 670), end at sm2's SMEM port.
+    // * W0 (64 KiB from HBM to sm1): HBM (64 B/cycle) [250, 1274), not held
     //   back by the slower bridge (no backpressure); sm1's bridge down after
-    //   the x DMA, [384, 2432), its SMEM port to 2442. W1 (to sm2): HBM
-    //   after W0, [1264, 2288); sm2's bridge [1264, 3312), SMEM to 3322.
-    // * Matmuls (608 cycles on SMEM) after the weights: sm1 [2446, 3054),
-    //   done 3058; sm2 [3326, 3934), done 3938.
-    // * The driver waits on (out1, 1): Resolve leaves sm1 at 3058 and
-    //   reaches it at 3114; the Await for (out2, 1) registers at sm2;
-    //   Resolve leaves at 3938: up bridge [3938, 3952) + 10, ports
-    //   [3962, 3968) and [3968, 3976), down bridge [3976, 3984) + 10: it
-    //   arrives at 3994.
+    //   the x DMA, [404, 2452), its SMEM port to 2462. W1 (to sm2): HBM
+    //   after W0, [1274, 2298); sm2's bridge [1274, 3322), SMEM to 3332.
+    // * Matmuls (608 cycles on SMEM) after the weights: sm1 [2466, 3074),
+    //   done 3078; sm2 [3336, 3944), done 3948.
+    // * The driver waits on (out1, 1): Resolve leaves sm1 at 3078 and
+    //   reaches it at 3134; the Await for (out2, 1) registers at sm2;
+    //   Resolve leaves at 3948: up bridge [3948, 3952) + 10 (its slot is
+    //   at the cycles 15 mod 16), ports [3962, 3968) and [3968, 3976), down
+    //   bridge [3976, 3984) + 10: it arrives at 3994.
     // * sm0's source invoke queue: the head waits from 16 to 32, 32 to 64,
     //   64 to 120, 120 to 144 and 144 to 176 (160 cycles).
     assert_eq!(end, 3994);
     assert_eq!(
         (s.tasks[3].chunks[0].start, s.tasks[3].chunks[0].end),
-        (230, 650),
+        (250, 670),
         "sm2's x DMA waits for sm0's bridge behind sm1's"
     );
     assert_eq!(
         s.tasks[1].chunks[0],
         sim_core::ChunkRec {
-            start: 240,
-            end: 2442,
+            start: 250,
+            end: 2462,
             culprit: s.tasks[1].chunks[0].culprit
         }
     );
     assert_eq!(
-        s.tasks[4].chunks[0].start, 1264,
+        s.tasks[4].chunks[0].start, 1274,
         "W1 queues on HBM only for W0's HBM window"
     );
     // 6 Invoke, 2 Await, 2 AwaitAck, 2 Resolve; the two matmul invokes
@@ -152,9 +155,11 @@ fn one_moe_dispatch() {
     assert_eq!(r.tokens_per_expert, vec![vec![vec![14, 2]]]);
     // Critical path (by hand; control messages by the slot cycles of
     // one_linear_layer; DMAs by the data-path rule, hops in route order at
-    // the engine's 64 B beat after the source block's latency, HBM 100 and
-    // SMEM 10, and the engine latency 50; a Muon task after its overhead
-    // and its read's SMEM latency 10, 2026-10-21): rmsnorm [28, 284);
+    // the engine's 64 B beat after the engine latency 50, the request's
+    // trip to the source block (2026-10-21: 10 from an SM to the HBM, 20
+    // between two SMs) and the source block's latency, HBM 100 and SMEM 10;
+    // a Muon task after its overhead and its read's SMEM latency 10,
+    // 2026-10-21): rmsnorm [28, 284);
     // router [288, 361); the load of its output [376, 377); the MoE
     // window's forwards from 385: the first takes the up bridge (1/16 slot,
     // whose slot is at the cycles 15 mod 16) [385, 400) + 10, the ports
@@ -162,27 +167,30 @@ fn one_moe_dispatch() {
     // reaches sm1 at 442; the second (expert 0's gate weight DMA) reaches
     // it at 474. HBM (64 B/cycle) is not held back by the 32 B/cycle SM
     // bridges, so it serves the weight DMAs in invoke order, 1024 cycles
-    // each: expert 0's gate [624, 1648) and up [1648, 2672), expert 1's
-    // gate [2672, 3696) and up [3696, 4720).
+    // each: expert 0's gate [634, 1658) and up [1658, 2682), expert 1's
+    // gate [2682, 3706) and up [3706, 4730).
     // Expert 1 on sm2 (2 tokens): its gate weight crosses sm2's bridge
-    // [2672, 4720) and reaches SMEM at 4730. The up weight's DMA then holds
-    // 0.5 SMEM slot (32 B/cycle) until 6778, so the gate matmul starts on
+    // [2682, 4730) and reaches SMEM at 4740. The up weight's DMA then holds
+    // 0.5 SMEM slot (32 B/cycle) until 6788, so the gate matmul starts on
     // the 1.5 free slots (r2sim spec Section 5.7, starting on the free slots): its
-    // 1048 slot-cycles take 699 cycles, [4734, 5433). The down weight's DMA
-    // waits for sm2's bridge behind the up weight: [6768, 8816), SMEM to
-    // 8826. The up matmul (after the up weight, 6782) also runs on the 1.5
-    // slots beside the down weight's DMA: [6782, 7481). The vector op is
-    // bound by its Muon, so its SMEM demand takes one slot, [7505, 7537).
-    // Down matmul (it reads the down weight) 2 x 264 cycles [8830, 9358),
-    // done 9362. Home depends on the down matmul's output directly (a pin,
-    // no end join): Resolve takes sm2's up bridge [9362, 9376) + 10, the
-    // ports [9386, 9392) and [9392, 9400) and sm0's down bridge
-    // [9400, 9408) + 10 and reaches home at 9418; pull (SMEM latency 10,
-    // engine latency 50) [9478, 9530); add [9554, 9578), done 9582; the
-    // driver resumes at 9582. Against 9556 before the Muon paid its read's
+    // 1048 slot-cycles take 699 cycles, [4744, 5443). The down weight's DMA
+    // waits for sm2's bridge behind the up weight: [6778, 8826), SMEM to
+    // 8836. The up matmul (after the up weight, 6792) also runs on the 1.5
+    // slots beside the down weight's DMA: [6792, 7491). The vector op is
+    // bound by its Muon, so its SMEM demand takes one slot, [7515, 7547).
+    // Down matmul (it reads the down weight) 2 x 264 cycles [8840, 9368),
+    // done 9372. Home depends on the down matmul's output directly (a pin,
+    // no end join): Resolve takes sm2's up bridge [9372, 9376) + 10 (its
+    // slot is at the cycles 15 mod 16), the ports [9386, 9392) and
+    // [9392, 9400) and sm0's down bridge [9400, 9408) + 10 and reaches home
+    // at 9418; pull (request 20 over the two SM bridges, SMEM latency 10,
+    // engine latency 50) [9498, 9550); add [9574, 9598), done 9602; the
+    // driver resumes at 9602. Against 9556 before the Muon paid its read's
     // latency: +10 (rmsnorm), +6 (the forwards meet the up bridge's slot
-    // at 399 instead of 383) and +10 (add).
-    assert_eq!(r.step_end[0], 9582);
+    // at 399 instead of 383) and +10 (add); then +20 for the pull's
+    // request (2026-10-21; the weights' request of 10 is absorbed by the
+    // Resolve's wait for its slot).
+    assert_eq!(r.step_end[0], 9602);
     // 16 Invoke, 2 Await, 2 AwaitAck, 2 Resolve.
     assert_eq!(s.messages, 22);
 }

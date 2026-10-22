@@ -310,7 +310,13 @@ impl super::Sim {
                         t.read = Rc::clone(h);
                         c.routes[0] = route_use(h, n, Dir::Read);
                         if i == 0 {
-                            prof.fill = self.memories[sb].load_latency;
+                            let m = &self.memories[sb];
+                            prof.request = crate::profile::request_leg(
+                                &self.topo,
+                                &self.pes[pe.0 as usize].cfg,
+                                m,
+                            );
+                            prof.fill = prof.request + m.load_latency;
                         }
                     }
                 }

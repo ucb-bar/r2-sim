@@ -22,7 +22,7 @@ compute:
   # Copy engine: every write into the slice or the cmem is a task of the
   # gpc on it.
   # Beat 512 B: sized to the bus it masters (clsbus, 512 B/cycle).
-  - {name: dma, type: dma, latency: 100, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
+  - {name: dma, type: dma, latency: 10, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
 children:
   - {name: sm0, config: sm.yaml}

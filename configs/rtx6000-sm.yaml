@@ -23,11 +23,12 @@
 #   sub-partition's registers; --acc-buffer sets every unit's).
 # * muon: the 128 CUDA cores as a 128-lane vector unit (125 fp32 FMA per
 #   cycle measured); overhead 20 cycles per task (not measured).
-# * dma: the SM's bulk copy engine (TMA). Latency 289 cycles, the one
+# * dma: the SM's bulk copy engine (TMA). Latency 208 cycles, the one
 #   calibrated parameter of the copy path: a 1 KiB copy from the L2 takes
-#   the card's 550 cycles. It covers the request's way to the L2 (81
-#   cycles; the model charges a DMA only the data's route) and the TMA
-#   unit's own time (about 208). The other copy sizes are predictions.
+#   the card's 550 cycles. The TMA unit's own time; the request's way to
+#   the L2 (81 cycles) is the model's request leg since 2026-10-21 (the
+#   calibrated total was 289 before). The other copy sizes are
+#   predictions.
 #   8 transfers in flight; 32 B beats.
 # * neutrino: the Radiance 2 tables as in sm.yaml; the GPU has no such unit.
 
@@ -51,6 +52,6 @@ compute:
   - {name: atlas3, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
      quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 128}, overhead: 20, master: [$this.lbus, $this.smsbus]}
-  - {name: dma, type: dma, latency: 289, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
+  - {name: dma, type: dma, latency: 208, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
            c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}

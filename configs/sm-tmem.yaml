@@ -33,7 +33,10 @@
 #   the accumulator holds one fp32 output tile (see the head of the file).
 # * Muon: 256 lane-op/cycle (a 16 x 16 SIMT core), overhead 50 cycles per
 #   task for launch and the reduction tail.
-# * DMA: latency 100 cycles, 4 transfers in flight. Chunks are issued at
+# * DMA: issue latency 10 cycles (2026-10-21; before, 100 from before any
+#   memory latency was modeled); a read also pays its request's trip to
+#   the source block and the block's latency. 4 transfers in flight.
+#   Chunks are issued at
 #   the engine's beat rate (r2sim spec Section 5.4.1, issue-driven
 #   chunks), so the latency is paid once per transfer; `outstanding` (a cap
 #   on chunks issued and not ended) is not set. The chunk is the program's
@@ -70,6 +73,6 @@ compute:
   - {name: muon, type: vector, rate: {lane_op: 256}, overhead: 50, master: [$this.lbus, $this.smsbus]}
   # DMA beat 256 B: the two SMEM banks together (its buses are
   # unlimited); one transfer writes one bank at 128 B/cycle.
-  - {name: dma, type: dma, latency: 100, inflight: 4, beat_bytes: 256, master: [$this.lbus, $this.smsbus]}
+  - {name: dma, type: dma, latency: 10, inflight: 4, beat_bytes: 256, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
            c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}

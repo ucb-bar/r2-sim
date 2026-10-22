@@ -262,17 +262,19 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let t = &s.tasks[0];
-    // The Invoke (52 B, 1 beat) arrives at sm1 at 34 and issues; sm0's
-    // SMEM latency 10 (the pipeline fill) and the engine latency 100: the
-    // hops in route order from 144, at the engine's 64 B beat narrowed by
-    // each hop: sm0's SMEM port [144, 272); sm0's bridge up (32 B/cycle)
-    // [144, 400), latency 10; the crossbar ports and sm1's bridge down
-    // narrowed to 32, [154, 410), latency 10; sm1's SMEM port [164, 420).
-    // Complete 424; Resolve arrives at sm0 at 450.
+    // The Invoke (52 B, 1 beat) arrives at sm1 at 34 and issues; the
+    // request's trip from sm1's engine to sm0's SMEM (sm1's bridge up and
+    // sm0's bridge down, 10 each; 2026-10-21), sm0's SMEM latency 10 (the
+    // pipeline fill) and the engine latency 100: the hops in route order
+    // from 164, at the engine's 64 B beat narrowed by each hop: sm0's SMEM
+    // port [164, 292); sm0's bridge up (32 B/cycle) [164, 420), latency
+    // 10; the crossbar ports and sm1's bridge down narrowed to 32,
+    // [174, 430), latency 10; sm1's SMEM port [184, 440). Complete 444;
+    // Resolve arrives at sm0 at 470.
     assert_eq!(t.invoke, 34);
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (144, 420));
-    assert_eq!(t.complete, Some(424));
-    assert_eq!(s.end_time, 450);
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (164, 440));
+    assert_eq!(t.complete, Some(444));
+    assert_eq!(s.end_time, 470);
 }
 
 #[test]
@@ -369,19 +371,21 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
     // ports, sm1's down bridge 2 + 10) and waits on a pending entry. P
     // (72 B, 2 beats) is invoked at [208, 216) and enters sm1 at 248,
     // adopting the entry; it runs [248, 440) and completes at 444. Resolve
-    // reaches the device at 479: C is ready. C's DMA: sm1's SMEM latency
-    // 10 (the pipeline fill) and the engine latency 100, its first hop
-    // (sm1's SMEM port) at 589; 8 KiB at 32 B/cycle on sm1's bridge up
-    // from 589, then the crossbar ports and the cluster bridge narrowed to
-    // 32 from 599 and the HBM port from 619, to 875; complete 879; Resolve
-    // reaches sm0's wait at 914.
+    // reaches the device at 479: C is ready. C's DMA: the request's trip
+    // from the device's engine to sm1's SMEM (the cluster bridge down 20
+    // and sm1's bridge down 10: 30; 2026-10-21), sm1's SMEM latency 10
+    // (the pipeline fill) and the engine latency 100, its first hop (sm1's
+    // SMEM port) at 619; 8 KiB at 32 B/cycle on sm1's bridge up from 619,
+    // then the crossbar ports and the cluster bridge narrowed to 32 from
+    // 629 and the HBM port from 649, to 905; complete 909; Resolve reaches
+    // sm0's wait at 944.
     assert_eq!((tc.invoke, tp.invoke), (43, 248));
     assert_eq!((tp.complete, tc.ready), (Some(444), Some(479)));
     assert_eq!(
         (tc.chunks[0].start, tc.chunks[0].end, tc.complete),
-        (589, 875, Some(879))
+        (619, 905, Some(909))
     );
-    assert_eq!(s.end_time, 914);
+    assert_eq!(s.end_time, 944);
 }
 
 #[test]

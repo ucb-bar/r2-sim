@@ -16,5 +16,5 @@ fn hello_runs_four_tasks_on_2p() {
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
     // Two DMAs on the SM's engine, the matmul, the copy back.
     assert_eq!(s.invoked, 4);
-    assert_eq!(s.end_time, 1949);
+    assert_eq!(s.end_time, 1789);
 }

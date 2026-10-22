@@ -176,21 +176,24 @@ fn data_leaving_the_node_does_not_use_the_pool() {
 #[test]
 fn a_chunk_that_does_not_fit_waits_and_holds_from_when_room_frees() {
     // A pool of one read; two reads issued together at 0. The first
-    // holds the pool from its issue to the end of its window on the link:
-    // its first hop (the HBM port) starts after the HBM's 200 cycles, and
-    // 512 B take one cycle on the HBM port and on the link (1024 B/cycle;
-    // the root bus is unlimited, no latency between them), so the hold is
-    // [0, 201). The second's request crosses the link at 201: its first
-    // hop starts the source latency (200) and the request route from the
-    // link to the HBM (0 cycles) later, at 401, and its hold starts at 201.
+    // read's request crosses the link (latency 10) and reaches the HBM at
+    // 10 (the request leg, 2026-10-21); its first hop (the HBM port)
+    // starts after the HBM's 200 cycles, at 210, and 512 B take one cycle
+    // on the HBM port and on the link (1024 B/cycle; the root bus is
+    // unlimited, no latency between them). It holds the pool from its
+    // request crossing the link to the end of its window on the link:
+    // [10, 211). The second's request crosses the link when the room
+    // frees, at 211: its first hop starts the source latency (200) and the
+    // request route from the link to the HBM (0 cycles) later, at 411, and
+    // its hold starts at 211.
     let s = reads_n(200, ", bw_bytes: 1024, inflight_bytes: 512", 2);
     let (a, b) = (&s.tasks[0], &s.tasks[1]);
     assert_eq!((a.issue, b.issue), (Some(0), Some(0)));
-    assert_eq!(a.chunks[0].start, 200);
-    assert_eq!(b.chunks[0].start, 200 + 1 + 200);
+    assert_eq!(a.chunks[0].start, 210);
+    assert_eq!(b.chunks[0].start, 211 + 200);
     let p = pool(&s, POOL);
     assert_eq!(p.peak, 512);
-    // The wait: the second read's first hop at 401 instead of 200.
+    // The wait: the second read's first hop at 411 instead of 210.
     assert_eq!(p.delay_cycles, 201);
     // Held byte-cycles: 512 x 201 for each read.
     assert_eq!(p.held_cycles, 2.0 * 512.0 * 201.0);
