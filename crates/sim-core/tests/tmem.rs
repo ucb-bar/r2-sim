@@ -2,7 +2,7 @@
 //! configs/2p-tmem.yaml: four banks of 64 KiB, each with a read and a
 //! write port of 128 B/cycle, latency 5. The Atlas reads A and B from the
 //! tmem and is output stationary: a partial C stays in its accumulator
-//! (64 KiB by default, one 128 x 128 fp32 tile); a partial C outside the
+//! (128 KiB by default, two 128 x 128 fp32 tiles); a partial C outside the
 //! accumulator is fp32 in the tmem; the last task writes C in its output
 //! type.
 
@@ -236,10 +236,11 @@ fn the_accumulator_keeps_the_partial_c_of_a_chain() {
 
 #[test]
 fn an_evicted_partial_c_goes_to_the_tmem_in_fp32() {
-    // The accumulator holds one fp32 tile. Two chains alternate: keeping
-    // the second tile evicts the first (64 KiB written in fp32), and the
-    // first chain then reads it back from the tmem in fp32 (64 KiB).
-    let b = tmem(&[]).unwrap();
+    // An accumulator of one fp32 tile (the default holds two). Two chains
+    // alternate: keeping the second tile evicts the first (64 KiB written
+    // in fp32), and the first chain then reads it back from the tmem in
+    // fp32 (64 KiB).
+    let b = tmem(&["root.gpc0.sm0.atlas.acc_buffer=65536"]).unwrap();
     let (x, y) = (bank(&b, 2), bank(&b, 3));
     let (a, bb) = (bank(&b, 0), bank(&b, 1));
     let descs = vec![
