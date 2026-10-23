@@ -885,6 +885,25 @@ impl Sim {
         self.sync_only.push(range);
     }
 
+    /// The sync-only ranges.
+    pub fn sync_only_ranges(&self) -> &[Range] {
+        &self.sync_only
+    }
+
+    /// The blocks the functional plane stores: the memory blocks, and a
+    /// block per hash link's linear range (the plane sees linear
+    /// addresses).
+    pub fn functional_blocks(&self) -> Vec<MemBlock> {
+        let mut stores = self.memories.clone();
+        for h in &self.hashes {
+            stores.push(MemBlock {
+                numeric: h.numeric,
+                ..MemBlock::plain(String::new(), h.owner, h.hash.range, ResourceId(0), 0)
+            });
+        }
+        stores
+    }
+
     /// Adds a PE on `nu` and returns its ID. Panics if `cfg.max_inflight` or
     /// `cfg.max_outstanding` is 0.
     pub fn add_pe(&mut self, nu: NeutrinoId, cfg: PeConfig) -> PeId {
@@ -1182,15 +1201,7 @@ impl Sim {
             10 * t_retry + self.topo.max_latency()
         });
         let mut backend = self.backend.take().expect("backend");
-        // The functional plane sees linear addresses: a store per hash
-        // link's linear range beside the blocks.
-        let mut stores = self.memories.clone();
-        for h in &self.hashes {
-            stores.push(MemBlock {
-                numeric: h.numeric,
-                ..MemBlock::plain(String::new(), h.owner, h.hash.range, ResourceId(0), 0)
-            });
-        }
+        let stores = self.functional_blocks();
         let granule = self.nus.first().map_or(1, |n| n.tables.config().granule);
         backend.configure(&stores, &self.sync_only, granule);
         for (addr, bytes) in std::mem::take(&mut self.init) {

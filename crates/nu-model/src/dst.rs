@@ -37,10 +37,12 @@ impl Dst {
         self.span.len() / g
     }
 
-    /// True when every granule of the span is held.
+    /// True when every granule of the span is held: every offset
+    /// `i < n` has `i & !mask == 0`, that is, every bit up to the highest
+    /// set bit of `n - 1` is in the mask (`n` need not be a power of two).
     pub fn is_whole(&self, g: u64) -> bool {
         let n = self.granules(g);
-        n == 0 || (n - 1) & !(self.mask as u64) == 0
+        n <= 1 || (u64::MAX >> (n - 1).leading_zeros()) & !(self.mask as u64) == 0
     }
 
     /// True when the range holds the granule of byte `addr`.
@@ -143,27 +145,28 @@ impl Dst {
 mod tests {
     use super::*;
 
-    /// The warp-tile example of the spec, granule 128 B: warp 0 holds the
-    /// even granules of 128 from its base, warp 1 the odd ones.
+    /// The warp-tile example of the spec, granule 128 B, bound 127 (the
+    /// spec's value), mask 0x7e: warp 0 holds the even granules from c,
+    /// warp 2 starts one granule later and holds the odd ones. Bound 127
+    /// is not a power of two: the span is not whole.
     #[test]
     fn the_warp_tile_example() {
         let g = 128;
         let c = 0x10000;
-        let w0 = Dst {
-            span: Range::from_len(c, 128 * g),
+        let warp = |base: u64| Dst {
+            span: Range::from_len(base, 127 * g),
             mask: 0x7e,
         };
-        let w1 = Dst {
-            span: Range::from_len(c + g, 128 * g),
-            mask: 0x7e,
-        };
+        let (w0, w2) = (warp(c), warp(c + g));
+        assert!(!w0.is_whole(g));
+        assert_eq!(w0.canonical_mask(g), 0x7e);
         assert!(w0.holds(g, c) && w0.holds(g, c + 2 * g) && w0.holds(g, c + 126 * g));
-        assert!(!w0.holds(g, c + g) && !w0.holds(g, c + 127 * g));
+        assert!(!w0.holds(g, c + g) && !w0.holds(g, c + 125 * g));
         assert_eq!(w0.runs(g).len(), 64);
-        assert!(!w0.meets(g, &w1) && !w1.meets(g, &w0));
-        assert!(w0.span.overlaps(&w1.span));
+        assert!(!w0.meets(g, &w2) && !w2.meets(g, &w0));
+        assert!(w0.span.overlaps(&w2.span));
         let whole = Dst::plain(Range::from_len(c, 256 * g));
-        assert!(whole.covers(g, &w0) && whole.covers(g, &w1));
+        assert!(whole.covers(g, &w0) && whole.covers(g, &w2));
         assert!(!w0.covers(g, &whole));
         assert!(w0.covers_bytes(g, &Range::from_len(c + 2 * g + 5, 100)));
         assert!(!w0.covers_bytes(g, &Range::from_len(c, 2 * g)));

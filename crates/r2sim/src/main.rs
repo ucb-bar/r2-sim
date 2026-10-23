@@ -1,6 +1,7 @@
 //! `r2sim run --config C --program P [options]` (see `USAGE`).
 //!
-//! Runs program P on configuration C in timing mode with the Trace backend.
+//! Runs program P on configuration C in timing mode with the Trace backend
+//! (`--functional` selects another; `--image` loads a memory image).
 //! It prints a summary to stdout and, with `--stats OUT`, writes the run as
 //! JSON to OUT. `--trace-out DIR` writes the tracer files;
 //! `--trace-raw DIR` writes the raw trace dump for r2-vis. The run itself
@@ -44,6 +45,10 @@ fn parse(argv: &[String]) -> Result<Options, String> {
             "--param" => a.overrides.push(val()?),
             "--trace" => a.trace = Some(val()?.into()),
             "--synthetic" => a.synthetic = Some(val()?.parse().map_err(|e| format!("{e}"))?),
+            "--functional" => a.functional = Some(val()?.parse()?),
+            "--functional-cmd" => a.functional_cmd = Some(val()?),
+            "--image" => a.image = Some(val()?.into()),
+            "--image-out" => a.image_out = Some(val()?.into()),
             "--stats" => a.stats = Some(val()?.into()),
             "--timeline" => a.timeline = true,
             "--phase-stats" => a.phase_stats = true,
@@ -108,6 +113,9 @@ fn parse(argv: &[String]) -> Result<Options, String> {
         && (a.trace_zstd || a.trace_config.is_some() || !a.trace_sets.is_empty())
     {
         return Err("--trace-zstd, --trace-config and --set trace.* need --trace-raw".into());
+    }
+    if a.functional_cmd.is_some() && a.functional != Some(r2sim::Functional::Python) {
+        return Err("--functional-cmd needs --functional python".into());
     }
     Ok(a)
 }

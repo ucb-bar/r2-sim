@@ -61,7 +61,9 @@ dependencies = [
 name = "func"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nu-model",
+ "serde_json",
  "sim-core",
 ]
 
@@ -191,6 +193,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sim-core",
+ "toml",
  "zstd",
 ]
 

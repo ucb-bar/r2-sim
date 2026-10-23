@@ -6,6 +6,7 @@
 //! arguments into [`Options`] and calls [`run`]; [`run_program`] runs a
 //! program that is not one of `nu_prog::launch`.
 
+pub mod image;
 pub mod trace;
 pub mod traceraw;
 
@@ -18,8 +19,62 @@ use sim_core::{build_config_file, Built, ProfileRegistry, SimWarning, Stats};
 
 /// The command line.
 pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
-[--trace FILE | --synthetic SEED] [--stats OUT] [--timeline] [--quantize tile|none] \
+[--trace FILE | --synthetic SEED] [--functional trace|numeric|python|null [--functional-cmd CMD]] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--quantize tile|none] \
 [--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--asm DIR] [--no-diagnostics]";
+
+/// A functional backend of the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Functional {
+    /// Routing records and memory (`func::Trace`).
+    Trace,
+    /// Memory and numerics in Rust (`func::Numeric`).
+    Numeric,
+    /// A child process (`func::Process`), by default the Python plane.
+    Python,
+    /// No data (`sim_core::NullBackend`).
+    Null,
+}
+
+impl std::str::FromStr for Functional {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "trace" => Ok(Self::Trace),
+            "numeric" => Ok(Self::Numeric),
+            "python" => Ok(Self::Python),
+            "null" => Ok(Self::Null),
+            _ => Err(format!("--functional {s} (trace, numeric, python or null)")),
+        }
+    }
+}
+
+/// The default command of the process backend.
+pub const PYTHON_PLANE: &str = "python -m r2sim.func";
+
+/// Starts the process backend: `cmd` (white-space separated) or the
+/// Python plane. The Python plane finds the package `r2sim` in the
+/// source tree's `python` directory, appended to PYTHONPATH.
+pub fn spawn_process(cmd: Option<&str>) -> Result<func::Process, String> {
+    let words: Vec<String> = cmd
+        .unwrap_or(PYTHON_PLANE)
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let mut env = Vec::new();
+    if cmd.is_none() {
+        let tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python");
+        if tree.join("r2sim/func").is_dir() {
+            // After the user's own entries, which keep precedence.
+            let path = match std::env::var("PYTHONPATH") {
+                Ok(p) if !p.is_empty() => format!("{p}:{}", tree.display()),
+                _ => tree.display().to_string(),
+            };
+            env.push(("PYTHONPATH".to_string(), path));
+        }
+    }
+    func::Process::spawn_with_env(&words, &env, "r2sim.func: ").map_err(|e| e.0)
+}
 
 /// What to run and what to write: the command line's options.
 #[derive(Default)]
@@ -36,6 +91,16 @@ pub struct Options {
     pub trace: Option<PathBuf>,
     /// `--synthetic SEED`: synthetic routing records.
     pub synthetic: Option<u64>,
+    /// `--functional`: the functional backend (default: Null for the
+    /// kernels program, Trace for the others).
+    pub functional: Option<Functional>,
+    /// `--functional-cmd`: the command of the process backend, split at
+    /// white space (default `python -m r2sim.func`).
+    pub functional_cmd: Option<String>,
+    /// `--image`: the memory image loaded before the run ([`image`]).
+    pub image: Option<PathBuf>,
+    /// `--image-out`: the named image entries, read back after the run.
+    pub image_out: Option<PathBuf>,
     /// `--stats`: the JSON stats file.
     pub stats: Option<PathBuf>,
     /// `--timeline`: per-task records in the stats.
@@ -411,15 +476,37 @@ fn execute(
     if let Some(f) = a.flow {
         b.sim.set_flow(f);
     }
-    if launch.kernels.is_some() {
-        // The kernel sequences carry no data (no loads), and their output
-        // stores name a store record as their range, not the memory they
-        // write (a correlation-only convention, nu_prog::kernels): no data
-        // plane.
-        b.sim.set_functional(Box::new(sim_core::NullBackend));
+    // The kernel sequences carry no data (no loads), and their output
+    // stores name a store record as their range, not the memory they
+    // write (a correlation-only convention, nu_prog::kernels): no data
+    // plane by default.
+    let functional = a.functional.unwrap_or(if launch.kernels.is_some() {
+        Functional::Null
     } else {
-        b.sim.set_functional(Box::new(func::Trace::new(records)));
-    }
+        Functional::Trace
+    });
+    let backend: Box<dyn sim_core::FunctionalBackend> = match functional {
+        Functional::Null => Box::new(sim_core::NullBackend),
+        Functional::Trace => Box::new(func::Trace::new(records)),
+        Functional::Numeric => Box::new(func::Numeric::new()),
+        // Spawned here, on the main thread: the child's parent-death
+        // signal follows the thread that spawns it.
+        Functional::Python => Box::new(spawn_process(a.functional_cmd.as_deref())?),
+    };
+    let image = match &a.image {
+        Some(p) => {
+            if !backend.has_data() {
+                return Err("--image needs a functional backend with data".into());
+            }
+            let img = image::Image::load(p, &b).map_err(|e| format!("--image: {e}"))?;
+            img.install(&mut b).map_err(|e| format!("--image: {e}"))?;
+            Some(img)
+        }
+        None if a.image_out.is_some() => return Err("--image-out needs --image".into()),
+        None => None,
+    };
+    let (blocks, sync_only) = (b.sim.functional_blocks(), b.sim.sync_only_ranges().to_vec());
+    b.sim.set_functional(backend);
     // The names are taken now, before the run consumes the simulation.
     let names = tracing.then(|| trace::names(&b));
     let atlas = b
@@ -467,8 +554,16 @@ fn execute(
     sim.set_asm(a.asm.is_some());
     sim.spawn_named(launch.nu, launch.name, launch.program);
     let t0 = Instant::now();
-    let stats = sim.run();
+    let (stats, mut backend) = sim.run_with_backend();
     let wall = t0.elapsed().as_secs_f64();
+    if let (Some(img), Some(out), Some(be), None) =
+        (&image, &a.image_out, backend.as_deref_mut(), &stats.fatal)
+    {
+        img.write_out(be, &blocks, &sync_only, out)
+            .map_err(|e| format!("--image-out: {e}"))?;
+    }
+    // The process backend's child exits here.
+    drop(backend);
     if let (Some(dir), Some(sym)) = (&a.asm, &symbols) {
         write_asm(dir, sym, &stats.asm).map_err(|e| format!("--asm: {e}"))?;
     }

@@ -10,13 +10,16 @@ python = "3.12.*"
 numpy = ">=2"
 matplotlib = ">=3.9"
 pandas = ">=2.2"
+ml_dtypes = ">=0.5.4,<0.6"
+safetensors = ">=0.8.0,<0.9"
+pytest = ">=9.1.1,<10"
 
 [activation.env]
 PYTHONPATH = "$PIXI_PROJECT_ROOT/python"
 
 [tasks]
 build = "cargo build --release"
-test = "cargo test --release"
+test = "cargo test --release && python -m pytest -q python/tests"
 check = "cargo clippy --release --all-targets -- -D warnings"
 fmt = "cargo fmt --all"
 golden = { cmd = "tools/golden.sh", depends-on = ["build"] }
