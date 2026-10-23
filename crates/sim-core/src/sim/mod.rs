@@ -236,6 +236,13 @@ struct Neutrino {
     inbound_peak: usize,
     /// A `DrainInbound` event is queued.
     drain_scheduled: bool,
+    /// The scalar core's memories, prefix and data scratch.
+    core: crate::program::Core,
+    /// The port of the data scratch for other nodes' loads and stores,
+    /// made on the first such access.
+    scratch_port: Option<ResourceId>,
+    /// The instruction DMA, made on the first IMEM_COPY.
+    idma: Option<ResourceId>,
 }
 
 impl Neutrino {
@@ -838,6 +845,14 @@ impl Sim {
             cfg.complete_rate,
         );
         let cfg_outbound_deps = cfg.outbound_deps;
+        let core = crate::program::Core {
+            mem: Rc::new(RefCell::new(crate::program::CoreMem::new(
+                cfg.imem_bytes,
+                cfg.scratch_bytes,
+            ))),
+            prefix: 0,
+            scratch: None,
+        };
         self.nus.push(Neutrino {
             id,
             tables: DepTables::new(cfg.tables),
@@ -871,8 +886,86 @@ impl Sim {
             inbound: VecDeque::new(),
             inbound_peak: 0,
             drain_scheduled: false,
+            core,
+            scratch_port: None,
+            idma: None,
         });
         id
+    }
+
+    /// Sets the global prefix of `nu` and the global range of its data
+    /// scratch (RV programs, 2026-10-23; [`crate::abi`]).
+    pub fn set_core_space(&mut self, nu: NeutrinoId, prefix: u64, scratch: Option<Range>) {
+        let c = &mut self.nus[nu.0 as usize].core;
+        c.prefix = prefix;
+        c.scratch = scratch;
+    }
+
+    /// The scalar core of `nu`: its memories (shared: a write before the
+    /// run is the program's initial state, a read after it the final
+    /// state), its prefix and its data scratch.
+    pub fn core(&self, nu: NeutrinoId) -> crate::program::Core {
+        self.nus[nu.0 as usize].core.clone()
+    }
+
+    /// The port of the data scratch of `nu` (`<node>.scratch.port`), made
+    /// on first use.
+    fn make_scratch_port(&mut self, nu: NeutrinoId) -> ResourceId {
+        if let Some(p) = self.nus[nu.0 as usize].scratch_port {
+            return p;
+        }
+        let o = &self.nus[nu.0 as usize];
+        let name = format!("{}.scratch.port", o.cfg.name);
+        let rate = Ratio::int(o.cfg.scratch_port_bytes);
+        let p = self.res.add_flow(&name, Kind::Bandwidth, rate);
+        self.nus[nu.0 as usize].scratch_port = Some(p);
+        p
+    }
+
+    /// The instruction DMA of `nu` (`<node>.idma`), made on first use.
+    fn make_idma(&mut self, nu: NeutrinoId) -> ResourceId {
+        if let Some(r) = self.nus[nu.0 as usize].idma {
+            return r;
+        }
+        let n = &self.nus[nu.0 as usize];
+        let name = format!("{}.idma", n.cfg.name);
+        let rate = Ratio::int(n.cfg.idma_bytes);
+        let r = self.res.add_flow(&name, Kind::Bandwidth, rate);
+        self.nus[nu.0 as usize].idma = Some(r);
+        r
+    }
+
+    /// Makes now the resources that RV programs otherwise make on first
+    /// use: the instruction DMA of every node and the port of every data
+    /// scratch. A tracer that lists the resources before the run then
+    /// sees them all.
+    pub fn make_core_resources(&mut self) {
+        for i in 0..self.nus.len() {
+            let nu = NeutrinoId(i as u32);
+            self.make_idma(nu);
+            if self.nus[i].core.scratch.is_some() {
+                self.make_scratch_port(nu);
+            }
+        }
+    }
+
+    /// The instruction DMA of `nu`, if it exists.
+    pub fn idma(&self, nu: NeutrinoId) -> Option<ResourceId> {
+        self.nus[nu.0 as usize].idma
+    }
+
+    /// The port of the data scratch of `nu`, if it exists.
+    pub fn scratch_port(&self, nu: NeutrinoId) -> Option<ResourceId> {
+        self.nus[nu.0 as usize].scratch_port
+    }
+
+    /// The node whose data scratch holds a byte of `r`, and whether it
+    /// holds all of `r`.
+    fn scratch_of(&self, r: &Range) -> Option<(NeutrinoId, bool)> {
+        self.nus.iter().find_map(|n| {
+            let s = n.core.scratch?;
+            s.overlaps(r).then_some((n.id, s.covers(r)))
+        })
     }
 
     /// True when `r` lies inside a sync-only range that `nu` owns.
@@ -1154,6 +1247,21 @@ impl Sim {
         name: &'static str,
         program: impl NeutrinoProgram,
     ) {
+        self.spawn_program(nu, crate::program::ProgramName::Fixed(name), program);
+    }
+
+    /// [`Sim::spawn_named`] with a [`crate::program::ProgramName`], which
+    /// is resolved now, as the program starts.
+    pub fn spawn_program(
+        &mut self,
+        nu: NeutrinoId,
+        name: crate::program::ProgramName,
+        program: impl NeutrinoProgram,
+    ) {
+        let name = match name {
+            crate::program::ProgramName::Fixed(s) => s,
+            crate::program::ProgramName::AtStart(f) => f(),
+        };
         let n = &mut self.nus[nu.0 as usize];
         assert!(
             n.program.is_none(),
@@ -1165,6 +1273,7 @@ impl Sim {
             self.clock.clone(),
             self.topo.node(nu).children.clone(),
             n.cfg.costs.plan,
+            n.core.clone(),
         );
         // A program start resets the Neutrino's version table (Neutrino spec Section 7.7).
         n.tables.vreset_all();
@@ -1374,6 +1483,7 @@ impl Sim {
             Event::ChunkEnd { pe, nu, task } => self.chunk_end(pe, nu, task),
             Event::ChunkIssue { pe, nu, task } => self.chunk_issue(pe, nu, task),
             Event::Complete { nu, task } => self.complete(nu, task),
+            Event::ImemCopyDone { nu, task } => self.imem_copy_done(nu, task),
             Event::MemDone(nu) => self.mem_done(nu),
             Event::MsgArrive { msg } => self.msg_arrive(msg),
             Event::ResendAwait { nu, owner, msg } => self.resend_await(nu, owner, msg),
@@ -1414,6 +1524,9 @@ impl Sim {
                         .expect("a program awaited something that is not a NuCtx call");
                 if matches!(req, Request::Spawn { .. }) {
                     n.pending_spawn = n.mb.borrow_mut().spawn.take();
+                }
+                if let Request::Fail(msg) = req {
+                    return self.fatal(nu, None, FatalError::Invalid(msg));
                 }
                 self.start_request(nu, req);
             }
@@ -1456,9 +1569,13 @@ impl Sim {
         let n = &self.nus[nu.0 as usize];
         let c = &n.cfg.costs;
         let desc = match &req {
+            // A descriptor that the program's own instructions built (an
+            // RV program): its assembly is in their cycles.
+            Request::Invoke(d) if d.pc.is_some() => 0,
             Request::Invoke(d) => c.desc(d.deps.len(), d.wire_bytes()),
             // The spawn descriptor of `Descriptor::wire_bytes`: 20 B of
             // header and `dst`, 8 per dependency, 4 for the child.
+            Request::Spawn { pc: Some(_), .. } => 0,
             Request::Spawn { deps, .. } => c.desc(deps.len(), 24 + 8 * deps.len() as u64),
             _ => 0,
         };
@@ -1472,6 +1589,7 @@ impl Sim {
             Request::Store { .. } => c.store,
             Request::Spawn { .. } => c.spawn,
             Request::Mark(_) | Request::CacheFlush => 0,
+            Request::Fail(_) => unreachable!("a failure stops the run before its cost"),
         };
         // An invoke's cost is its task's (trace-raw 1.6), named by the
         // call's number until the task has a gid.
@@ -1707,7 +1825,13 @@ impl Sim {
                 self.respond(nu, Response::Done)
             }
             req @ (Request::Load { .. } | Request::Store { .. }) => self.exec_mem(nu, req),
-            Request::Spawn { child, done, deps } => {
+            Request::Fail(_) => unreachable!("a failure stops the run before its execution"),
+            Request::Spawn {
+                child,
+                done,
+                deps,
+                pc,
+            } => {
                 let n = &mut self.nus[nu.0 as usize];
                 let start = n.pending_spawn.take().expect("spawn program");
                 if self.topo.node(child).parent != Some(nu) {
@@ -1730,6 +1854,7 @@ impl Sim {
                     untracked: false,
                     dst_mask: nu_model::FULL_MASK,
                     inferred_version: None,
+                    pc,
                     deps,
                     label: None,
                     args: Args::Spawn { child },
@@ -1749,6 +1874,19 @@ impl Sim {
             _ => unreachable!("not a memory request"),
         };
         let load = matches!(req, Request::Load { .. });
+        let range = Range::from_len(addr.0, len);
+        match self.scratch_of(&range) {
+            Some((owner, true)) => return self.scratch_access(nu, owner, req),
+            Some((owner, false)) => {
+                let msg = format!(
+                    "{} of {range} runs past the data scratch of {}",
+                    if load { "load" } else { "store" },
+                    self.topo.path_name(owner)
+                );
+                return self.fatal(nu, None, FatalError::Invalid(msg));
+            }
+            None => {}
+        }
         // One piece per block it touches: a piece never crosses a block
         // boundary (r2sim spec Section 5.4). The access is done when its last piece
         // is.
@@ -1860,9 +1998,92 @@ impl Sim {
         Ok(g.end)
     }
 
+    /// A load or store of the data scratch of `owner` (RV programs,
+    /// 2026-10-23): the data route between the two nodes and the
+    /// scratch's port (`scratch_port_bytes` of `owner`); a load also pays
+    /// the scratch's latency (`scratch_latency`), a store does not, as for
+    /// a memory block. The value comes from or goes to the control plane: no
+    /// functional op and no functional sync.
+    fn scratch_access(&mut self, nu: NeutrinoId, owner: NeutrinoId, req: Request) {
+        let (load, n) = match &req {
+            Request::Load { len, .. } => (true, *len),
+            Request::Store { bytes, .. } => (false, bytes.len() as u64),
+            _ => unreachable!("not a memory request"),
+        };
+        let port = self.make_scratch_port(owner);
+        let latency = self.nus[owner.0 as usize].cfg.scratch_latency;
+        let (hub, at) = (self.topo.data_hub(nu), self.topo.data_hub(owner));
+        let (Some(to), Some(back)) = (
+            self.topo.best_path(hub, at).cloned(),
+            self.topo.best_path(at, hub).cloned(),
+        ) else {
+            let msg = format!(
+                "no data route between {} and the data scratch of {}",
+                self.topo.path_name(nu),
+                self.topo.path_name(owner)
+            );
+            return self.fatal(nu, None, FatalError::Invalid(msg));
+        };
+        let dir = if load { Dir::Read } else { Dir::Write };
+        let hop = |resource, latency, pool| PathHop {
+            resource,
+            amount: n,
+            dir,
+            latency,
+            pool,
+        };
+        let mut admit = crate::resource::Admit {
+            issue: self.now,
+            src_latency: if load { latency } else { 0 },
+            tail: None,
+        };
+        let (path, lead) = if load {
+            let mut p = vec![hop(port, back.lead, None)];
+            p.extend(back.hops.iter().map(|h| hop(h.lane, h.latency, h.pool)));
+            admit.tail = back.pool_after;
+            (p, to.latency + latency)
+        } else {
+            let mut p: Vec<PathHop> = to
+                .hops_for(Dir::Write)
+                .iter()
+                .map(|h| hop(h.lane, h.latency, h.pool))
+                .collect();
+            p.push(hop(port, 0, to.pool_after));
+            (p, to.lead)
+        };
+        let earliest = self.now + if self.zero_time { 0 } else { lead };
+        let beat = self.nus[nu.0 as usize].cfg.beat_bytes;
+        let g = self.reserve_path(&path, beat, earliest, admit, Who::Program(nu));
+        self.nus[nu.0 as usize].op = Some(req);
+        self.queue.push(g.end, Event::MemDone(nu));
+    }
+
     /// The memory access of a load or store is done: sync or emit.
     fn mem_done(&mut self, nu: NeutrinoId) {
-        match self.nus[nu.0 as usize].op.take().expect("memory request") {
+        let op = self.nus[nu.0 as usize].op.take().expect("memory request");
+        // A data scratch: the control plane's bytes.
+        let (a, len) = match &op {
+            Request::Load { addr, len } => (addr.0, *len),
+            Request::Store { addr, bytes } => (addr.0, bytes.len() as u64),
+            _ => unreachable!("not a memory request"),
+        };
+        if let Some((owner, _)) = self.scratch_of(&Range::from_len(a, len)) {
+            let core = self.nus[owner.0 as usize].core.clone();
+            let off = (a - core.scratch.expect("a data scratch").base) as usize;
+            let mut mem = core.mem.borrow_mut();
+            let scratch = mem.scratch();
+            let r = match op {
+                Request::Load { .. } => Response::Bytes(scratch[off..off + len as usize].to_vec()),
+                Request::Store { bytes, .. } => {
+                    scratch[off..off + bytes.len()].copy_from_slice(&bytes);
+                    Response::Done
+                }
+                _ => unreachable!("not a memory request"),
+            };
+            drop(mem);
+            return self.respond(nu, r);
+        }
+        match op {
             Request::Load { addr, len } => self.load(nu, addr, len),
             Request::Store { addr, bytes } => {
                 let range = Range::from_len(addr.0, bytes.len() as u64);
@@ -1949,7 +2170,105 @@ impl Sim {
         }
     }
 
+    /// The ranges a task writes and reads, named, for the data scratch
+    /// check: its `dst`, and the operands of a DMA, matmul or vector task
+    /// (a matmul operand of `rows` rows with leading dimension `ld`).
+    fn task_ranges(desc: &Descriptor) -> Vec<(&'static str, Range)> {
+        let mut v = vec![("dst", desc.dst)];
+        let span = |at: Addr, rows: u64, ld: u64, dt: crate::Dtype| {
+            Range::from_len(at.0, dt.bytes_for(rows.saturating_sub(1) * ld + ld.max(1)))
+        };
+        match &desc.args {
+            Args::Dma { src, bytes, .. } => v.push(("src", Range::from_len(src.0, *bytes))),
+            Args::Matmul {
+                a,
+                b,
+                a2,
+                b2,
+                lda,
+                ldb,
+                m,
+                k,
+                in_dtype,
+                b_dtype,
+                ..
+            } => {
+                v.push(("A", span(*a, *m, *lda, *in_dtype)));
+                v.push(("B", span(*b, *k, *ldb, *b_dtype)));
+                if let Some(a2) = a2 {
+                    v.push(("A2", span(*a2, *m, *lda, *in_dtype)));
+                }
+                if let Some(b2) = b2 {
+                    v.push(("B2", span(*b2, *k, *ldb, *b_dtype)));
+                }
+            }
+            Args::Vector {
+                src: Some(src),
+                bytes_in,
+                ..
+            } => v.push(("src", Range::from_len(src.0, *bytes_in))),
+            _ => {}
+        }
+        v
+    }
+
+    /// The rules of an IMEM_COPY of `nu`: a direct child, both ranges
+    /// inside their IMEMs, the record in the invoker's sync-only space and
+    /// unversioned.
+    fn imem_copy_check(&self, nu: NeutrinoId, desc: &Descriptor) -> Result<(), String> {
+        let Args::ImemCopy {
+            child,
+            src,
+            offset,
+            bytes,
+        } = desc.args
+        else {
+            return Ok(());
+        };
+        let name = |n: NeutrinoId| self.topo.path_name(n);
+        if self.topo.node(child).parent != Some(nu) {
+            return Err(format!(
+                "IMEM_COPY to {}, which is not a direct child of {}",
+                name(child),
+                name(nu)
+            ));
+        }
+        for (who, at) in [(nu, src), (child, offset)] {
+            let size = self.nus[who.0 as usize].cfg.imem_bytes;
+            if at.checked_add(bytes).is_none_or(|e| e > size) {
+                return Err(format!(
+                    "IMEM_COPY of {bytes} bytes at offset {at:#x} runs past the IMEM ({size} bytes) of {}",
+                    name(who)
+                ));
+            }
+        }
+        if desc.versioned || desc.untracked || !self.in_own_sync(nu, desc.dst) {
+            return Err(format!(
+                "IMEM_COPY record {} is not an unversioned range of the sync-only space of {}",
+                desc.dst,
+                name(nu)
+            ));
+        }
+        Ok(())
+    }
+
     fn exec_invoke(&mut self, nu: NeutrinoId, desc: Descriptor) {
+        if let Err(msg) = self.imem_copy_check(nu, &desc) {
+            return self.fatal(nu, None, FatalError::Invalid(msg));
+        }
+        // No task reads or writes a data scratch (RV programs, 2026-10-23).
+        for (what, r) in Self::task_ranges(&desc) {
+            if r.is_empty() {
+                continue;
+            }
+            if let Some((owner, _)) = self.scratch_of(&r) {
+                let msg = format!(
+                    "a task's {what} {r} touches the data scratch of {}",
+                    self.topo.path_name(owner)
+                );
+                return self.fatal(nu, None, FatalError::Invalid(msg));
+            }
+        }
         // The key 0 names no producer: it is the fence's (2026-10-20).
         if desc.deps.iter().any(|d| d.addr() == 0) {
             let msg = format!("invoke of {} with the key 0 in deps", desc.dst);
@@ -2411,11 +2730,63 @@ impl Sim {
             Args::Spawn { child } => Some((child, rec.spawn.take().expect("spawn program"))),
             _ => None,
         };
+        let copy = matches!(rec.desc.args, Args::ImemCopy { .. }).then(|| rec.desc.clone());
         self.issued(nu, gid);
-        match spawn {
-            Some((child, start)) => self.send(nu, child, remote::MsgKind::Start { task: t, start }),
-            None => self.complete_after_charge(nu, t),
+        match (spawn, copy) {
+            (Some((child, start)), _) => {
+                self.send(nu, child, remote::MsgKind::Start { task: t, start })
+            }
+            (None, Some(desc)) => self.imem_copy(nu, t, gid, desc),
+            (None, None) => self.complete_after_charge(nu, t),
         }
+    }
+
+    /// An IMEM_COPY issues on the instruction DMA of `nu` (made on the
+    /// first copy): `idma_latency`, then its bytes at `idma_bytes` per
+    /// cycle, one copy at a time. It uses no resource of the data fabric.
+    /// The functional plane gets it as an op with no effect on data; the
+    /// bytes move in the control plane when the copy ends.
+    fn imem_copy(&mut self, nu: NeutrinoId, t: TaskId, gid: u64, desc: Descriptor) {
+        let Args::ImemCopy { bytes, .. } = desc.args else {
+            unreachable!("an IMEM_COPY");
+        };
+        let seq = self.emit(nu, Some(gid), OpKind::Task(desc));
+        self.nus[nu.0 as usize].rec_mut(t).seq = seq;
+        let r = self.make_idma(nu);
+        let latency = self.nus[nu.0 as usize].cfg.idma_latency;
+        let earliest = self.now + if self.zero_time { 0 } else { latency };
+        let end = self
+            .reserve(&[Demand::work(r, bytes)], earliest, Who::Task(gid))
+            .end;
+        self.queue.push(end, Event::ImemCopyDone { nu, task: t });
+    }
+
+    /// The copy of an IMEM_COPY ended: its bytes go into the child's IMEM,
+    /// and the task completes.
+    fn imem_copy_done(&mut self, nu: NeutrinoId, t: TaskId) {
+        let Args::ImemCopy {
+            child,
+            src,
+            offset,
+            bytes,
+        } = self.nus[nu.0 as usize].rec(t).desc.args
+        else {
+            unreachable!("an IMEM_COPY");
+        };
+        let (s, o, b) = (src as usize, offset as usize, bytes as usize);
+        let data = self.nus[nu.0 as usize].core.mem.borrow_mut().imem()[s..s + b].to_vec();
+        let mut mem = self.nus[child.0 as usize].core.mem.borrow_mut();
+        mem.imem()[o..o + b].copy_from_slice(&data);
+        // A copy to offset 0 places the child's image.
+        if offset == 0 {
+            mem.image = Some(crate::program::ImemImage {
+                bytes,
+                file: None,
+                node: None,
+            });
+        }
+        drop(mem);
+        self.complete_after_charge(nu, t);
     }
 
     /// Issues ready tasks of `pe` in order while slots, holds and execution table

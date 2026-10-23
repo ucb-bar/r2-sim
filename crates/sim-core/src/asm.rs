@@ -97,7 +97,10 @@ impl Op {
             },
             Request::Mark(n) => Op::Mark(n.clone()),
             Request::CacheFlush => Op::CacheFlush,
-            Request::Spawn { child, done, deps } => Op::Spawn {
+            Request::Fail(_) => unreachable!("a failure stops the run before its op"),
+            Request::Spawn {
+                child, done, deps, ..
+            } => Op::Spawn {
                 child: *child,
                 done: *done,
                 deps: deps.clone(),
@@ -364,6 +367,17 @@ impl Symbols {
             }
             Args::Join => {}
             Args::Spawn { child } => s += &format!(" child={}", self.nu(*child)),
+            Args::ImemCopy {
+                child,
+                src,
+                offset,
+                bytes,
+            } => {
+                s += &format!(
+                    " child={} src={src:#x} offset={offset:#x} bytes={bytes}",
+                    self.nu(*child)
+                )
+            }
         }
         if let Some(l) = d.label {
             s += &format!(" label={l}");

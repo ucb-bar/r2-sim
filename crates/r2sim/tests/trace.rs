@@ -106,7 +106,7 @@ fn trace_raw_writes_whole_records_that_match_the_stats() {
         assert!(sm1["neutrino"][k].as_u64().unwrap() > 0, "{k}");
     }
     for (stem, size) in [
-        ("tasks", 112),
+        ("tasks", 120),
         ("chunks", 32),
         ("deps", 24),
         ("charges", 32),
@@ -200,7 +200,7 @@ fn trace_raw_filters_keep_the_subtree_and_the_window() {
     let tasks = |dir: &PathBuf| -> Vec<(u32, u16, u64, u64)> {
         let b = std::fs::read(dir.join("tasks.bin")).unwrap();
         let u64_at = |r: &[u8], o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
-        b.chunks(112)
+        b.chunks(120)
             .map(|r| {
                 let gid = u32::from_le_bytes(r[0..4].try_into().unwrap());
                 (
@@ -342,11 +342,11 @@ fn trace_raw_flags_untracked_tasks() {
     let layout = manifest["records"]["tasks"].as_array().unwrap();
     assert_eq!(layout[17], serde_json::json!(["flags", "u32"]));
     let b = std::fs::read(tmp.join("tasks.bin")).unwrap();
-    assert_eq!(b.len() % 112, 0);
+    assert_eq!(b.len() % 120, 0);
     let u32_at = |r: &[u8], o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
     let u64_at = |r: &[u8], o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
     let (mut untracked, mut tracked) = (0, 0);
-    for r in b.chunks(112) {
+    for r in b.chunks(120) {
         if u32_at(r, 104) & 1 == 1 {
             untracked += 1;
             assert_eq!(u32_at(r, 12), u32::MAX, "version");

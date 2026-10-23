@@ -59,6 +59,9 @@ pub struct Launch {
     pub program: ProgramFn,
     /// The program name (for a tracer).
     pub name: &'static str,
+    /// A name found when the program starts, for a tracer instead of
+    /// `name` (an RV program names itself by the record in its IMEM).
+    pub start_name: Option<sim_core::ProgramName>,
     /// The action expert's report (`adamoe`; the action stage of `forward`).
     pub report: Rc<RefCell<adamoe::Report>>,
     /// The prefill programs' report (their `report` stays empty).
@@ -90,6 +93,7 @@ impl Launch {
             forward: None,
             micro: None,
             kernels: None,
+            start_name: None,
         }
     }
 }
@@ -143,6 +147,7 @@ pub fn launch(
                 forward: None,
                 micro: None,
                 kernels: None,
+                start_name: None,
             })
         }
         "forward" => {
@@ -162,6 +167,7 @@ pub fn launch(
                 forward: Some(fwd),
                 micro: None,
                 kernels: None,
+                start_name: None,
             })
         }
         "prefill" => {
@@ -181,6 +187,7 @@ pub fn launch(
                 forward: None,
                 micro: None,
                 kernels: None,
+                start_name: None,
             })
         }
         "micro" => {
@@ -198,6 +205,7 @@ pub fn launch(
                 forward: None,
                 micro: Some(report),
                 kernels: None,
+                start_name: None,
             })
         }
         "kernels" => {
@@ -216,6 +224,7 @@ pub fn launch(
                 forward: None,
                 micro: None,
                 kernels: Some(report),
+                start_name: None,
             })
         }
         _ => Err(format!(

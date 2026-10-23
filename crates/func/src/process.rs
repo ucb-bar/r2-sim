@@ -226,6 +226,14 @@ pub fn descriptor(d: &Descriptor) -> Value {
     let args = match &d.args {
         Args::Join => json!({ "kind": "join" }),
         Args::Spawn { child } => json!({ "kind": "spawn", "child": child.0 }),
+        Args::ImemCopy {
+            child,
+            src,
+            offset,
+            bytes,
+        } => json!({
+            "kind": "imem_copy", "child": child.0, "src": src, "offset": offset, "bytes": bytes,
+        }),
         Args::Dma {
             src,
             dst,

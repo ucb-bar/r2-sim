@@ -230,6 +230,13 @@ def test_a_muon_task_has_no_effect(plane):
     assert plane.memory.read(MEM, 64) == bytes(64)
 
 
+def test_an_imem_copy_has_no_effect_on_data(plane):
+    # Its bytes move in the control plane (the IMEMs), not in memory.
+    plane.task({"kind": "imem_copy", "pe": None, "dst": [MEM, MEM + G], "mask": FULL,
+                "child": 1, "src": 0x100, "offset": 0, "bytes": 64})
+    assert plane.memory.read(MEM, 64) == bytes(64)
+
+
 def frames(*fs) -> io.BytesIO:
     buf = io.BytesIO()
     for f in fs:

@@ -30,6 +30,9 @@ pub enum Event {
     },
     /// The completion of `task` reaches the tables (after `c_complete`).
     Complete { nu: NeutrinoId, task: TaskId },
+    /// The instruction DMA of `nu` finished the copy of IMEM_COPY task
+    /// `task`.
+    ImemCopyDone { nu: NeutrinoId, task: TaskId },
     /// The memory access of the Neutrino's load or store is done.
     MemDone(NeutrinoId),
     /// A fabric message arrives; it waits in the message slab.

@@ -33,6 +33,10 @@ impl OpcodeId {
     pub const MATMUL: OpcodeId = OpcodeId(3);
     /// `muon.vector`, a built-in profile.
     pub const VECTOR: OpcodeId = OpcodeId(4);
+    /// `imem_copy`, a built-in opcode without a profile (RV programs,
+    /// 2026-10-23): a copy into a child's IMEM on the instruction DMA of
+    /// the invoking Neutrino.
+    pub const IMEM_COPY: OpcodeId = OpcodeId(5);
 }
 
 /// Index of a PE or DMA engine.
@@ -119,6 +123,15 @@ pub enum Args {
         /// The child Neutrino that runs the program.
         child: NeutrinoId,
     },
+    /// Copy `bytes` from offset `src` of the invoking Neutrino's IMEM to
+    /// offset `offset` of the IMEM of its direct child `child`, on the
+    /// invoker's instruction DMA (RV programs, 2026-10-23).
+    ImemCopy {
+        child: NeutrinoId,
+        src: u64,
+        offset: u64,
+        bytes: u64,
+    },
 }
 
 /// Element types of the numeric operands.
@@ -191,6 +204,11 @@ pub struct Descriptor {
     pub label: Option<u64>,
     /// Opcode-specific request data.
     pub args: Args,
+    /// The PC of the `nu.invoke` of an RV program whose instructions built
+    /// this descriptor (2026-10-23): its assembly is in the program's
+    /// instruction cycles, so the invoke charges no `c_desc`. `None` for
+    /// the descriptors of the Rust programs.
+    pub pc: Option<u64>,
 }
 
 impl Descriptor {
@@ -205,6 +223,7 @@ impl Descriptor {
             untracked: false,
             dst_mask: FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps: Vec::new(),
             label: None,
             args,
@@ -369,6 +388,7 @@ impl Descriptor {
             untracked: false,
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps,
             label: None,
             args: Args::Join,
@@ -422,6 +442,7 @@ impl Descriptor {
             Args::Vector { src: Some(_), .. } => 32,
             Args::Join => 0,
             Args::Spawn { .. } => 4,
+            Args::ImemCopy { .. } => 24,
         };
         2 + 2 + 16 + 8 * self.deps.len() as u64 + args
     }
@@ -801,12 +822,14 @@ impl Default for ProfileRegistry {
 
 impl ProfileRegistry {
     /// The registry with the phase-1 profiles: `dma`, `atlas.matmul` and
-    /// `muon.vector`.
+    /// `muon.vector`, and the `imem_copy` opcode.
     pub fn with_builtins() -> Self {
         let mut r = Self::default();
         assert_eq!(r.register("dma", dma_profile), OpcodeId::DMA);
         assert_eq!(r.register("atlas.matmul", matmul_profile), OpcodeId::MATMUL);
         assert_eq!(r.register("muon.vector", vector_profile), OpcodeId::VECTOR);
+        r.fns.push(("imem_copy".to_string(), None));
+        assert_eq!(r.lookup("imem_copy"), Some(OpcodeId::IMEM_COPY));
         r
     }
 
@@ -1572,6 +1595,7 @@ device:
                 untracked: false,
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
+                pc: None,
                 deps: vec![],
                 label: None,
                 args: Args::Dma {

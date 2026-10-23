@@ -51,6 +51,7 @@ fn a_descriptor_prints_as_one_instruction() {
         untracked: false,
         dst_mask: nu_model::FULL_MASK,
         inferred_version: Some(3),
+        pc: None,
         deps: vec![
             Dep::Versioned {
                 addr: smem,
@@ -80,6 +81,7 @@ fn a_descriptor_prints_as_one_instruction() {
         untracked: false,
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
+        pc: None,
         deps: vec![],
         label: None,
         args: Args::Matmul {
@@ -169,6 +171,7 @@ fn an_untracked_task_and_the_fence_print_their_syntax() {
         untracked: true,
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
+        pc: None,
         deps: vec![],
         label: None,
         args: Args::Dma {

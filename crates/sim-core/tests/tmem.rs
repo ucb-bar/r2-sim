@@ -35,6 +35,7 @@ fn mm(b: &Built, (a, bb, c): (u64, u64, u64), accumulate: bool, keep: bool) -> D
         untracked: false,
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
+        pc: None,
         deps: vec![],
         label: Some(1),
         args: Args::Matmul {
@@ -152,6 +153,7 @@ fn the_tmem_access_rules_stop_the_run() {
         untracked: true,
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
+        pc: None,
         deps: vec![],
         label: None,
         args: Args::Dma {

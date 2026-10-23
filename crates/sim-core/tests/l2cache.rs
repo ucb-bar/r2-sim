@@ -67,6 +67,7 @@ fn run(steps: &[Step]) -> Stats {
                 untracked: false,
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
+                pc: None,
                 deps: vec![],
                 label: Some(i as u64),
                 args: Args::Dma {

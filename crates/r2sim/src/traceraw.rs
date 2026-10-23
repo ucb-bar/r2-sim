@@ -48,9 +48,9 @@ use nu_model::{Dep, NeutrinoId};
 use serde_json::{json, Value};
 use sim_core::tracer as tr;
 use sim_core::{
-    AttachId, Built, BusTopology, Charge, ChunkGrant, Component, Cycle, Dir, Link, Owner, PeParams,
-    ResourceId, Role, RouteUse, Sim, Stats, Table, TableEntry, TaskEntered, Topology, Tracer, Who,
-    MESSAGE_KINDS,
+    AttachId, Built, BusTopology, Charge, ChunkGrant, Component, Cycle, Dir, Link, OpcodeId, Owner,
+    PeParams, ResourceId, Role, RouteUse, Sim, Stats, Table, TableEntry, TaskEntered, Topology,
+    Tracer, Who, MESSAGE_KINDS,
 };
 
 const BUF: usize = 1 << 20;
@@ -87,6 +87,8 @@ const TASKS: &[(&str, &str)] = &[
     ("sent", "u64"),
     ("flags", "u32"),
     ("dst_mask", "u32"),
+    ("pc", "u32"),
+    ("pad", "u32"),
 ];
 const CHUNKS: &[(&str, &str)] = &[
     ("gid", "u32"),
@@ -121,7 +123,7 @@ const PROGRAMS: &[(&str, &str)] = &[
     ("pad", "u16"),
     ("name", "u32"),
     ("spawn", "u32"),
-    ("pad2", "u32"),
+    ("image", "u32"),
     ("start", "u64"),
     ("end", "u64"),
 ];
@@ -150,7 +152,7 @@ type Layout = &'static [(&'static str, &'static str)];
 
 /// The record types: file stem, layout and record size.
 pub const RECORDS: [(&str, Layout, usize); 7] = [
-    ("tasks", TASKS, 112),
+    ("tasks", TASKS, 120),
     ("chunks", CHUNKS, 32),
     ("deps", DEPS, 24),
     ("charges", CHARGES, 32),
@@ -485,6 +487,9 @@ struct OpenTask {
     flags: u32,
     /// The mask of `dst` in granules (1.9).
     dst_mask: u32,
+    /// The IMEM offset of the `nu.*` instruction of an RV program that
+    /// made the task (1.10).
+    pc: Option<u32>,
     /// Resolved deps kept until the task's retire decides the window.
     parked: u32,
     /// Its invoke call (source Neutrino, number), when it has one: the key
@@ -580,8 +585,17 @@ pub struct RawTracer {
     remote: IdMap<(u32, u32), u32>,
     /// The remote deps of the last invoked task (their requests follow).
     last_remote: Vec<u32>,
-    /// Running programs by Neutrino: (name, spawn, start).
+    /// Running programs by Neutrino: (name, spawn, start, image).
     programs: IdMap<u32, Program>,
+    /// The scalar cores of the nodes (the images in their IMEMs) and the
+    /// instruction DMA PE of each node (1.10).
+    cores: Vec<sim_core::Core>,
+    idma_pe: Vec<Option<u16>>,
+    /// The manifest's `images` (1.10), with their SHA-256.
+    images: Vec<(String, Value)>,
+    /// The manifest, written again at the end when it has `images`.
+    manifest: Value,
+    dir: std::path::PathBuf,
     /// Owners (trace-raw 1.6): the gid of an invoke call (source, number)
     /// from its task's invoke to its retire, and the charge records of an
     /// invoke call held until its task has a gid.
@@ -608,8 +622,9 @@ pub struct RawTracer {
     deps_on: bool,
 }
 
-/// A running program: (name string id, spawn gid, start).
-type Program = (u32, Option<u64>, Cycle);
+/// A running program: (name string id, spawn gid, start, index of its
+/// image in the manifest's `images`).
+type Program = (u32, Option<u64>, Cycle, Option<u32>);
 
 /// A run of link ids in the link store: (first, count).
 type Span = (u32, u32);
@@ -750,6 +765,13 @@ impl RawTracer {
             remote: IdMap::default(),
             last_remote: Vec::new(),
             programs: IdMap::default(),
+            cores: (0..topo.len())
+                .map(|i| b.sim.core(NeutrinoId(i as u32)))
+                .collect(),
+            idma_pe: idma_pes(&b.sim),
+            images: Vec::new(),
+            manifest,
+            dir: o.dir.clone(),
             named: IdMap::default(),
             held: IdMap::default(),
             held_now: 0,
@@ -815,7 +837,7 @@ impl RawTracer {
         if !self.task_kept(t, retire) {
             return;
         }
-        let mut r = Rec::<112>::new();
+        let mut r = Rec::<120>::new();
         r.u32(gid as u32)
             .u16(t.nu)
             .u16(t.src)
@@ -834,7 +856,9 @@ impl RawTracer {
             .u64(o64(t.queued))
             .u64(o64(t.sent))
             .u32(t.flags)
-            .u32(t.dst_mask);
+            .u32(t.dst_mask)
+            .u32(o32(t.pc))
+            .u32(0);
         self.emit(T_TASKS, r.done());
     }
 
@@ -944,16 +968,37 @@ impl RawTracer {
         self.emit(T_DEPS, r.done());
     }
 
-    fn write_program(&mut self, nu: u32, (name, spawn, start): Program, end: Option<Cycle>) {
+    fn write_program(&mut self, nu: u32, (name, spawn, start, image): Program, end: Option<Cycle>) {
         let mut r = Rec::<32>::new();
         r.u16(nu as u16)
             .u16(0)
             .u32(name)
             .u32(o32(spawn.map(|s| s as u32)))
-            .u32(0)
+            .u32(o32(image))
             .u64(start)
             .u64(o64(end));
         self.emit(T_PROGRAMS, r.done());
+    }
+
+    /// The index in the manifest's `images` of the image at offset 0 of the
+    /// IMEM of `nu` (1.10); `None` without one. A new image (by SHA-256)
+    /// joins the list.
+    fn image_of(&mut self, nu: NeutrinoId) -> Option<u32> {
+        let mut mem = self.cores[nu.0 as usize].mem.borrow_mut();
+        let img = mem.image.clone()?;
+        let bytes = mem.imem()[..img.bytes as usize].to_vec();
+        drop(mem);
+        let sha = crate::sha256::hex(&bytes);
+        if let Some(i) = self.images.iter().position(|(s, _)| *s == sha) {
+            return Some(i as u32);
+        }
+        let names: Vec<String> = nu_rv::records(&bytes).into_iter().map(|r| r.name).collect();
+        let row = json!({
+            "file": img.file, "imem": img.node, "bytes": img.bytes, "sha256": sha,
+            "programs": names,
+        });
+        self.images.push((sha, row));
+        Some(self.images.len() as u32 - 1)
     }
 
     fn write_entry(&mut self, (nu, table, _): EntryKey, e: &OpenEntry, end: Option<Cycle>) {
@@ -1175,10 +1220,15 @@ impl RawTracer {
 impl Tracer for RawTracer {
     fn task_invoke(&mut self, e: &TaskEntered) {
         let d = e.desc;
+        // An IMEM copy runs on the instruction DMA of its node (1.10).
+        let pe = match d.opcode {
+            OpcodeId::IMEM_COPY => self.idma_pe[e.nu.0 as usize],
+            _ => d.pe.map(|p| p.0 as u16),
+        };
         let open = OpenTask {
             nu: e.nu.0 as u16,
             src: e.call.src.0 as u16,
-            pe: d.pe.map(|p| p.0 as u16),
+            pe,
             opcode: d.opcode.0,
             version: e.version.map(|v| v as u32),
             label: d.label,
@@ -1193,6 +1243,7 @@ impl Tracer for RawTracer {
             sent: e.call.sent,
             flags: d.untracked as u32 * UNTRACKED,
             dst_mask: d.dst_mask,
+            pc: d.pc.map(|pc| pc as u32),
             parked: NONE,
             call_key: None,
         };
@@ -1528,7 +1579,8 @@ impl Tracer for RawTracer {
 
     fn program_start(&mut self, nu: NeutrinoId, name: &'static str, spawn: Option<u64>, t: Cycle) {
         let id = self.string(name);
-        self.programs.insert(nu.0, (id, spawn, t));
+        let image = self.image_of(nu);
+        self.programs.insert(nu.0, (id, spawn, t, image));
     }
 
     fn program_return(&mut self, nu: NeutrinoId, time: Cycle) {
@@ -1631,6 +1683,15 @@ impl Tracer for RawTracer {
                 }
             }
         }
+        // The images of RV programs (1.10): the manifest again, with them.
+        if !self.images.is_empty() {
+            let images: Vec<Value> = self.images.iter().map(|(_, v)| v.clone()).collect();
+            self.manifest["images"] = Value::Array(images);
+            let text = serde_json::to_string_pretty(&self.manifest).expect("JSON");
+            if let Err(e) = std::fs::write(self.dir.join("manifest.json"), text) {
+                err.get_or_insert(e);
+            }
+        }
         let mut out = self.out.borrow_mut();
         out.counts = self.counts;
         out.error = err.map(|e| e.to_string());
@@ -1638,6 +1699,20 @@ impl Tracer for RawTracer {
 }
 
 // ---- the manifest ----
+
+/// The PE id of the instruction DMA of each node that has one (1.10):
+/// after the configured PEs, in node order.
+fn idma_pes(sim: &Sim) -> Vec<Option<u16>> {
+    let mut next = sim.pe_count() as u16;
+    (0..sim.topology().len())
+        .map(|i| {
+            sim.idma(NeutrinoId(i as u32)).map(|_| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
 
 /// Ids of the unlimited links, after the real resources, in a fixed
 /// order: attachment ports, shared buses, link directions.
@@ -1796,6 +1871,34 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             json!({"id": i, "path": pe_paths[i], "node": sim.pe_neutrino(id).0, "type": kind})
         })
         .collect();
+    // The instruction DMAs (1.10): PEs after the configured ones.
+    let mut pe_rows = pe_rows;
+    for (i, id) in idma_pes(sim).into_iter().enumerate() {
+        let (Some(id), Some(r)) = (id, sim.idma(NeutrinoId(i as u32))) else {
+            continue;
+        };
+        set_role(r, json!({"type": "pe", "pe": id}));
+        pe_rows.push(json!({
+            "id": id, "path": format!("{}.idma", nodes[i]), "node": i, "type": "idma",
+        }));
+    }
+    // The data scratch memories with a port (1.10), after the
+    // configured memories.
+    let mut scratch_rows = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let nu = NeutrinoId(i as u32);
+        let (Some(p), Some(r)) = (sim.scratch_port(nu), sim.core(nu).scratch) else {
+            continue;
+        };
+        let id = lay.memories.len() + scratch_rows.len();
+        set_role(p, json!({"type": "mem_port", "memory": id}));
+        scratch_rows.push(json!({
+            "id": id, "path": format!("{node}.scratch"), "node": i, "type": "nu_scratch",
+            "ranges": [[hex(r.base), hex(r.bound)]], "attachments": [],
+            "port": p.0, "bw_bytes": bw(res.flow_rate(p)),
+            "latency": sim.neutrino_config(nu).scratch_latency,
+        }));
+    }
     for i in 0..topo.len() {
         let (s, c) = sim.neutrino_resources(NeutrinoId(i as u32));
         set_role(s, json!({"type": "scalar", "node": i}));
@@ -1963,6 +2066,8 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         })
         .collect();
 
+    let mut mem_rows = mem_rows;
+    mem_rows.extend(scratch_rows);
     let mut res_rows: Vec<Value> = (0..res.len())
         .map(|i| {
             let id = ResourceId(i as u32);
@@ -2048,7 +2153,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         .collect();
     json!({
         "format": "r2raw",
-        "version": [1, 9],
+        "version": [1, 10],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

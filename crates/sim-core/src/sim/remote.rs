@@ -1423,20 +1423,26 @@ impl Sim {
             self.clock.clone(),
             self.topo.node(child).children.clone(),
             n.cfg.costs.plan,
+            n.core.clone(),
         );
         // A program start resets the Neutrino's version table (Neutrino spec Section 7.7).
         n.tables.vreset_all();
         n.program = Some((start.run)(ctx));
-        n.prog_name = start.name;
+        let name = match start.name {
+            crate::program::ProgramName::Fixed(s) => s,
+            crate::program::ProgramName::AtStart(f) => f(),
+        };
+        let n = &mut self.nus[child.0 as usize];
+        n.prog_name = name;
         n.parent_task = Some((parent, task));
         n.state = ProgState::Busy;
         if let Some(a) = self.asm.as_mut() {
-            a.start(child, start.name, Some(parent), self.now);
+            a.start(child, name, Some(parent), self.now);
         }
         if let Some(t) = self.tracer.as_mut() {
             let gid = self.nus[parent.0 as usize].rec(task).gid;
             t.entries_clear(child, Table::Versions, self.now);
-            t.program_start(child, start.name, Some(gid), self.now);
+            t.program_start(child, name, Some(gid), self.now);
         }
         self.queue.push(self.now, Event::NuResume(child));
     }

@@ -66,6 +66,7 @@ fn run_some(b: Built, dma: bool, store: bool) -> (u64, Stats) {
         untracked: false,
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
+        pc: None,
         deps: vec![],
         label: Some(0),
         args: Args::Dma {

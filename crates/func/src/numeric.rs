@@ -58,7 +58,8 @@ impl Numeric {
 
     fn task(&mut self, desc: &Descriptor) -> Result<(), FuncError> {
         match &desc.args {
-            Args::Join | Args::Spawn { .. } | Args::Vector { .. } => Ok(()),
+            // An IMEM_COPY moves bytes of the control plane: no data here.
+            Args::Join | Args::Spawn { .. } | Args::Vector { .. } | Args::ImemCopy { .. } => Ok(()),
             &Args::Dma {
                 src, dst, bytes, ..
             } => self.mem.dma(&desc.held(), src.0, dst.0, bytes),

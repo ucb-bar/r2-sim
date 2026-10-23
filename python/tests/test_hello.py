@@ -67,3 +67,48 @@ shape = [128, 128]
     want = (a.astype(np.float32) @ b.astype(np.float32)).astype(BF16)
     assert got["C"].dtype == BF16 and got["C"].shape == (128, 128)
     assert np.array_equal(got["C"], want)
+
+
+HELLO_BIN = REPO / "crates/nu-rv/tests/fixtures/rv/hello.bin"
+
+
+def test_the_rv_hello_image(tmp_path):
+    """`--program rv` with the RV64 image of hello in the root's IMEM:
+    C = A @ B with the Numeric backend and with the Python plane."""
+    rng = np.random.default_rng(2026)
+    a = rng.standard_normal((128, 128)).astype(BF16)
+    b = rng.standard_normal((128, 128)).astype(BF16)
+    save_file({"A": a, "B": b}, str(tmp_path / "ab.safetensors"))
+    (tmp_path / "image.toml").write_text(
+        f"""
+[[entry]]
+imem = "root"
+bin = "{HELLO_BIN}"
+
+[[entry]]
+at = "root.gpc0.hbm+0x0"
+safetensors = "ab.safetensors"
+tensor = "A"
+
+[[entry]]
+at = "root.gpc0.hbm+0x8000"
+safetensors = "ab.safetensors"
+tensor = "B"
+
+[[entry]]
+name = "C"
+at = "root.gpc0.hbm+0x10000"
+dtype = "bf16"
+shape = [128, 128]
+"""
+    )
+    want = (a.astype(np.float32) @ b.astype(np.float32)).astype(BF16)
+    for backend in ["numeric", "python"]:
+        out = tmp_path / f"{backend}.safetensors"
+        subprocess.run(
+            [str(r2sim()), "run", "--config", str(REPO / "configs/2p.yaml"), "--program", "rv",
+             "--functional", backend, "--image", str(tmp_path / "image.toml"),
+             "--image-out", str(out)],
+            check=True, stdout=subprocess.DEVNULL,
+        )
+        assert np.array_equal(load_file(str(out))["C"], want), backend

@@ -1,0 +1,18 @@
+[package]
+name = "nu-rv"
+description = "RV programs on the Neutrino model: the ABI descriptor decoder, the scalar core interpreter and the root launch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nu-model = { path = "../nu-model" }
+sim-core = { path = "../sim-core" }
+nu-iss = { path = "../nu-iss" }
+nu-prog = { path = "../nu-prog" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+func = { path = "../func" }

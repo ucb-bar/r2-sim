@@ -102,6 +102,60 @@ pub struct NeutrinoConfig {
     /// protocol messages): the start of a transfer's narrowing chain
     /// (r2sim spec Section 5.6).
     pub beat_bytes: u64,
+    /// Bytes of the IMEM of the scalar core (RV programs, 2026-10-23).
+    pub imem_bytes: u64,
+    /// Bytes of the data scratch: at the end of the node's sync-only range
+    /// in its own space ([`crate::abi`]).
+    pub scratch_bytes: u64,
+    /// Cycles per instruction class of an RV program.
+    pub scalar: ScalarCosts,
+    /// A load or store of another node's data scratch: the latency at the
+    /// scratch.
+    pub scratch_latency: Cycle,
+    /// A load or store of another node's data scratch: the bytes per
+    /// cycle of the scratch's port (`<node>.scratch.port`).
+    pub scratch_port_bytes: u64,
+    /// The instruction DMA (`<node>.idma`, an IMEM_COPY into a child's
+    /// IMEM): cycles before a copy moves bytes.
+    pub idma_latency: Cycle,
+    /// The instruction DMA: bytes per cycle, one copy at a time.
+    pub idma_bytes: u64,
+}
+
+/// Cycles per instruction class of the scalar core when it runs an RV
+/// program (2026-10-23). `nu.*` instructions cost their requests
+/// (`c_invoke`, `c_wait`, ...), and `c_desc` is not charged: the program's
+/// own instructions build the descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScalarCosts {
+    /// ALU, `lui`, `auipc`, a CSR read, `fence`.
+    pub alu: Cycle,
+    /// A taken branch, and every jump.
+    pub branch_taken: Cycle,
+    /// A branch not taken.
+    pub branch: Cycle,
+    /// A load from the IMEM or the own data scratch.
+    pub load: Cycle,
+    /// A store to the own data scratch.
+    pub store: Cycle,
+    /// The `mul` family.
+    pub mul: Cycle,
+    /// The `div` and `rem` families.
+    pub div: Cycle,
+}
+
+impl Default for ScalarCosts {
+    fn default() -> Self {
+        Self {
+            alu: 1,
+            branch_taken: 2,
+            branch: 1,
+            load: 2,
+            store: 1,
+            mul: 3,
+            div: 34,
+        }
+    }
 }
 
 impl Default for NeutrinoConfig {
@@ -125,6 +179,13 @@ impl Default for NeutrinoConfig {
             inbound_invokes: 64,
             t_retry: 50,
             beat_bytes: 64,
+            imem_bytes: 32 << 10,
+            scratch_bytes: 32 << 10,
+            scalar: ScalarCosts::default(),
+            scratch_latency: 1,
+            scratch_port_bytes: 8,
+            idma_latency: 10,
+            idma_bytes: 8,
         }
     }
 }

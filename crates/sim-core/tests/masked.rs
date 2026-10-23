@@ -27,6 +27,7 @@ fn dma(b: &Built, src: u64, to: u64, bytes: u64, dst: Range, mask: u32) -> Descr
         untracked: false,
         dst_mask: mask,
         inferred_version: None,
+        pc: None,
         deps: vec![],
         label: None,
         args: Args::Dma {

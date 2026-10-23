@@ -198,6 +198,7 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
                 untracked: false,
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
+                pc: None,
                 deps: vec![],
                 label: Some(i),
                 args: Args::Dma {
@@ -268,6 +269,7 @@ fn two_matmuls(units: [&str; 2]) -> [u64; 2] {
             untracked: false,
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps: vec![],
             label: Some(i as u64),
             args: Args::Matmul {

@@ -146,6 +146,7 @@ fn main() {
                         untracked: false,
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
+                        pc: None,
                         deps: war,
                         label: None,
                         args: Args::Dma {
@@ -165,6 +166,7 @@ fn main() {
                         untracked: false,
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
+                        pc: None,
                         deps: vec![ha.key()],
                         label: None,
                         args: Args::Matmul {

@@ -28,26 +28,39 @@
 //! at = "root.gpc0.hbm+0x10000"
 //! dtype = "bf16"
 //! shape = [128, 128]
+//!
+//! [[entry]]                      # an RV image into the IMEM of a node:
+//! imem = "root"                  # an ELF (PT_LOAD segments at their
+//! bin = "hello.bin"              # addresses, IMEM offsets) or raw bytes
+//!                                # at offset 0
+//!
+//! [[entry]]                      # bytes in the data scratch of a node
+//! at = "root.scratch+0x100"
+//! bin = "args.bin"
 //! ```
 //!
-//! `at` is a memory of the configuration by its dotted name, with an
-//! optional `+offset` (decimal or `0x` hex). File paths are relative to the
-//! image file. Every byte of an entry must lie in a memory block or hash
-//! range of numeric fidelity, outside the sync-only space. The image loads
-//! through the functional backend's host write before the run.
+//! `at` is a memory of the configuration by its dotted name, or
+//! `<node path>.scratch` for the data scratch of a node, with an optional
+//! `+offset` (decimal or `0x` hex). File paths are relative to the image
+//! file. Every byte of an entry must lie in a memory block or hash range
+//! of numeric fidelity, outside the sync-only space; or in the data
+//! scratch or the IMEM of its node. The image loads through the functional
+//! backend's host write before the run; IMEM and data scratch bytes go to
+//! the control plane.
 //!
 //! After the run, `--image-out` reads every named entry back into one
 //! safetensors file (an ELF entry gives one `U8` tensor per segment,
 //! `<name>.<i>`); the metadata maps each tensor name to its global address
-//! and, for a region, its shape, as JSON.
+//! (`imem` and `offset` for an IMEM entry) and, for a region, its shape,
+//! as JSON.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nu_model::{Addr, Range};
+use nu_model::{Addr, NeutrinoId, Range};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sim_core::{Built, FunctionalBackend, MemBlock};
+use sim_core::{Built, Core, FunctionalBackend, MemBlock};
 
 /// An element type of an image entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +112,7 @@ struct RawEntry {
     tensor: Option<String>,
     elf: Option<PathBuf>,
     bin: Option<PathBuf>,
+    imem: Option<String>,
     dtype: Option<String>,
     shape: Option<Vec<u64>>,
 }
@@ -110,7 +124,18 @@ struct RawImage {
     entry: Vec<RawEntry>,
 }
 
-/// One piece of data at a global address.
+/// Where the bytes of an entry go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// Global addresses, through the functional backend.
+    Global,
+    /// The IMEM of a node: addresses are IMEM offsets.
+    Imem(NeutrinoId),
+    /// The data scratch of a node: global addresses.
+    Scratch(NeutrinoId),
+}
+
+/// One piece of data at an address of its entry's target.
 pub struct Segment {
     pub addr: u64,
     pub bytes: Vec<u8>,
@@ -125,6 +150,9 @@ pub struct Entry {
     pub shape: Vec<u64>,
     /// True for a region (no data).
     pub region: bool,
+    pub target: Target,
+    /// The file of an ELF or raw entry: its canonical absolute path.
+    pub file: Option<String>,
     /// The data (a region: one segment of zero-length data giving its
     /// address, see `ranges`).
     pub segments: Vec<Segment>,
@@ -135,18 +163,34 @@ pub struct Entry {
 /// A loaded image.
 pub struct Image {
     pub entries: Vec<Entry>,
+    /// The scalar cores, and paths, of the nodes of IMEM and data scratch
+    /// entries.
+    cores: BTreeMap<u32, (Core, String)>,
 }
 
-/// Resolves `at`: "<memory path>[+offset]".
-fn resolve(b: &Built, at: &str) -> Result<u64, String> {
+/// The node at dotted path `path`.
+fn node(b: &Built, path: &str) -> Option<NeutrinoId> {
+    let topo = b.sim.topology();
+    (0..topo.len())
+        .map(|i| NeutrinoId(i as u32))
+        .find(|&nu| topo.path_name(nu) == path)
+}
+
+/// Resolves `at`: "<memory path>[+offset]" or "<node path>.scratch[+offset]",
+/// to a global address and its target.
+fn resolve(b: &Built, at: &str) -> Result<(u64, Target), String> {
     let (path, off) = match at.split_once('+') {
         Some((p, o)) => (p.trim(), parse_u64(o.trim())?),
         None => (at.trim(), 0),
     };
-    let m = b
-        .try_memory(path)
-        .ok_or_else(|| format!("at {at:?}: no memory {path:?}"))?;
-    Ok(m.base + off)
+    if let Some(m) = b.try_memory(path) {
+        return Ok((m.base + off, Target::Global));
+    }
+    if let Some(nu) = path.strip_suffix(".scratch").and_then(|n| node(b, n)) {
+        let r = sim_core::abi::data_scratch(b, nu).map_err(|e| format!("at {at:?}: {e}"))?;
+        return Ok((r.base + off, Target::Scratch(nu)));
+    }
+    Err(format!("at {at:?}: no memory {path:?}"))
 }
 
 fn parse_u64(s: &str) -> Result<u64, String> {
@@ -155,6 +199,15 @@ fn parse_u64(s: &str) -> Result<u64, String> {
         None => s.replace('_', "").parse(),
     }
     .map_err(|e| format!("offset {s:?}: {e}"))
+}
+
+/// The canonical absolute path of `p` (as given when it cannot be
+/// resolved): the raw trace names an image's file by it.
+fn absolute(p: &Path) -> String {
+    std::fs::canonicalize(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn read_file(base: &Path, p: &Path) -> Result<(PathBuf, Vec<u8>), String> {
@@ -415,6 +468,7 @@ impl Image {
         let blocks = b.sim.functional_blocks();
         let sync_only = b.sim.sync_only_ranges();
         let mut entries = Vec::new();
+        let mut cores = BTreeMap::new();
         for (i, e) in raw.entry.into_iter().enumerate() {
             let what = match &e.name {
                 Some(n) => format!("entry {n:?}"),
@@ -430,16 +484,69 @@ impl Image {
                     len
                 };
                 let r = Range::from_len(s.addr, len);
-                pieces(&blocks, sync_only, r).map_err(|m| format!("{what}: {m}"))?;
+                match entry.target {
+                    Target::Global => {
+                        pieces(&blocks, sync_only, r).map_err(|m| format!("{what}: {m}"))?;
+                    }
+                    Target::Scratch(nu) => {
+                        let s = sim_core::abi::data_scratch(b, nu)?;
+                        if !s.covers(&r) {
+                            return Err(format!(
+                                "{what}: {r} runs past the data scratch {s} of {}",
+                                b.sim.topology().path_name(nu)
+                            ));
+                        }
+                    }
+                    Target::Imem(nu) => {
+                        let n = sim_core::abi::imem_bytes(b, nu);
+                        if r.bound > n {
+                            return Err(format!(
+                                "{what}: IMEM offsets {r} run past the IMEM ({n} bytes) of {}",
+                                b.sim.topology().path_name(nu)
+                            ));
+                        }
+                    }
+                }
                 ranges.push(r);
+            }
+            if let Target::Imem(nu) | Target::Scratch(nu) = entry.target {
+                cores.insert(nu.0, (b.sim.core(nu), b.sim.topology().path_name(nu)));
             }
             entries.push(Entry { ranges, ..entry });
         }
-        Ok(Self { entries })
+        Ok(Self { entries, cores })
+    }
+
+    /// The address of the first byte of entry `name`: global, or an IMEM
+    /// offset for an IMEM entry.
+    pub fn address_of(&self, name: &str) -> Option<u64> {
+        let e = self
+            .entries
+            .iter()
+            .find(|e| e.name.as_deref() == Some(name))?;
+        e.ranges.first().map(|r| r.base)
     }
 
     fn entry(e: RawEntry, dir: &Path, b: &Built) -> Result<Entry, String> {
-        let at = || -> Result<u64, String> { resolve(b, e.at.as_deref().ok_or("needs at")?) };
+        let imem = match &e.imem {
+            Some(p) => {
+                if e.at.is_some() || !(e.elf.is_some() || e.bin.is_some()) {
+                    return Err("imem takes an elf or a bin, and no at".into());
+                }
+                Some(node(b, p).ok_or_else(|| format!("imem: no node {p:?}"))?)
+            }
+            None => None,
+        };
+        let resolved = match (&e.at, imem) {
+            (_, Some(nu)) => Some(Ok((0, Target::Imem(nu)))),
+            (Some(at), None) => Some(resolve(b, at)),
+            (None, None) => None,
+        };
+        let at = || -> Result<u64, String> { Ok(resolved.clone().ok_or("needs at")??.0) };
+        let target = match &resolved {
+            Some(Ok((_, t))) => *t,
+            _ => Target::Global,
+        };
         let want = e.dtype.as_deref().map(Dtype::parse).transpose()?;
         let sources = [
             e.npy.is_some(),
@@ -463,6 +570,8 @@ impl Image {
                 dtype: to,
                 shape,
                 region: false,
+                target,
+                file: None,
                 segments: vec![Segment {
                     addr: at()?,
                     bytes: convert(&data, dtype, to)?,
@@ -490,23 +599,28 @@ impl Image {
             if e.at.is_some() {
                 return Err("an ELF loads at its physical addresses: no at".into());
             }
+            let target = imem.map_or(Target::Global, Target::Imem);
             let (full, f) = read_file(dir, p)?;
             return Ok(Entry {
                 name: e.name.clone(),
                 dtype: Dtype::U8,
                 shape: Vec::new(),
                 region: false,
+                target,
+                file: Some(absolute(&full)),
                 segments: elf(&full, &f)?,
                 ranges: Vec::new(),
             });
         }
         if let Some(p) = &e.bin {
-            let (_, f) = read_file(dir, p)?;
+            let (full, f) = read_file(dir, p)?;
             return Ok(Entry {
                 name: e.name.clone(),
                 dtype: Dtype::U8,
                 shape: vec![f.len() as u64],
                 region: false,
+                target,
+                file: Some(absolute(&full)),
                 segments: vec![Segment {
                     addr: at()?,
                     bytes: f,
@@ -523,6 +637,8 @@ impl Image {
             dtype: want.ok_or("a region needs dtype")?,
             shape: e.shape.clone().ok_or("a region needs shape")?,
             region: true,
+            target,
+            file: None,
             segments: vec![Segment {
                 addr: at()?,
                 bytes: Vec::new(),
@@ -537,7 +653,33 @@ impl Image {
         let blocks = b.sim.functional_blocks();
         let sync_only = b.sim.sync_only_ranges().to_vec();
         for e in &self.entries {
+            // An image at offset 0 of an IMEM: the IMEM's image, for the
+            // raw trace.
+            if let Target::Imem(nu) = e.target {
+                if e.segments.iter().any(|s| s.addr == 0) {
+                    let end = e
+                        .segments
+                        .iter()
+                        .map(|s| s.addr + s.bytes.len() as u64)
+                        .max();
+                    let (core, path) = &self.cores[&nu.0];
+                    core.mem.borrow_mut().image = Some(sim_core::ImemImage {
+                        bytes: end.unwrap_or(0),
+                        file: e.file.clone(),
+                        node: Some(path.clone()),
+                    });
+                }
+            }
             for s in e.segments.iter().filter(|s| !s.bytes.is_empty()) {
+                if let Some((nu, at)) = self.core_at(e.target, s.addr) {
+                    let mut mem = self.cores[&nu].0.mem.borrow_mut();
+                    let m = match e.target {
+                        Target::Imem(_) => mem.imem(),
+                        _ => mem.scratch(),
+                    };
+                    m[at..at + s.bytes.len()].copy_from_slice(&s.bytes);
+                    continue;
+                }
                 let r = Range::from_len(s.addr, s.bytes.len() as u64);
                 for p in pieces(&blocks, &sync_only, r)? {
                     let (a, z) = ((p.base - s.addr) as usize, (p.bound - s.addr) as usize);
@@ -546,6 +688,19 @@ impl Image {
             }
         }
         Ok(())
+    }
+
+    /// The node and the offset in its IMEM or data scratch of address
+    /// `addr` of target `t`; `None` for a global target.
+    fn core_at(&self, t: Target, addr: u64) -> Option<(u32, usize)> {
+        match t {
+            Target::Global => None,
+            Target::Imem(nu) => Some((nu.0, addr as usize)),
+            Target::Scratch(nu) => {
+                let base = self.cores[&nu.0].0.scratch.expect("a data scratch").base;
+                Some((nu.0, (addr - base) as usize))
+            }
+        }
     }
 
     /// Reads every named entry back from `backend` and writes them to the
@@ -564,7 +719,20 @@ impl Image {
             let many = e.ranges.len() != 1;
             for (i, r) in e.ranges.iter().enumerate() {
                 let mut data = Vec::with_capacity(r.len() as usize);
-                for p in pieces(blocks, sync_only, *r)? {
+                if let Some((nu, at)) = self.core_at(e.target, r.base) {
+                    let mut mem = self.cores[&nu].0.mem.borrow_mut();
+                    let m = match e.target {
+                        Target::Imem(_) => mem.imem(),
+                        _ => mem.scratch(),
+                    };
+                    data.extend_from_slice(&m[at..at + r.len() as usize]);
+                }
+                let global = if e.target == Target::Global {
+                    pieces(blocks, sync_only, *r)?
+                } else {
+                    Vec::new()
+                };
+                for p in global {
                     data.extend(
                         backend
                             .read(Addr(p.base), p.len())
@@ -578,7 +746,13 @@ impl Image {
                 } else {
                     (name.clone(), e.shape.clone())
                 };
-                let mut m = json!({ "addr": format!("{:#x}", r.base) });
+                let mut m = match e.target {
+                    Target::Imem(nu) => json!({
+                        "imem": self.cores[&nu.0].1,
+                        "offset": format!("{:#x}", r.base),
+                    }),
+                    _ => json!({ "addr": format!("{:#x}", r.base) }),
+                };
                 if e.region {
                     m["shape"] = json!(e.shape);
                 }

@@ -62,7 +62,10 @@
 //!   `c_invoke`, `c_base`, `c_dep`, `c_word` (descriptor assembly),
 //!   `c_plan` (per planned task), `c_wait`, `c_version`, `c_vreset`, `c_complete`,
 //!   `c_load`, `c_store`, `c_spawn`, `c_resolve`, `scalar_rate`,
-//!   `complete_rate`), and `master`.
+//!   `complete_rate`, `imem_bytes`, `scratch_bytes`, `scratch_latency`,
+//!   `scratch_port_bytes`, `idma_latency`, `idma_bytes`, and `scalar`: the cycles of the instruction
+//!   classes of an RV program, `alu`, `branch_taken`, `branch`, `load`,
+//!   `store`, `mul`, `div`), and `master`.
 //! * compute: `utilization` (tensor and vector), `inflight` (default 1),
 //!   `outstanding` (a DMA engine: a cap on chunks issued and not ended,
 //!   default none, r2sim spec Section 5.4.1 issue-driven chunks; another PE: chunks
@@ -652,6 +655,26 @@ struct NuSec {
     master: Option<Buses>,
     /// Data width as a master: loads, stores, messages (default 64).
     beat_bytes: Option<Num>,
+    imem_bytes: Option<Num>,
+    scratch_bytes: Option<Num>,
+    scratch_latency: Option<u64>,
+    scratch_port_bytes: Option<Num>,
+    idma_latency: Option<u64>,
+    idma_bytes: Option<Num>,
+    scalar: Option<ScalarSec>,
+}
+
+/// `neutrino.scalar`: cycles per instruction class of an RV program.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ScalarSec {
+    alu: Option<u64>,
+    branch_taken: Option<u64>,
+    branch: Option<u64>,
+    load: Option<u64>,
+    store: Option<u64>,
+    mul: Option<u64>,
+    div: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1267,9 +1290,23 @@ impl Builder {
         self.built.layout.memories.extend(syncs);
         self.built.sim.finish_fabric().map_err(ConfigError)?;
         check_tables(&self.table_sizes)?;
+        self.place_scratches();
         self.built.warnings.extend(check_bursts(&self.built.sim));
         self.built.warnings.extend(check_beats(&self.built.sim));
         Ok(self.built)
+    }
+
+    /// The global prefix of every node, and the data scratch of every
+    /// node whose scratch is valid ([`crate::abi::data_scratch`]). An
+    /// invalid scratch is an error only where a program or the memory
+    /// image uses it: some test configurations have none.
+    fn place_scratches(&mut self) {
+        for i in 0..self.built.own.len() {
+            let nu = NeutrinoId(i as u32);
+            let scratch = crate::abi::data_scratch(&self.built, nu).ok();
+            let prefix = self.built.own[i].base;
+            self.built.sim.set_core_space(nu, prefix, scratch);
+        }
     }
 
     /// Adds node `sec` under `parent`; returns its id, name and fidelity.
@@ -2295,5 +2332,43 @@ fn nu_config(
         inbound_invokes: s.inbound_invokes.unwrap_or(d.inbound_invokes),
         t_retry: s.t_retry.unwrap_or(d.t_retry),
         beat_bytes: beat_of(&s.beat_bytes, name)?,
+        imem_bytes: opt_bytes(&s.imem_bytes, name, "imem_bytes")?.unwrap_or(d.imem_bytes),
+        scratch_bytes: opt_bytes(&s.scratch_bytes, name, "scratch_bytes")?
+            .unwrap_or(d.scratch_bytes),
+        scalar: {
+            let (x, c) = (s.scalar.as_ref(), d.scalar);
+            let pick = |f: fn(&ScalarSec) -> Option<u64>, v| x.and_then(f).unwrap_or(v);
+            super::ScalarCosts {
+                alu: pick(|x| x.alu, c.alu),
+                branch_taken: pick(|x| x.branch_taken, c.branch_taken),
+                branch: pick(|x| x.branch, c.branch),
+                load: pick(|x| x.load, c.load),
+                store: pick(|x| x.store, c.store),
+                mul: pick(|x| x.mul, c.mul),
+                div: pick(|x| x.div, c.div),
+            }
+        },
+        scratch_latency: s.scratch_latency.unwrap_or(d.scratch_latency),
+        scratch_port_bytes: match opt_bytes(&s.scratch_port_bytes, name, "scratch_port_bytes")? {
+            Some(0) => return err(format!("{name}.neutrino: scratch_port_bytes 0")),
+            Some(b) => b,
+            None => d.scratch_port_bytes,
+        },
+        idma_latency: s.idma_latency.unwrap_or(d.idma_latency),
+        idma_bytes: match opt_bytes(&s.idma_bytes, name, "idma_bytes")? {
+            Some(0) => return err(format!("{name}.neutrino: idma_bytes 0")),
+            Some(b) => b,
+            None => d.idma_bytes,
+        },
     })
+}
+
+/// An optional byte count of the `neutrino` section of `name`.
+fn opt_bytes(v: &Option<Num>, name: &str, key: &str) -> Result<Option<u64>, ConfigError> {
+    v.as_ref()
+        .map(|n| {
+            n.bytes()
+                .map_err(|e| ConfigError(format!("{name}.neutrino: {key}: {}", e.0)))
+        })
+        .transpose()
 }

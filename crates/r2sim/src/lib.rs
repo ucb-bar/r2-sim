@@ -7,6 +7,7 @@
 //! program that is not one of `nu_prog::launch`.
 
 pub mod image;
+mod sha256;
 pub mod trace;
 pub mod traceraw;
 
@@ -389,9 +390,37 @@ pub fn run(o: &Options) -> Result<(), String> {
     if let Some(bytes) = a.acc_buffer {
         b.sim.set_atlas_acc_buffer(bytes);
     }
-    let launch = nu_prog::launch(&program, &b, granule, &params_text, &overrides)?;
+    let launch = if program == "rv" {
+        rv_launch(a, &b)?
+    } else {
+        nu_prog::launch(&program, &b, granule, &params_text, &overrides)?
+    };
     let cfg = cfg_path.display().to_string();
     execute(a, b, launch, records, &cfg, program, granule)
+}
+
+/// `--program rv` ([`nu_rv::launch`]): the root program of the root's
+/// IMEM. `--param args=NAME`: the arguments are at the image entry NAME
+/// (default address 0); `--param limit=N`: the run stops after N
+/// instructions of the program (default [`nu_rv::DEFAULT_LIMIT`]).
+fn rv_launch(a: &Options, b: &Built) -> Result<nu_prog::Launch, String> {
+    let (mut args, mut limit) = (0, nu_rv::DEFAULT_LIMIT);
+    for o in &a.overrides {
+        match o.split_once('=') {
+            Some(("args", name)) => {
+                let path = a.image.as_ref().ok_or("--param args=NAME needs --image")?;
+                let img = image::Image::load(path, b).map_err(|e| format!("--image: {e}"))?;
+                args = img
+                    .address_of(name)
+                    .ok_or_else(|| format!("--param args={name}: no image entry {name:?}"))?;
+            }
+            Some(("limit", n)) => {
+                limit = n.parse().map_err(|e| format!("--param limit={n}: {e}"))?;
+            }
+            _ => return Err(format!("--program rv: unknown --param {o} (args, limit)")),
+        }
+    }
+    nu_rv::launch(b, args, limit)
 }
 
 /// Runs the program that `launch` builds on the configuration `o.config`
@@ -429,7 +458,7 @@ pub fn run_program(
 fn execute(
     a: &Options,
     mut b: Built,
-    launch: nu_prog::Launch,
+    mut launch: nu_prog::Launch,
     records: func::Records,
     cfg: &str,
     program: String,
@@ -505,6 +534,11 @@ fn execute(
         None if a.image_out.is_some() => return Err("--image-out needs --image".into()),
         None => None,
     };
+    // An RV run makes its lazy resources (instruction DMAs, data scratch
+    // ports) now, so that the raw trace lists them with fixed ids.
+    if program == "rv" {
+        b.sim.make_core_resources();
+    }
     let (blocks, sync_only) = (b.sim.functional_blocks(), b.sim.sync_only_ranges().to_vec());
     b.sim.set_functional(backend);
     // The names are taken now, before the run consumes the simulation.
@@ -552,7 +586,10 @@ fn execute(
         .map(|_| sim_core::asm::Symbols::from_built(&b));
     let mut sim = b.sim;
     sim.set_asm(a.asm.is_some());
-    sim.spawn_named(launch.nu, launch.name, launch.program);
+    match launch.start_name.take() {
+        Some(name) => sim.spawn_program(launch.nu, name, launch.program),
+        None => sim.spawn_named(launch.nu, launch.name, launch.program),
+    }
     let t0 = Instant::now();
     let (stats, mut backend) = sim.run_with_backend();
     let wall = t0.elapsed().as_secs_f64();

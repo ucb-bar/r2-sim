@@ -720,6 +720,7 @@ impl Builder {
                 untracked: false,
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
+                pc: None,
                 deps,
                 label: None,
                 args: Args::Dma {
@@ -812,6 +813,7 @@ impl Builder {
                 untracked: false,
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
+                pc: None,
                 deps,
                 label: None,
                 args: Args::Matmul {
@@ -866,6 +868,7 @@ impl Builder {
                 untracked: false,
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
+                pc: None,
                 deps,
                 label: None,
                 args: Args::Vector {

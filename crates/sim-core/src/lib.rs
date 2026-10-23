@@ -6,12 +6,14 @@
 //! * [`profile`]: descriptors, demand profiles, the opcode registry.
 //! * [`config`]: static configuration of Neutrinos, PEs and memories.
 //! * [`program`]: Neutrino programs as coroutines over [`NuCtx`].
+//! * [`abi`]: the numbers of the Neutrino ABI that a configuration fixes.
 //! * [`func`]: the functional plane interface, `Null`, and the worker protocol.
 //! * [`topology`]: the node tree, links and data paths.
 //! * [`sim`]: the timing plane and the run loop.
 //! * [`stats`]: run outputs.
 //! * [`tracer`]: observation points and the in-memory collector.
 
+pub mod abi;
 pub mod asm;
 pub mod config;
 pub(crate) mod event;
@@ -29,14 +31,14 @@ mod writers;
 pub use config::{
     build as build_config, build_file as build_config_file, build_str as build_config_str,
     AttachInfo, Built, Component, ConfigError, Layout, LinkInfo, MemBlock, MemInfo, NeutrinoConfig,
-    NuCosts, PeConfig, PeParams, RaceCheck, Role,
+    NuCosts, PeConfig, PeParams, RaceCheck, Role, ScalarCosts,
 };
 pub use func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
 pub use profile::{
     split_row, Args, Chunk, Descriptor, Dtype, NodeConfig, Occupancy, OpcodeId, PeId, Profile,
     ProfileFn, ProfileRegistry,
 };
-pub use program::{NeutrinoProgram, NuCtx, TaskHandle};
+pub use program::{Core, CoreMem, ImemImage, NeutrinoProgram, NuCtx, ProgramName, TaskHandle};
 pub use resource::{
     CoCharge, Demand, Dir, DirAmounts, DirSlots, Grant, Kind, LogEntry, PathHop, ResourceId,
     ResourceStats, Resources, SCALE,

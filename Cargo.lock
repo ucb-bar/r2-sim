@@ -133,6 +133,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nu-iss"
+version = "0.1.0"
+
+[[package]]
 name = "nu-model"
 version = "0.1.0"
 dependencies = [
@@ -149,6 +153,17 @@ dependencies = [
  "serde_json",
  "sim-core",
  "toml",
+]
+
+[[package]]
+name = "nu-rv"
+version = "0.1.0"
+dependencies = [
+ "func",
+ "nu-iss",
+ "nu-model",
+ "nu-prog",
+ "sim-core",
 ]
 
 [[package]]
@@ -189,6 +204,7 @@ dependencies = [
  "func",
  "nu-model",
  "nu-prog",
+ "nu-rv",
  "serde",
  "serde_json",
  "serde_yaml",

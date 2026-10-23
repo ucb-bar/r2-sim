@@ -450,6 +450,7 @@ impl Machine {
             untracked: false,
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps: Vec::new(),
             label: None,
             args: Args::Dma {
@@ -483,6 +484,7 @@ impl Machine {
             untracked: false,
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps: Vec::new(),
             label: None,
             args: Args::Matmul {
@@ -550,6 +552,7 @@ impl Machine {
             untracked: false,
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps: Vec::new(),
             label: None,
             args: Args::Vector {

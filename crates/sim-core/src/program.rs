@@ -93,12 +93,16 @@ pub(crate) enum Request {
     Mark(String),
     /// Empties every cache with no traffic (the `cache` experiment).
     CacheFlush,
-    /// `spawn_child`; the program travels in the mailbox.
+    /// `spawn_child`; the program travels in the mailbox. `pc`: the spawn
+    /// descriptor of an RV program (no `c_desc`).
     Spawn {
         child: NeutrinoId,
         done: Range,
         deps: Vec<Dep>,
+        pc: Option<u64>,
     },
+    /// The program stops the run with an error (an RV program's fault).
+    Fail(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,11 +115,19 @@ pub(crate) enum Response {
 /// A running program.
 pub(crate) type ProgramFuture = Pin<Box<dyn Future<Output = ()>>>;
 
+/// The name of a program for a tracer: fixed, or found when the program
+/// starts (an RV program names itself by the record in its IMEM, which
+/// holds the image only after the copy that the spawn waits for).
+pub enum ProgramName {
+    Fixed(&'static str),
+    AtStart(Box<dyn FnOnce() -> &'static str>),
+}
+
 /// A program value ready to start on a Neutrino, and its name for a
 /// tracer.
 pub(crate) struct StartFn {
     pub run: Box<dyn FnOnce(NuCtx) -> ProgramFuture>,
-    pub name: &'static str,
+    pub name: ProgramName,
 }
 
 #[derive(Default)]
@@ -124,6 +136,66 @@ pub(crate) struct Mailbox {
     /// The program of a `Spawn` request.
     pub spawn: Option<StartFn>,
     pub response: Option<Response>,
+}
+
+/// The memories of a Neutrino's scalar core, held in the control plane
+/// (RV programs, 2026-10-23): its IMEM, the local window `[0,
+/// imem_bytes)` of the core, and its data scratch. Each is allocated, as
+/// zeros, on its first use.
+#[derive(Debug, Default)]
+pub struct CoreMem {
+    imem_bytes: u64,
+    scratch_bytes: u64,
+    imem: Vec<u8>,
+    scratch: Vec<u8>,
+    /// The image at offset 0 of the IMEM: the last image load or IMEM
+    /// copy there.
+    pub image: Option<ImemImage>,
+}
+
+/// An image placed at offset 0 of an IMEM: its bytes, and for an image
+/// of the memory image (`--image`) its file and node; none for a copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImemImage {
+    pub bytes: u64,
+    pub file: Option<String>,
+    pub node: Option<String>,
+}
+
+impl CoreMem {
+    pub(crate) fn new(imem_bytes: u64, scratch_bytes: u64) -> Self {
+        Self {
+            imem_bytes,
+            scratch_bytes,
+            ..Self::default()
+        }
+    }
+
+    /// The IMEM.
+    pub fn imem(&mut self) -> &mut [u8] {
+        if self.imem.is_empty() {
+            self.imem = vec![0; self.imem_bytes as usize];
+        }
+        &mut self.imem
+    }
+
+    /// The data scratch.
+    pub fn scratch(&mut self) -> &mut [u8] {
+        if self.scratch.is_empty() {
+            self.scratch = vec![0; self.scratch_bytes as usize];
+        }
+        &mut self.scratch
+    }
+}
+
+/// A Neutrino's scalar core as a program sees it: its memories, its
+/// global prefix (the base of its own space) and the global range of its
+/// data scratch (none for a node without a sync-only range).
+#[derive(Debug, Clone)]
+pub struct Core {
+    pub mem: Rc<RefCell<CoreMem>>,
+    pub prefix: u64,
+    pub scratch: Option<Range>,
 }
 
 /// The program's view of its Neutrino.
@@ -135,6 +207,7 @@ pub struct NuCtx {
     children: Rc<Vec<NeutrinoId>>,
     /// The Neutrino's `c_plan`.
     plan_cost: Cycle,
+    core: Core,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -154,6 +227,7 @@ impl NuCtx {
         clock: Rc<Cell<Cycle>>,
         children: Vec<NeutrinoId>,
         plan_cost: Cycle,
+        core: Core,
     ) -> Self {
         Self {
             id,
@@ -161,7 +235,13 @@ impl NuCtx {
             clock,
             children: Rc::new(children),
             plan_cost,
+            core,
         }
+    }
+
+    /// The Neutrino's scalar core: IMEM, data scratch and prefix.
+    pub fn core(&self) -> &Core {
+        &self.core
     }
 
     /// The Neutrino this program runs on.
@@ -198,12 +278,35 @@ impl NuCtx {
         deps: Vec<Dep>,
         program: impl NeutrinoProgram + 'static,
     ) -> TaskHandle {
+        self.spawn_program(child, ProgramName::Fixed(name), done, deps, None, program)
+            .await
+    }
+
+    /// [`NuCtx::spawn_named`] with a [`ProgramName`], and the PC of the
+    /// spawn descriptor of an RV program (which charges no `c_desc`).
+    pub async fn spawn_program(
+        &self,
+        child: NeutrinoId,
+        name: ProgramName,
+        done: Range,
+        deps: Vec<Dep>,
+        pc: Option<u64>,
+        program: impl NeutrinoProgram + 'static,
+    ) -> TaskHandle {
         let start = StartFn {
             run: Box::new(move |ctx| Box::pin(program.run(ctx))),
             name,
         };
         self.mb.borrow_mut().spawn = Some(start);
-        match self.call(Request::Spawn { child, done, deps }).await {
+        match self
+            .call(Request::Spawn {
+                child,
+                done,
+                deps,
+                pc,
+            })
+            .await
+        {
             Response::Invoked(h) => h,
             r => panic!("spawn_child answered with {r:?}"),
         }
@@ -302,6 +405,12 @@ impl NuCtx {
     /// Does not wait for the functional plane.
     pub async fn store(&self, addr: Addr, bytes: Vec<u8>) {
         self.call(Request::Store { addr, bytes }).await;
+    }
+
+    /// Stops the run with the error `msg` (a fatal `Invalid` error); the
+    /// call does not return.
+    pub async fn fail(&self, msg: String) {
+        self.call(Request::Fail(msg)).await;
     }
 
     /// Charges `n` scalar cycles.

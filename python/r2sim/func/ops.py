@@ -136,10 +136,18 @@ def vector(plane: Plane, desc: dict) -> None:
 
 
 def nothing(plane: Plane, desc: dict) -> None:
-    """A join or a spawn: no data."""
+    """A join, a spawn, or an IMEM_COPY (its bytes are in the control
+    plane): no data."""
 
 
-TASKS = {"dma": dma, "matmul": matmul, "vector": vector, "join": nothing, "spawn": nothing}
+TASKS = {
+    "dma": dma,
+    "matmul": matmul,
+    "vector": vector,
+    "join": nothing,
+    "spawn": nothing,
+    "imem_copy": nothing,
+}
 
 
 def task(plane: Plane, desc: dict) -> None:

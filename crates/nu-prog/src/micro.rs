@@ -501,6 +501,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         untracked: false,
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
+                        pc: None,
                         deps: Vec::new(),
                         label: None,
                         args: Args::Dma {
@@ -568,6 +569,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             untracked: false,
                             dst_mask: nu_model::FULL_MASK,
                             inferred_version: None,
+                            pc: None,
                             deps: Vec::new(),
                             label: None,
                             args: Args::Matmul {
@@ -599,6 +601,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         untracked: false,
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
+                        pc: None,
                         deps: Vec::new(),
                         label: None,
                         args: Args::Vector {
@@ -763,6 +766,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         untracked: true,
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
+                        pc: None,
                         deps: Vec::new(),
                         label: Some(items.len() as u64),
                         args: Args::Dma {
@@ -910,6 +914,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                 untracked: false,
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
+                pc: None,
                 deps,
                 label: None,
                 args: Args::Dma {
@@ -973,6 +978,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         untracked: false,
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
+                        pc: None,
                         deps,
                         label: None,
                         args: Args::Matmul {

@@ -179,6 +179,7 @@ impl Node {
             untracked: false,
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps: vec![],
             label: None,
             args: Args::Dma {
@@ -203,6 +204,7 @@ impl Node {
             untracked: false,
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
+            pc: None,
             deps,
             label: None,
             args: Args::Matmul {

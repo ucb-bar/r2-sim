@@ -175,3 +175,65 @@ fn a_bad_at_is_an_error() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("no memory \"root.gpc9.hbm\""), "{err}");
 }
+
+#[test]
+fn imem_and_data_scratch_entries_load_into_the_control_plane() {
+    // A raw image into the root's IMEM and bytes into gpc0's data
+    // scratch; both read back. The IMEM entry gives its node and offset.
+    let d = dir("core");
+    std::fs::write(d.join("code.bin"), b"\x13\x00\x00\x00code").unwrap();
+    std::fs::write(d.join("args.bin"), b"arguments").unwrap();
+    let out = run(
+        &d,
+        r#"
+[[entry]]
+name = "code"
+imem = "root"
+bin = "code.bin"
+
+[[entry]]
+name = "args"
+at = "root.gpc0.scratch+0x100"
+bin = "args.bin"
+"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (h, data) = safetensors(&d.join("out.safetensors"));
+    assert_eq!(tensor(&h, &data, "code"), b"\x13\x00\x00\x00code");
+    assert_eq!(tensor(&h, &data, "args"), b"arguments");
+    let meta = &h["__metadata__"];
+    let code: Value = serde_json::from_str(meta["code"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        (code["imem"].as_str(), code["offset"].as_str()),
+        (Some("root"), Some("0x0"))
+    );
+    let args: Value = serde_json::from_str(meta["args"].as_str().unwrap()).unwrap();
+    // gpc0's data scratch: its prefix 1 << 36 plus the end of its
+    // sync-only range, 0x1f1000000.
+    assert_eq!(args["addr"], "0x11f1000100");
+}
+
+#[test]
+fn imem_and_data_scratch_entries_stay_inside() {
+    let d = dir("core-bad");
+    std::fs::write(d.join("big.bin"), vec![0u8; 40 << 10]).unwrap();
+    let out = run(&d, "[[entry]]\nimem = \"root\"\nbin = \"big.bin\"\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("run past the IMEM"),
+        "{err}"
+    );
+    let out = run(
+        &d,
+        "[[entry]]\nat = \"root.scratch+0x100\"\nbin = \"big.bin\"\n",
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("runs past the data scratch"),
+        "{err}"
+    );
+}
