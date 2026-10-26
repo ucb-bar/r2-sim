@@ -1436,9 +1436,6 @@ impl Sim {
         n.prog_name = name;
         n.parent_task = Some((parent, task));
         n.state = ProgState::Busy;
-        if let Some(a) = self.asm.as_mut() {
-            a.start(child, name, Some(parent), self.now);
-        }
         if let Some(t) = self.tracer.as_mut() {
             let gid = self.nus[parent.0 as usize].rec(task).gid;
             t.entries_clear(child, Table::Versions, self.now);

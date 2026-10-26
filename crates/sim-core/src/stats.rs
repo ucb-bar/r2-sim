@@ -318,10 +318,6 @@ pub struct Stats {
     /// (left out of the JSON when there is none).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub caches: Vec<crate::sim::cache::CacheStats>,
-    /// The programs' listings, when recorded (`Sim::set_asm`); not in the
-    /// JSON.
-    #[serde(skip)]
-    pub asm: Vec<crate::asm::Listing>,
 }
 
 /// Resource totals at a program mark: per resource (by id), busy, culprit

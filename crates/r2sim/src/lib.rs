@@ -1,8 +1,8 @@
 //! The Radiance 2 simulator's run and its outputs: run a program on a
 //! configuration in timing mode with the Trace backend, print a summary,
 //! and write the JSON stats (`stats`), the tracer files (`trace_out`,
-//! [`trace`]), the raw trace dump for r2-vis (`trace_raw`, [`traceraw`])
-//! and the program listings (`asm`). The `r2sim` command line parses its
+//! [`trace`]) and the raw trace dump for r2-vis (`trace_raw`,
+//! [`traceraw`]). The `r2sim` command line parses its
 //! arguments into [`Options`] and calls [`run`]; [`run_program`] runs a
 //! program that is not one of `nu_prog::launch`.
 
@@ -21,7 +21,7 @@ use sim_core::{build_config_file, Built, ProfileRegistry, SimWarning, Stats};
 /// The command line.
 pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
 [--trace FILE | --synthetic SEED] [--functional trace|numeric|python|null [--functional-cmd CMD]] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--quantize tile|none] \
-[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--asm DIR] [--no-diagnostics]";
+[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]";
 
 /// A functional backend of the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +116,6 @@ pub struct Options {
     pub trace_zstd: bool,
     /// `--trace-config`: the raw dump's configuration file.
     pub trace_config: Option<PathBuf>,
-    /// `--asm DIR`: one assembly-style listing per program instance.
-    pub asm: Option<PathBuf>,
     /// `--set trace.KEY=VALUE`: trace configuration overrides.
     pub trace_sets: Vec<String>,
     /// `--set PATH=VALUE`: configuration overrides.
@@ -322,24 +320,6 @@ fn action_params(
     } else {
         nu_prog::params(text, overrides)
     }
-}
-
-/// One file per program instance: `<neutrino>.<k>.<program>.s`, k the
-/// instance's index on its Neutrino.
-fn write_asm(
-    dir: &std::path::Path,
-    sym: &sim_core::asm::Symbols,
-    listings: &[sim_core::asm::Listing],
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let mut count: BTreeMap<u32, usize> = BTreeMap::new();
-    for l in listings {
-        let k = count.entry(l.nu.0).or_default();
-        let name = format!("{}.{k}.{}.s", sym.nu(l.nu), l.name);
-        *k += 1;
-        std::fs::write(dir.join(name), sym.listing(l))?;
-    }
-    Ok(())
 }
 
 /// Runs the program `o.program` (a program of `nu_prog::launch`) on the
@@ -580,12 +560,7 @@ fn execute(
         }
         None => None,
     };
-    let symbols = a
-        .asm
-        .as_ref()
-        .map(|_| sim_core::asm::Symbols::from_built(&b));
     let mut sim = b.sim;
-    sim.set_asm(a.asm.is_some());
     match launch.start_name.take() {
         Some(name) => sim.spawn_program(launch.nu, name, launch.program),
         None => sim.spawn_named(launch.nu, launch.name, launch.program),
@@ -601,9 +576,6 @@ fn execute(
     }
     // The process backend's child exits here.
     drop(backend);
-    if let (Some(dir), Some(sym)) = (&a.asm, &symbols) {
-        write_asm(dir, sym, &stats.asm).map_err(|e| format!("--asm: {e}"))?;
-    }
     let micro = launch
         .micro
         .as_ref()

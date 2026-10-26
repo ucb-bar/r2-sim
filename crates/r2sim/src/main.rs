@@ -56,7 +56,6 @@ fn parse(argv: &[String]) -> Result<Options, String> {
             "--trace-raw" => a.trace_raw = Some(val()?.into()),
             "--trace-zstd" => a.trace_zstd = true,
             "--trace-config" => a.trace_config = Some(val()?.into()),
-            "--asm" => a.asm = Some(val()?.into()),
             "--set" => {
                 // Tracing is not part of the SoC configuration.
                 let v = val()?;

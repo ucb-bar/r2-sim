@@ -2123,7 +2123,7 @@ impl Run {
     pub async fn run(self, ctx: NuCtx) {
         for (ki, (name, plan)) in self.plans.into_iter().enumerate() {
             // The kernel's gpc and SM program instances carry its name (a
-            // tracer's program bars, asm listings); one leaked string per
+            // tracer's program bars); one leaked string per
             // kernel of the run.
             let prog: &'static str = Box::leak(name.clone().into_boxed_str());
             if self.flush {

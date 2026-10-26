@@ -18,7 +18,7 @@ Install [pixi](https://pixi.sh), then from the repository root (with Rust
 pixi run build
 mkdir -p out
 target/release/r2sim run --config configs/2p.yaml --program hello \
-  --stats out/hello.json --trace-out out/hello --asm out/asm
+  --stats out/hello.json --trace-out out/hello
 ```
 
 The `hello` program ([crates/nu-prog/src/hello.rs](crates/nu-prog/src/hello.rs))
@@ -28,8 +28,7 @@ back. The run prints its end cycle and writes:
 
 - `out/hello.json`: the statistics of the run;
 - `out/hello/`: the trace, as CSV and JSON files (`tasks.csv.gz` has one
-  row per task, `resources.csv.gz` the use of each resource over time);
-- `out/asm/`: the program as assembly text.
+  row per task, `resources.csv.gz` the use of each resource over time).
 
 To write a program, start from `hello.rs` and register it in
 `nu_prog::launch`, or define it outside the crates as in

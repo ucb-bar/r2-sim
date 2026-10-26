@@ -14,7 +14,6 @@
 //! * [`tracer`]: observation points and the in-memory collector.
 
 pub mod abi;
-pub mod asm;
 pub mod config;
 pub(crate) mod event;
 pub mod func;
