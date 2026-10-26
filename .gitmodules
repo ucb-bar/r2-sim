@@ -1,0 +1,3 @@
+[submodule "isa-tests"]
+	path = isa-tests
+	url = ../r2-isa-tests

@@ -40,3 +40,10 @@ pixi run cargo run --release --example custom
 ```
 
 `pixi run test` runs the tests.
+
+The tests include the ISA tests of the Neutrino scalar core (RV64IMC, Zicsr
+and the `nu.*` instructions) on its instruction-set simulator, `nu-iss`.
+They come from the r2-isa-tests repository, the submodule `isa-tests`:
+`git submodule update --init --recursive isa-tests` fetches them. The
+crate `nu-isa-test` builds them with clang and lld, which the pixi
+environment provides, so run these tests under `pixi run`.

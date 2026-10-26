@@ -1,0 +1,13 @@
+[package]
+name = "nu-isa-test"
+description = "Builds and runs the ISA tests of the Neutrino scalar core (r2-isa-tests): on nu-iss with a model of the version table, or in r2-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nu-iss = { path = "../nu-iss" }
+object = { version = "0.36", default-features = false, features = ["read", "std", "elf"] }
+
+[lints]
+workspace = true
