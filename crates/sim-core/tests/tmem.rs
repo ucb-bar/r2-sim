@@ -1,5 +1,5 @@
 //! The tensor memory of an SM (tmem model, 2026-10-21) on
-//! configs/2p-tmem.yaml: four banks of 64 KiB, each with a read and a
+//! configs/2p.yaml: four banks of 64 KiB, each with a read and a
 //! write port of 128 B/cycle, latency 5. The Atlas reads A and B from the
 //! tmem and is output stationary: a partial C stays in its accumulator
 //! (128 KiB by default, two 128 x 128 fp32 tiles); a partial C outside the
@@ -15,7 +15,7 @@ const T: u64 = 128;
 const BANK: u64 = 64 << 10;
 
 fn tmem(sets: &[&str]) -> Result<Built, sim_core::ConfigError> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p-tmem.yaml");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
     build_config_file(&path, sets, ProfileRegistry::with_builtins())
 }
 

@@ -1,4 +1,4 @@
-//! The hierarchy of RV programs on configs/2p.yaml: IMEM_COPY on the
+//! The hierarchy of RV programs on configs/2p-smem.yaml: IMEM_COPY on the
 //! instruction DMA, SPAWN of RV children, and the three-level image
 //! (tests/fixtures/rv/three-level.bin): a device program, a program on
 //! each cluster, a program on each SM.

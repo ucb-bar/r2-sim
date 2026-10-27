@@ -281,7 +281,7 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
             .args([
                 "run",
                 "--config",
-                "configs/2p.yaml",
+                "configs/2p-smem.yaml",
                 "--program",
                 "micro",
                 "--param",
@@ -328,7 +328,7 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
 
 #[test]
 fn trace_raw_flags_untracked_tasks() {
-    // micro mode=untracked on configs/2p.yaml: two SMs each copy 64 KiB
+    // micro mode=untracked on configs/2p-smem.yaml: two SMs each copy 64 KiB
     // into their gpc's DRAM in four untracked DMA tasks, fence, and signal
     // the device with a join. The DMA records have flags bit 0, version,
     // queued and sent null, and nu = src_nu (the invoking SM).
@@ -337,7 +337,13 @@ fn trace_raw_flags_untracked_tasks() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let out = Command::new(env!("CARGO_BIN_EXE_r2sim"))
         .current_dir(&root)
-        .args(["run", "--config", "configs/2p.yaml", "--program", "micro"])
+        .args([
+            "run",
+            "--config",
+            "configs/2p-smem.yaml",
+            "--program",
+            "micro",
+        ])
         .args(["--param", "mode=untracked", "--param", "sms=2"])
         .args(["--param", "placement=spread", "--param", "bytes=65536"])
         .args(["--param", "chunk=16384", "--trace-raw"])

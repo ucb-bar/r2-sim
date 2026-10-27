@@ -1,4 +1,4 @@
-//! Shared parts of the nu-rv tests: configs/2p.yaml, an encoder of the
+//! Shared parts of the nu-rv tests: configs/2p-smem.yaml, an encoder of the
 //! few instructions the tests need, descriptor bytes, a tracer that keeps
 //! the invoked descriptors, and a run of an RV root program.
 
@@ -12,7 +12,7 @@ use nu_rv::{Abi, RvProgram};
 use sim_core::{build_config_file, Built, Descriptor, ProfileRegistry, Stats, TaskEntered, Tracer};
 
 pub fn two_p() -> Built {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p-smem.yaml");
     build_config_file(&path, &[] as &[&str], ProfileRegistry::with_builtins()).expect("config")
 }
 
@@ -175,7 +175,7 @@ impl Tracer for Tasks {
     }
 }
 
-/// A run of an RV root program on 2p.yaml.
+/// A run of an RV root program on 2p-smem.yaml.
 pub struct Run {
     pub stats: Stats,
     pub tasks: Vec<Descriptor>,

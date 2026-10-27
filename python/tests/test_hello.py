@@ -1,5 +1,5 @@
 """End to end: `r2sim run --program rv` with the RV hello fixture
-(crates/nu-rv/tests/fixtures/rv/hello.bin) on configs/2p.yaml, with the
+(crates/nu-rv/tests/fixtures/rv/hello.bin) on configs/2p-smem.yaml, with the
 Python plane (`--functional python`) and a memory image. A and B are
 random bf16 matrices from a fixed seed; C, read back with --image-out, must
 equal numpy's A @ B computed in fp32 and rounded to bf16 once (exact
@@ -63,7 +63,7 @@ shape = [128, 128]
     )
     out = tmp_path / "out.safetensors"
     subprocess.run(
-        [str(r2sim()), "run", "--config", str(REPO / "configs/2p.yaml"), "--program", "rv",
+        [str(r2sim()), "run", "--config", str(REPO / "configs/2p-smem.yaml"), "--program", "rv",
          "--functional", "python", "--image", str(tmp_path / "image.toml"),
          "--image-out", str(out)],
         check=True, stdout=subprocess.DEVNULL,
@@ -108,7 +108,7 @@ shape = [128, 128]
     for backend in ["numeric", "python"]:
         out = tmp_path / f"{backend}.safetensors"
         subprocess.run(
-            [str(r2sim()), "run", "--config", str(REPO / "configs/2p.yaml"), "--program", "rv",
+            [str(r2sim()), "run", "--config", str(REPO / "configs/2p-smem.yaml"), "--program", "rv",
              "--functional", backend, "--image", str(tmp_path / "image.toml"),
              "--image-out", str(out)],
             check=True, stdout=subprocess.DEVNULL,

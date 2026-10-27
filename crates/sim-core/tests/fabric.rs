@@ -1,5 +1,5 @@
 //! The YAML loader and the fabric (r2sim spec Section 10) on
-//! tests/configs/two_sm.yaml and configs/2p.yaml: charging by bus
+//! tests/configs/two_sm.yaml and configs/2p-smem.yaml: charging by bus
 //! topology, the per-type tensor rate, includes, names and child-entry
 //! overrides, NUMA slices, route selection by target address, and route
 //! checks.
@@ -207,13 +207,13 @@ fn the_2p_family_passes_the_loader_check() {
             n += 1;
         }
     }
-    assert_eq!(n, 10, "the 2p*.yaml files (2p-tmem.yaml since 2026-10-21)");
+    assert_eq!(n, 2, "the 2p*.yaml files: 2p.yaml and 2p-smem.yaml");
 }
 
-/// The 2p family's configs/2p.yaml.
+/// The 2p family's configs/2p-smem.yaml.
 fn two_p() -> Built {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
-    build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).expect("2p.yaml")
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p-smem.yaml");
+    build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).expect("2p-smem.yaml")
 }
 
 /// The resource names on the route a DMA engine `pe` takes from the block
@@ -275,7 +275,7 @@ fn every_gpc_owns_its_hbm_slice() {
 
 #[test]
 fn one_gpc_file_is_instantiated_twice() {
-    // configs/2p.yaml lists gpc0 and gpc1 from gpc.yaml, which lists sm0 to
+    // configs/2p-smem.yaml lists gpc0 and gpc1 from gpc-smem.yaml, which lists sm0 to
     // sm3: eight SMs, named by their parent, in distinct spaces.
     let b = two_p();
     let mut spaces = Vec::new();
@@ -783,10 +783,10 @@ device:
 
 #[test]
 fn a_clock_key_scales_the_slots_of_its_element() {
-    // configs/2p.yaml with clocks on an SMEM, a crossbar, a link and an
+    // configs/2p-smem.yaml with clocks on an SMEM, a crossbar, a link and an
     // Atlas (r2sim spec Section 5.2): slots per core cycle are
     // `bw_bytes / beat_bytes x clock`, and `clock` for a compute unit.
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p-smem.yaml");
     let build = |sets: &[&str]| build_config_file(&path, sets, ProfileRegistry::with_builtins());
     let b = build(&[
         "root.gpc0.sm1.smem.clock=7/8",

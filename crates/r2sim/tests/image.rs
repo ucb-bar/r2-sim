@@ -1,4 +1,4 @@
-//! The memory image (`--image`, `--image-out`) on configs/2p.yaml with the
+//! The memory image (`--image`, `--image-out`) on configs/2p-smem.yaml with the
 //! Numeric backend: every kind of entry loads and reads back, and an entry
 //! outside a numeric memory block is an error.
 
@@ -28,7 +28,7 @@ fn run(d: &Path, toml: &str) -> std::process::Output {
     std::fs::write(d.join("image.toml"), text).unwrap();
     Command::new(R2SIM)
         .args(["run", "--config"])
-        .arg(root.join("../../configs/2p.yaml"))
+        .arg(root.join("../../configs/2p-smem.yaml"))
         .args(["--program", "rv", "--functional", "numeric", "--image"])
         .arg(d.join("image.toml"))
         .arg("--image-out")

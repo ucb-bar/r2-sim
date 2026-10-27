@@ -1,4 +1,4 @@
-//! The hello image (tests/fixtures/rv/hello.bin) on configs/2p.yaml: the
+//! The hello image (tests/fixtures/rv/hello.bin) on configs/2p-smem.yaml: the
 //! device loads A and B from gpc0's DRAM into root.gpc0.sm0's SMEM,
 //! multiplies them on that SM's Atlas, and copies C back to the DRAM.
 

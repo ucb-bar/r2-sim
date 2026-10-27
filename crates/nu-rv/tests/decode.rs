@@ -1,5 +1,5 @@
 //! The descriptor decoder against the layout of ABI version 1 (a 24-byte
-//! header, the keys, the arguments of the opcode), on configs/2p.yaml.
+//! header, the keys, the arguments of the opcode), on configs/2p-smem.yaml.
 
 mod common;
 
@@ -53,7 +53,7 @@ fn the_pe_order_is_by_increasing_pe_id() {
 
 #[test]
 fn the_key_bits_are_the_address_bits_less_the_granule_shift() {
-    // 2p.yaml: the highest own space is gpc1's sm3, (2 << 36) | (4 << 33)
+    // 2p-smem.yaml: the highest own space is gpc1's sm3, (2 << 36) | (4 << 33)
     // plus 8 GiB: 38 bits; granule 512 B.
     let abi = Abi::new(&two_p());
     assert_eq!((abi.granule_shift, abi.key_bits), (9, 29));

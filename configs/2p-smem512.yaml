@@ -1,9 +1,0 @@
-# 2p.yaml with 2 MiB of SMEM per SM (the 5b item 3b target size) as two
-# banks of 1 MiB, each with a read port and a write port of 256 B/cycle
-# (512 B/cycle over the two banks; sm.yaml has 128 per bank). The Atlas
-# rates are those of sm.yaml.
-base: 2p.yaml
-set:
-  - "root.gpc*.sm*.smem.addr=[[0x0, 0x200000]]"
-  - root.gpc*.sm*.smem.bw_bytes=256
-  - root.gpc*.sm*.smem.wr_bytes=256

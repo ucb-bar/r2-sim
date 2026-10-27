@@ -1,5 +1,0 @@
-# 2p-cmem64.yaml with 1.5 GiB of cmem per gpc (5b item 2): the whole
-# action expert fits in cmem.
-base: 2p-cmem64.yaml
-set:
-  - "root.gpc*.cmem.addr=[[0x100000000, 0x160000000]]"

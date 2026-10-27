@@ -1,5 +1,5 @@
 #!/bin/bash
-# Golden check: runs the RV image rows below on configs/2p.yaml and
+# Golden check: runs the RV image rows below on configs/2p-smem.yaml and
 # compares them with a reference run.
 #
 #   tools/golden.sh record DIR        # run the rows into DIR (the reference)
@@ -24,7 +24,7 @@ run_all() {
   run() { # name image [arguments]
     local name=$1 image=$2
     shift 2
-    "$R2SIM" run --config configs/2p.yaml --program rv --image "$FIXTURES/$image.toml" \
+    "$R2SIM" run --config configs/2p-smem.yaml --program rv --image "$FIXTURES/$image.toml" \
       "$@" --stats "$out/$name.json" ${GOLDEN_ARGS:-} > "$out/$name.log" 2>&1
   }
   run encoder_a0 encoder --acc-buffer 0 &

@@ -1,7 +1,6 @@
-# gpc.yaml with SMs that have a tmem (sm-tmem.yaml; tmem model,
-# 2026-10-21). The rest is gpc.yaml: two crossbars (data and control),
-# its HBM slice with a copy engine, and four SMs, addressed root.gpcN.sm0
-# .. sm3.
+# A gpc of the 2p family without the tensor memory: two crossbars (data
+# and control), its HBM slice with a copy engine, and four SMs without a
+# tmem (sm-smem.yaml), addressed root.gpcN.sm0 .. sm3.
 
 # Data bridge to the device: 256 B/cycle each way, latency 20 cycles.
 # SMEM keeps data (router outputs, activations); HBM has no values:
@@ -30,7 +29,7 @@ memory:
 compute:
   # Copy engine: every write into the slice is a task of the gpc on it, a
   # pull from the writing SM (Neutrino spec Section 3); 8 transfers in flight, chunks
-  # issued at the beat rate (see sm.yaml). No burst_bytes.
+  # issued at the beat rate (see sm-smem.yaml). No burst_bytes.
   # Beat 512 B: sized to the bus it masters (clsbus, 512 B/cycle).
   - {name: dma, type: dma, latency: 10, inflight: 8, beat_bytes: 512, master: [$this.clsbus]}
 # Version table 1024: one entry per HBM output block in flight (up to 896
@@ -38,7 +37,7 @@ compute:
 # block per token tile).
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 1024, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
 children:
-  - {name: sm0, config: sm-tmem.yaml}
-  - {name: sm1, config: sm-tmem.yaml}
-  - {name: sm2, config: sm-tmem.yaml}
-  - {name: sm3, config: sm-tmem.yaml}
+  - {name: sm0, config: sm-smem.yaml}
+  - {name: sm1, config: sm-smem.yaml}
+  - {name: sm2, config: sm-smem.yaml}
+  - {name: sm3, config: sm-smem.yaml}

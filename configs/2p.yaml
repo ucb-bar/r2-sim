@@ -1,6 +1,7 @@
-# Radiance-2P for the pi0 forward-pass study. Every number is a knob to be
-# swept; the comments give the reason for the starting value. Clock: 1 GHz
-# reference, so 1 cycle = 1 ns.
+# Radiance-2P: a device with two gpcs of four SMs, and a tensor memory
+# (tmem) in every SM (tmem model, 2026-10-21; the data paths are
+# provisional). Every number is a knob; the comments give the reason for
+# the starting value. Clock: 1 GHz reference, so 1 cycle = 1 ns.
 #
 # Flow control of forwarded invokes: ready/valid (2026-09-30; Neutrino spec
 # Section 9.2). Every protocol class has its own channel with one message

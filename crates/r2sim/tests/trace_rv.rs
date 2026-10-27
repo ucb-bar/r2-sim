@@ -17,13 +17,13 @@ fn dir(test: &str) -> PathBuf {
     d
 }
 
-/// Runs r2sim on configs/2p.yaml with `args` and a raw dump into
+/// Runs r2sim on configs/2p-smem.yaml with `args` and a raw dump into
 /// `d/raw`; the manifest.
 fn run(d: &Path, args: &[&str]) -> Value {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out = Command::new(env!("CARGO_BIN_EXE_r2sim"))
         .args(["run", "--config"])
-        .arg(root.join("../../configs/2p.yaml"))
+        .arg(root.join("../../configs/2p-smem.yaml"))
         .args(args)
         .arg("--trace-raw")
         .arg(d.join("raw"))

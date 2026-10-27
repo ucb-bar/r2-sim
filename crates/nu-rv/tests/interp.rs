@@ -1,5 +1,5 @@
 //! The interpreter on hand-encoded programs, as the root program of
-//! configs/2p.yaml: the requests of the `nu.*` instructions, loads from
+//! configs/2p-smem.yaml: the requests of the `nu.*` instructions, loads from
 //! other nodes, the instruction costs, and each error.
 
 mod common;
@@ -8,7 +8,7 @@ use common::{fatal, image, k, run, run_on, rv, two_p, Desc};
 use nu_model::{Addr, Range};
 use sim_core::OpcodeId;
 
-/// The root's data scratch (2p.yaml: after the sync-only range).
+/// The root's data scratch (2p-smem.yaml: after the sync-only range).
 const SCRATCH: u64 = 0x1_F100_0000;
 /// The root's sync-only range.
 const SYNC: u64 = 0x1_F000_0000;

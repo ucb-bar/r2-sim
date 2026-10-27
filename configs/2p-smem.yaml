@@ -1,5 +1,7 @@
-# 2p.yaml plus a cluster memory tier: one cmem SRAM block of 64 MiB per
-# gpc (5b item 2, gpc-cmem.yaml). The rest of this file is 2p.yaml.
+# Radiance-2P without the tensor memory: 2p.yaml with SMs that have no
+# tmem (gpc-smem.yaml, sm-smem.yaml). The Atlas reads its operands from the
+# SMEM and writes C into the SMEM; its accumulator holds 1 MiB. Every
+# number is a knob; the comments give the reason for the starting value.
 # Clock: 1 GHz reference, so 1 cycle = 1 ns.
 #
 # Flow control of forwarded invokes: ready/valid (2026-09-30; Neutrino spec
@@ -9,9 +11,9 @@
 # selects the ticket scheme for comparison.
 #
 # The tree (r2sim spec Section 10): root (the device: its sync space and
-# its Neutrino), gpc0 and gpc1 (gpc.yaml, each with its HBM slice and four
-# SMs, sm.yaml), addressed root.gpc1.sm2. Data buses carry DMA chunks,
-# loads and stores; control buses carry the protocol messages.
+# its Neutrino), gpc0 and gpc1 (gpc-smem.yaml, each with its HBM slice and
+# four SMs, sm-smem.yaml), addressed root.gpc1.sm2. Data buses carry DMA
+# chunks, loads and stores; control buses carry the protocol messages.
 #
 # Own spaces (offset_bits 33 = 8 GiB per node; fields gpc:2, sm:3):
 #   root          0x00_0000_0000   the device sync space
@@ -31,7 +33,8 @@ global:
 device:
   name: root
   fabric:
-    # Data between the gpcs: 512 B/cycle per port.
+    # Data between the gpcs: 512 B/cycle per port, with separate read and
+    # write channels at that rate (Radiance 2 spec Section 3.4).
     - {name: sbus, topology: xbar, bw_bytes: 512, wr_bytes: 512}
     # Control between the gpcs: 8 B/cycle per port (2026-10-20):
     # a 64 B message beat takes 8 cycles on each control hop.
@@ -40,5 +43,5 @@ device:
     - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
   neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32}
   children:
-    - {name: gpc0, config: gpc-cmem.yaml}
-    - {name: gpc1, config: gpc-cmem.yaml}
+    - {name: gpc0, config: gpc-smem.yaml}
+    - {name: gpc1, config: gpc-smem.yaml}

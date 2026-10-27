@@ -123,9 +123,9 @@ fn bad_parameters_are_errors() {
     assert!(err(&["mem=\"l3\""]).contains("unknown mem"));
 }
 
-/// Launches `micro` with `params` on configs/2p-tmem.yaml.
+/// Launches `micro` with `params` on configs/2p.yaml.
 fn tmem_launch(params: &[&str]) -> Result<Value, String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p-tmem.yaml");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
     let mut b =
         build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).expect("config");
     let ov: Vec<String> = params.iter().map(|s| s.to_string()).collect();
@@ -145,7 +145,7 @@ fn tmem_launch(params: &[&str]) -> Result<Value, String> {
 #[test]
 fn tmem_chains_on_one_sm() {
     // Two tiles of a 128 x 128 x 512 bf16 GEMM in chains of 4 matmuls of
-    // kc 128 on 2p-tmem.yaml (tmem model, 2026-10-21): 16,777,216 MACs at
+    // kc 128 on 2p.yaml (tmem model, 2026-10-21): 16,777,216 MACs at
     // 8192 per cycle, 2048 cycles at best.
     let r = tmem_launch(&["mode=\"tmem\"", "k=512", "tiles=2"]).unwrap();
     assert_eq!(r["macs"], 2 * 128 * 128 * 512);

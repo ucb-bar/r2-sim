@@ -17,7 +17,7 @@ Install [pixi](https://pixi.sh), then from the repository root (with Rust
 ```bash
 pixi run build
 mkdir -p out
-target/release/r2sim run --config configs/2p.yaml --program rv \
+target/release/r2sim run --config configs/2p-smem.yaml --program rv \
   --image crates/nu-rv/tests/fixtures/rv/hello.toml \
   --stats out/hello.json --trace-out out/hello
 ```
@@ -26,7 +26,10 @@ target/release/r2sim run --config configs/2p.yaml --program rv \
 memory image `hello.toml` loads the program `hello.bin` into that IMEM.
 The program copies two 128 x 128 bf16 tiles from the DRAM of a cluster
 into the SMEM of an SM, multiplies them on the Atlas of that SM, and
-copies the product back. The run prints its end cycle and writes:
+copies the product back. The main configuration, configs/2p.yaml, has a
+tensor memory in every SM, and its Atlas reads its operands from that
+memory; the hello image keeps its operands in the SMEM, so it runs on
+configs/2p-smem.yaml. The run prints its end cycle and writes:
 
 - `out/hello.json`: the statistics of the run;
 - `out/hello/`: the trace, as CSV and JSON files (`tasks.csv.gz` has one

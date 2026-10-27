@@ -1,4 +1,12 @@
-# One SM of the 2p family. All eight are identical.
+# One SM of the 2p family, with a tensor memory (tmem model, 2026-10-21).
+# All eight are identical.
+#
+# * tmem: four banks on lbus. The Atlas reads A and B from the tmem and is
+#   output stationary: the partial C of a chain stays in its accumulator,
+#   and the last task writes C in its output type into the tmem. The
+#   accumulator is double-buffered, as in the taped-out Atlas
+#   (2026-10-21): acc_buffer 131072, two 128 x 128 fp32 tiles, so one tile
+#   drains while the next accumulates. The data paths are provisional.
 #
 # * Bridge to the gpc: 128 B/cycle each way (half the SMEM's two read
 #   ports together, so one SM cannot saturate the gpc crossbar alone),
@@ -24,8 +32,8 @@
 #   bf16 8192, fp8 16384, mxfp4 32768 (30840 would saturate exactly, so a
 #   pure mxfp4 tile is about 6 % SMEM-bound). A tile of mixed types runs at
 #   the slower operand's rate. quantize = tile charges a 51-token row as a
-#   full 128-row tile (the padding-waste assumption of workload 1). A 1 MiB
-#   accumulator (acc_buffer).
+#   full 128-row tile (the padding waste of a short row tile). The
+#   accumulator holds one fp32 output tile (see the head of the file).
 # * Muon: 256 lane-op/cycle (a 16 x 16 SIMT core), overhead 50 cycles per
 #   task for launch and the reduction tail.
 # * DMA: issue latency 10 cycles (2026-10-21; before, 100 from before any
@@ -43,8 +51,7 @@
 #   inbound ref table 128, inbound invoke table 64, outbound dep table 128,
 #   outbound invoke table 32; c_invoke 8 cycles. Version table 256
 #   (2026-09-28; the gpcs have 1024). The outbound and inbound invoke
-#   tables count messages (a multi-beat message is one entry). The 5a
-#   values are in 2p-smallrefs.yaml.
+#   tables count messages (a multi-beat message is one entry).
 
 fabric:
   - {name: smsbus, topology: xbar}
@@ -58,9 +65,13 @@ memory:
   - {name: smem, type: scratch, addr: [[0x0, 0x100000]], banks: 2, bw_bytes: 128, wr_bytes: 128, latency: 10,
      slave: [$this.lbus, $this.smsbus]}
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+  # The tensor memory (tmem model, 2026-10-21): four banks of 64 KiB, each
+  # with a read port and a write port of 128 B/cycle, read latency 5. A
+  # slave on lbus only: the SM's own DMA engine reaches it, no other node.
+  - {name: tmem, type: tmem, addr: [[0x1000000, 0x1040000]], banks: 4, bw_bytes: 128, wr_bytes: 128, latency: 5, slave: [$this.lbus]}
 compute:
   - {name: atlas, type: tensor, rate: {bf16: 8192, fp8: 16384, mxfp4: 32768},
-     quantize: tile, operand_reuse: none, acc_buffer: 1048576, master: [$this.lbus]}
+     quantize: tile, operand_reuse: none, acc_buffer: 131072, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 256}, overhead: 50, master: [$this.lbus, $this.smsbus]}
   # DMA beat 256 B: the two SMEM banks together (its buses are
   # unlimited); one transfer writes one bank at 128 B/cycle.

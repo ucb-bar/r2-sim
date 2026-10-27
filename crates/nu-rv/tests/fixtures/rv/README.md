@@ -1,14 +1,14 @@
 # RV test images
 
 Each image `NAME.bin` has an image file `NAME.toml` that loads it into
-the IMEM of the root node, for `r2sim run --config configs/2p.yaml
+the IMEM of the root node, for `r2sim run --config configs/2p-smem.yaml
 --program rv --image NAME.toml`. The golden check (`tools/golden.sh`)
 runs the three images.
 
 `hello.bin` (384 bytes) is a device program as an RV64 program: it loads
 two tiles into the SMEM of an SM, multiplies them there and copies the
 product back. The image was built by the r2-toolchain
-(`r2-build --config configs/2p.yaml`) from this source:
+(`r2-build --config configs/2p-smem.yaml`) from this source:
 
 ```rust
 #[nu_program(node = root, stack = 4096)]
@@ -96,7 +96,7 @@ entry 0x2a.
 `encoder.bin` (5768 bytes) is a vision encoder kernel (27 layers of width
 1152, 16 heads of 72, an FFN of 4304, three images of 256 patches, and a
 projector to a width of 2048), built by the r2-toolchain for
-configs/2p.yaml. It models time only: the functional plane does not
+configs/2p-smem.yaml. It models time only: the functional plane does not
 compute its values. The image holds every program of the kernel: the
 device program `encoder` (node type `root`) embeds the image of the
 cluster program `encoder_cluster` (node type `gpc`), which embeds the

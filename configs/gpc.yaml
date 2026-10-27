@@ -1,6 +1,6 @@
-# A gpc of the 2p family without cmem: two crossbars (data and control),
-# its HBM slice with a copy engine, and four SMs (sm.yaml), addressed
-# root.gpcN.sm0 .. sm3.
+# A gpc of the 2p family: two crossbars (data and control), its HBM slice
+# with a copy engine, and four SMs with a tensor memory (sm.yaml),
+# addressed root.gpcN.sm0 .. sm3.
 
 # Data bridge to the device: 256 B/cycle each way, latency 20 cycles.
 # SMEM keeps data (router outputs, activations); HBM has no values:
