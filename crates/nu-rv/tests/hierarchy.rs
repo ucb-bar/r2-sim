@@ -294,3 +294,108 @@ fn the_errors_of_imem_copy_and_spawn() {
         "{e}"
     );
 }
+
+/// A child image of `bytes` bytes for node type `gpc`: at offset 4 the
+/// start code (it jumps to the entry in the start mailbox at offset 0 of
+/// the node's data scratch, prefix + 0x1f1000000 on 2p), `nu.exit` at
+/// 0x40 and 0x50, and a record named `name` with entry 0x40 at `rec`.
+fn child_image(bytes: usize, name: &str, rec: usize) -> Vec<u8> {
+    let slli = |rd: u32, rs1: u32, sh: u32| (sh << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x13;
+    let start = [
+        rv::csrr(rv::T0, 0xfc0),
+        rv::addi(rv::T1, rv::ZERO, 0x1f1),
+        slli(rv::T1, rv::T1, 24),
+        rv::add(rv::T0, rv::T0, rv::T1),
+        rv::ld(rv::T1, rv::T0, 0),
+        rv::jalr(rv::ZERO, rv::T1, 0),
+    ];
+    let mut m = vec![0u8; bytes];
+    for (i, w) in start.iter().enumerate() {
+        m[4 + 4 * i..8 + 4 * i].copy_from_slice(&w.to_le_bytes());
+    }
+    for at in [0x40, 0x50] {
+        m[at..at + 4].copy_from_slice(&rv::exit().to_le_bytes());
+    }
+    m[rec..rec + 8].copy_from_slice(&0x40u64.to_le_bytes());
+    m[rec + 8..rec + 12].copy_from_slice(&1u32.to_le_bytes());
+    m[rec + 24..rec + 24 + name.len()].copy_from_slice(name.as_bytes());
+    m[rec + 56..rec + 59].copy_from_slice(b"gpc");
+    m
+}
+
+/// A SPAWN of the root on gpc0 at `entry`, done at sync + `done`.
+fn spawn(entry: u32, done: u64) -> Desc {
+    let mut args = 0u16.to_le_bytes().to_vec();
+    args.extend(0u16.to_le_bytes());
+    args.extend(entry.to_le_bytes());
+    args.extend(0u64.to_le_bytes());
+    Desc {
+        opcode: 1,
+        pe: 0,
+        flags: 0,
+        base: (SYNC + done) >> 9,
+        bound: 1,
+        mask: u32::MAX,
+        deps: vec![],
+        args,
+    }
+}
+
+#[test]
+fn a_started_program_is_named_from_the_image_its_node_loaded() {
+    // The root copies image A (0x300 B, record "big" at 0x200) into
+    // gpc0's IMEM and starts it; then the smaller image B (0x100 B,
+    // record "small" at 0x80, the same entry 0x40) and starts it. A's
+    // record is still in the IMEM past B's end, but B's program is
+    // "small". A start at entry 0x50, which no record of B names, is "rv".
+    let (a, bimg) = (
+        child_image(0x300, "big", 0x200),
+        child_image(0x100, "small", 0x80),
+    );
+    let steps = [
+        copy(0, 0x1000, 0, 0x300, SYNC),
+        spawn(0x40, 0x200),
+        copy(0, 0x1400, 0, 0x100, SYNC + 0x400),
+        spawn(0x40, 0x600),
+        spawn(0x50, 0x800),
+    ];
+    let waits = [0, 0x200, 0x400, 0x600, 0x800];
+    let mut code = Vec::new();
+    let mut consts = Vec::new();
+    let mut scratch = Vec::new();
+    for (i, (d, w)) in steps.iter().zip(waits).enumerate() {
+        let at = 0x100 + 0x80 * i;
+        scratch.push((at, d.bytes()));
+        consts.push(SCRATCH + at as u64);
+        consts.push((SYNC + w) >> 9);
+        code.extend([
+            k(rv::A0, 2 * i as i32),
+            rv::invoke(rv::A1, rv::A0),
+            k(rv::T0, 2 * i as i32 + 1),
+            rv::wait(rv::T0),
+        ]);
+    }
+    code.push(rv::exit());
+    let mut img = image(&code, &consts);
+    img.resize(0x1500, 0);
+    img[0x1000..0x1300].copy_from_slice(&a);
+    img[0x1400..0x1500].copy_from_slice(&bimg);
+    let b = two_p();
+    {
+        let core = b.sim.core(NeutrinoId(0));
+        let mut m = core.mem.borrow_mut();
+        for (at, d) in &scratch {
+            m.scratch()[*at..*at + d.len()].copy_from_slice(d);
+        }
+    }
+    let gpc0 = b.nu("root.gpc0");
+    let (s, seen, _) = run_traced(b, &img);
+    assert_eq!(s.fatal, None);
+    let names: Vec<&str> = seen
+        .programs
+        .iter()
+        .filter(|p| p.0 == gpc0)
+        .map(|p| p.1)
+        .collect();
+    assert_eq!(names, ["big", "small", "rv"]);
+}

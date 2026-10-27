@@ -336,12 +336,12 @@ impl RvProgram {
             Some(e) => e,
             None => {
                 let t = abi::node_type(&node.path);
-                let found = find_record(core.mem.borrow_mut().imem(), t);
+                let found = loaded_records(&mut core.mem.borrow_mut(), t);
                 match found.as_slice() {
                     [r] => r.entry,
                     rs => {
                         return fail(format!(
-                            "{} program records of node type {t} in the IMEM, not one",
+                            "{} program records of node type {t} in the loaded image, not one",
                             rs.len()
                         ))
                         .await
@@ -441,7 +441,11 @@ impl RvProgram {
                                 done: done.base >> self.abi.granule_shift,
                                 limit: self.limit,
                             };
-                            let name = ProgramName::AtStart(Box::new(record_name(&self.abi, nu)));
+                            let name = ProgramName::AtStart(Box::new(record_name(
+                                &self.abi,
+                                nu,
+                                Some(entry as u64),
+                            )));
                             ctx.spawn_program(nu, name, done, deps, Some(pc), move |c| {
                                 program.run(c)
                             })
@@ -505,13 +509,28 @@ impl RvProgram {
     }
 }
 
+/// The records of node type `node` in the image loaded into `mem`: the
+/// bytes of the last image load or IMEM copy at offset 0
+/// (`CoreMem::image`), so that records left over from a larger image
+/// loaded before do not count. Without a recorded load (an IMEM written
+/// directly), the whole IMEM.
+fn loaded_records(mem: &mut CoreMem, node: &str) -> Vec<Record> {
+    let n = mem.image.as_ref().map_or(usize::MAX, |i| i.bytes as usize);
+    let imem = mem.imem();
+    find_record(&imem[..n.min(imem.len())], node)
+}
+
 /// The name of the program that starts on `nu`: the record of the node's
-/// type in its IMEM ("rv" when there is not exactly one). Read when the
-/// program starts: the IMEM holds the image only after its copy.
-fn record_name(abi: &Abi, nu: NeutrinoId) -> impl FnOnce() -> &'static str {
+/// type in its loaded image, and with `entry` (a spawn's) the record with
+/// that entry; "rv" when there is not exactly one. Read when the program
+/// starts: the IMEM holds the image only after its copy.
+fn record_name(abi: &Abi, nu: NeutrinoId, entry: Option<u64>) -> impl FnOnce() -> &'static str {
     let (core, path) = (abi.node(nu).core.clone(), abi.node(nu).path.clone());
     move || {
-        let found = find_record(core.mem.borrow_mut().imem(), abi::node_type(&path));
+        let found: Vec<Record> = loaded_records(&mut core.mem.borrow_mut(), abi::node_type(&path))
+            .into_iter()
+            .filter(|r| entry.is_none_or(|e| r.entry == e))
+            .collect();
         match found.as_slice() {
             [r] => intern(&r.name),
             _ => "rv",
@@ -542,7 +561,7 @@ pub fn launch(b: &Built, args: u64, limit: u64) -> Result<nu_prog::Launch, Strin
     let abi = Rc::new(Abi::new(b));
     let root = NeutrinoId(0);
     abi.node(root).scratch.as_ref().map_err(Clone::clone)?;
-    let name = ProgramName::AtStart(Box::new(record_name(&abi, root)));
+    let name = ProgramName::AtStart(Box::new(record_name(&abi, root, None)));
     let p = RvProgram::root(abi, args, limit);
     let mut l = nu_prog::Launch::new(root, "rv", move |ctx| p.run(ctx));
     l.start_name = Some(name);
