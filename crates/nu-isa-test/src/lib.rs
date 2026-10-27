@@ -479,7 +479,7 @@ mod tests {
             sim_outcome(false, text, Some(0x200)),
             Outcome::Error(_)
         ));
-        let ok = sim_outcome(true, "end 1234 cycles (0 steps)", None);
+        let ok = sim_outcome(true, "end 1234 cycles, driver scalar 0.100", None);
         assert_eq!(
             ok,
             Outcome::Pass {

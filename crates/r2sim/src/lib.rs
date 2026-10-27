@@ -3,8 +3,7 @@
 //! and write the JSON stats (`stats`), the tracer files (`trace_out`,
 //! [`trace`]) and the raw trace dump for r2-vis (`trace_raw`,
 //! [`traceraw`]). The `r2sim` command line parses its
-//! arguments into [`Options`] and calls [`run`]; [`run_program`] runs a
-//! program that is not one of `nu_prog::launch`.
+//! arguments into [`Options`] and calls [`run`].
 
 pub mod image;
 mod sha256;
@@ -26,7 +25,7 @@ pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [-
 /// A functional backend of the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Functional {
-    /// Routing records and memory (`func::Trace`).
+    /// Memory without compute: DMA copies and stores (`func::Trace`).
     Trace,
     /// Memory and numerics in Rust (`func::Numeric`).
     Numeric,
@@ -253,17 +252,9 @@ struct Out<'a> {
     cocharge: &'static str,
     flow: &'static str,
     end_time: u64,
-    step_end: Vec<u64>,
-    step_time: Vec<u64>,
-    hbm_bytes: u64,
-    /// HBM bytes loaded again by a program (0: no program reports it).
-    mqa_dup_bytes: u64,
-    hbm_rate_bytes_per_cycle: f64,
-    hbm_bound_cycles: u64,
-    end_over_hbm_bound: f64,
-    /// The central driver's instruction throughput used (busy / end): at 1
-    /// the driver is the bottleneck.
-    /// The busiest driver's scalar utilization.
+    /// The scalar utilization (busy / end) of the Neutrino that runs the
+    /// program (the root for an RV run): at 1 its program is the
+    /// bottleneck.
     driver_scalar_utilization: f64,
     wall_seconds: f64,
     events: u64,
@@ -362,38 +353,7 @@ fn rv_launch(a: &Options, b: &Built) -> Result<nu_prog::Launch, String> {
     nu_rv::launch(b, args, limit)
 }
 
-/// Runs the program that `launch` builds on the configuration `o.config`
-/// (its `program` and `params` are not used) and writes the outputs that
-/// `o` asks for, as [`run`] does.
-pub fn run_program(
-    o: &Options,
-    launch: impl FnOnce(&Built) -> Result<nu_prog::Launch, String>,
-) -> Result<(), String> {
-    let cfg_path = o.config.clone().ok_or(USAGE)?;
-    let mut b = build_config_file(&cfg_path, &o.sets, ProfileRegistry::with_builtins())
-        .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
-    for w in &b.warnings {
-        eprintln!("r2sim: warning: {}: {w}", cfg_path.display());
-    }
-    let granule = b
-        .sim
-        .neutrino_config(nu_model::NeutrinoId(0))
-        .tables
-        .granule;
-    if let Some(on) = o.row_panel {
-        b.sim.set_atlas_row_panel(on);
-    }
-    if let Some(bytes) = o.acc_buffer {
-        b.sim.set_atlas_acc_buffer(bytes);
-    }
-    let launch = launch(&b)?;
-    let program = launch.name.to_string();
-    let cfg = cfg_path.display().to_string();
-    execute(o, b, launch, &cfg, program, granule)
-}
-
-/// Runs `launch` on `b` and writes the outputs (the shared tail of [`run`]
-/// and [`run_program`]).
+/// Runs `launch` on `b` and writes the outputs (the tail of [`run`]).
 fn execute(
     a: &Options,
     mut b: Built,
@@ -402,21 +362,6 @@ fn execute(
     program: String,
     granule: u64,
 ) -> Result<(), String> {
-    // HBM rate for the bound: every slice.
-    let rate_f: f64 = b
-        .sim
-        .memories()
-        .iter()
-        .filter(|m| m.memory_name().ends_with(".hbm"))
-        .map(|m| {
-            let r = b.sim.resources().flow(m.port).rate();
-            r.num as f64 / r.den as f64
-        })
-        .sum();
-    if rate_f == 0.0 && launch.micro.is_none() && launch.kernels.is_none() {
-        return Err("no memory named hbm".into());
-    }
-
     let home_path = b.sim.topology().path_name(launch.nu);
     let driver_scalar = format!("{home_path}.scalar");
     // The tracer export needs the timeline, the marks and the resource logs.
@@ -450,7 +395,7 @@ fn execute(
     });
     let backend: Box<dyn sim_core::FunctionalBackend> = match functional {
         Functional::Null => Box::new(sim_core::NullBackend),
-        Functional::Trace => Box::new(func::Trace::new(Default::default())),
+        Functional::Trace => Box::new(func::Trace::new()),
         Functional::Numeric => Box::new(func::Numeric::new()),
         // Spawned here, on the main thread: the child's parent-death
         // signal follows the thread that spawns it.
@@ -646,15 +591,6 @@ fn execute(
             Some(sim_core::Flow::Ticket) => "ticket",
         },
         end_time: stats.end_time,
-        // No program reports steps or HBM bytes; the keys stay for the
-        // readers of the JSON.
-        step_end: Vec::new(),
-        step_time: Vec::new(),
-        hbm_bytes: 0,
-        mqa_dup_bytes: 0,
-        hbm_rate_bytes_per_cycle: rate_f,
-        hbm_bound_cycles: 0,
-        end_over_hbm_bound: stats.end_time as f64,
         driver_scalar_utilization: res
             .iter()
             .filter(|r| r.name == driver_scalar)
@@ -750,17 +686,8 @@ fn print_summary(out: &Out, stats: &Stats) {
         s.min, s.mean, s.max, s.home
     );
     println!(
-        "end {} cycles ({} steps), HBM {} B (MQA dup {}), bound {} cycles, ratio {:.3}, \
-    driver scalar {:.3}, wall {:.2} s, {} events",
-        out.end_time,
-        out.step_end.len(),
-        out.hbm_bytes,
-        out.mqa_dup_bytes,
-        out.hbm_bound_cycles,
-        out.end_over_hbm_bound,
-        out.driver_scalar_utilization,
-        out.wall_seconds,
-        out.events
+        "end {} cycles, driver scalar {:.3}, wall {:.2} s, {} events",
+        out.end_time, out.driver_scalar_utilization, out.wall_seconds, out.events
     );
     println!("  {spread}");
     for c in out.culprits.iter().take(5) {

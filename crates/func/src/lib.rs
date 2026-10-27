@@ -1,8 +1,8 @@
 //! Functional backends (r2sim spec Section 3.1).
 //!
 //! * [`Numeric`]: executes ops on byte memory (DMA copy, GEMM, stores).
-//! * [`Trace`]: the same memory without compute; labeled tasks write
-//!   recorded outputs (router decisions).
+//! * [`Trace`]: the same memory without compute: DMA copies and stores
+//!   only.
 //! * [`Process`]: a plane in a child process (for example the Python plane,
 //!   `python -m r2sim.func`), over a framed binary protocol.
 //!
@@ -19,4 +19,4 @@ mod trace;
 pub use dtype::{bf16_to_f32, f32_to_bf16};
 pub use numeric::Numeric;
 pub use process::Process;
-pub use trace::{decode_trace, encode_trace, load_trace, save_trace, Records, Trace};
+pub use trace::Trace;

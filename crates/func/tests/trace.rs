@@ -1,11 +1,11 @@
-use func::{decode_trace, encode_trace, Records, Trace};
+use func::Trace;
 use nu_model::{Addr, NeutrinoId, Range};
 use sim_core::{
     Args, Descriptor, FuncOp, FunctionalBackend, MemBlock, OpKind, OpcodeId, ResourceId,
 };
 
-fn trace(records: Records) -> Trace {
-    let mut t = Trace::new(records);
+fn trace() -> Trace {
+    let mut t = Trace::new();
     t.configure(
         &[MemBlock::plain(
             "m".into(),
@@ -52,40 +52,18 @@ fn task(label: Option<u64>, dst: Range) -> Descriptor {
 }
 
 #[test]
-fn file_format_round_trips() {
-    let mut r = Records::new();
-    r.insert(7, vec![1, 2, 3]);
-    r.insert(0x0100_0203, vec![]);
-    let bytes = encode_trace(&r);
-    assert_eq!(&bytes[..8], b"R2TRACE1");
-    assert_eq!(decode_trace(&bytes).unwrap(), r);
-    assert!(decode_trace(&bytes[..bytes.len() - 1]).is_err());
-}
-
-#[test]
-fn labeled_task_writes_its_record_and_others_write_nothing() {
-    let mut r = Records::new();
-    r.insert(7, vec![9; 51]);
-    let mut t = trace(r);
+fn a_compute_task_writes_nothing() {
+    let mut t = trace();
     let dst = Range::from_len(0x1000, 512);
+    t.write(Addr(0x1000), &[1, 2, 3, 4]).unwrap();
     t.apply(&op(task(Some(7), dst))).unwrap();
-    assert_eq!(t.read(Addr(0x1000), 51).unwrap(), vec![9; 51]);
-    t.apply(&op(task(Some(8), Range::from_len(0x2000, 512))))
-        .unwrap();
-    t.apply(&op(task(None, Range::from_len(0x2000, 512))))
-        .unwrap();
-    assert_eq!(t.read(Addr(0x2000), 4).unwrap(), vec![0; 4]);
-    assert_eq!(t.hits(), 1);
-    // A record larger than dst is an error.
-    let mut r = Records::new();
-    r.insert(1, vec![0; 1024]);
-    let mut t = trace(r);
-    assert!(t.apply(&op(task(Some(1), dst))).is_err());
+    t.apply(&op(task(None, dst))).unwrap();
+    assert_eq!(t.read(Addr(0x1000), 4).unwrap(), vec![1, 2, 3, 4]);
 }
 
 #[test]
 fn dma_copies_bytes() {
-    let mut t = trace(Records::new());
+    let mut t = trace();
     t.write(Addr(0x100), &[5, 6, 7]).unwrap();
     let d = Descriptor {
         opcode: OpcodeId(2),

@@ -297,7 +297,8 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
             .unwrap();
         (out, stats)
     };
-    // A faster gpc0 slice shows in the JSON's HBM rate (546 + gpc1's 512).
+    // A faster gpc0 slice shows in the slots of its port: 546 B per cycle
+    // over 64 B slots; gpc1 keeps 512 B, 8 slots.
     let (out, stats) = run("root.gpc0.hbm.bw_bytes=546");
     assert!(
         out.status.success(),
@@ -306,7 +307,20 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
     );
     let j: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&stats).unwrap()).unwrap();
-    assert_eq!(j["hbm_rate_bytes_per_cycle"], 1058.0);
+    let slots = |name: &str| {
+        j["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap()["slots"]
+            .as_f64()
+            .unwrap()
+    };
+    assert_eq!(
+        (slots("root.gpc0.hbm.port"), slots("root.gpc1.hbm.port")),
+        (546.0 / 64.0, 8.0)
+    );
     let (out, _) = run("root.nosuch*.smem.bw_bytes=1");
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing matches"));

@@ -39,13 +39,6 @@ specification, Sections 4 and 5). The README in
 describes the test images and their sources. The programs `kernels` and
 `micro` calibrate the model against measurements on a card.
 
-A program can also be written in Rust outside the crates, as in
-[crates/r2sim/examples/custom.rs](crates/r2sim/examples/custom.rs):
-
-```bash
-pixi run cargo run --release --example custom
-```
-
 `pixi run test` runs the tests.
 
 The tests include the ISA tests of the Neutrino scalar core (RV64IMC, Zicsr
