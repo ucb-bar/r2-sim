@@ -237,3 +237,17 @@ fn imem_and_data_scratch_entries_stay_inside() {
         "{err}"
     );
 }
+
+#[test]
+fn an_elf_given_as_bin_is_an_error() {
+    // An ELF given as raw bytes would put its header where the code goes.
+    let d = dir("elf-as-bin");
+    std::fs::write(d.join("k.elf"), elf64(0, b"code", 4)).unwrap();
+    let out = run(&d, "[[entry]]\nimem = \"root\"\nbin = \"k.elf\"\n");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("bin is an ELF file; load it with `elf = \"k.elf\"`"),
+        "{err}"
+    );
+}

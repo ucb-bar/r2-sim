@@ -429,22 +429,21 @@ impl Descriptor {
         self
     }
 
-    /// Bytes of the descriptor in an `Invoke` message (Neutrino spec Section 4.3):
-    /// opcode 2, PE 2, `dst` base and length 16, 8 per dependency (address
-    /// and version packed in 64 bits), and the request data (DMA 32,
-    /// matmul 52 plus 8 per high-half address, vector 24, join 0, spawn 4).
-    /// The label is not sent.
+    /// Bytes of the descriptor in an `Invoke` message: its size in the
+    /// Neutrino ABI (2026-10-26), a 24-byte header (opcode, PE, flags,
+    /// dependency count, `dst` base, bound and mask), 8 per dependency, and
+    /// the arguments (DMA 32, matmul 72, vector 32, spawn 16, IMEM copy 24,
+    /// join 0). The label is not sent.
     pub fn wire_bytes(&self) -> u64 {
         let args = match self.args {
             Args::Dma { .. } => 32,
-            Args::Matmul { a2, b2, .. } => 52 + 8 * (a2.is_some() as u64 + b2.is_some() as u64),
-            Args::Vector { src: None, .. } => 24,
-            Args::Vector { src: Some(_), .. } => 32,
+            Args::Matmul { .. } => 72,
+            Args::Vector { .. } => 32,
             Args::Join => 0,
-            Args::Spawn { .. } => 4,
+            Args::Spawn { .. } => 16,
             Args::ImemCopy { .. } => 24,
         };
-        2 + 2 + 16 + 8 * self.deps.len() as u64 + args
+        24 + 8 * self.deps.len() as u64 + args
     }
 
     /// Marks `dst` as versioned and records the version the program

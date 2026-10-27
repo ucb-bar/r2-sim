@@ -614,6 +614,15 @@ impl Image {
         }
         if let Some(p) = &e.bin {
             let (full, f) = read_file(dir, p)?;
+            // Raw bytes load as they are: an ELF given as `bin` would put
+            // its header where the code goes.
+            if f.starts_with(b"\x7fELF") {
+                return Err(format!(
+                    "{}: bin is an ELF file; load it with `elf = {:?}`",
+                    full.display(),
+                    p.display().to_string()
+                ));
+            }
             return Ok(Entry {
                 name: e.name.clone(),
                 dtype: Dtype::U8,

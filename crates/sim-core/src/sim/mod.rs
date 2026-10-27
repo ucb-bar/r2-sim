@@ -1556,10 +1556,10 @@ impl Sim {
             // RV program): its assembly is in their cycles.
             Request::Invoke(d) if d.pc.is_some() => 0,
             Request::Invoke(d) => c.desc(d.deps.len(), d.wire_bytes()),
-            // The spawn descriptor of `Descriptor::wire_bytes`: 20 B of
-            // header and `dst`, 8 per dependency, 4 for the child.
+            // The spawn descriptor of `Descriptor::wire_bytes`: 24 B of
+            // header, 8 per dependency, 16 of arguments.
             Request::Spawn { pc: Some(_), .. } => 0,
-            Request::Spawn { deps, .. } => c.desc(deps.len(), 24 + 8 * deps.len() as u64),
+            Request::Spawn { deps, .. } => c.desc(deps.len(), 40 + 8 * deps.len() as u64),
             _ => 0,
         };
         let cost = match &req {

@@ -150,7 +150,7 @@ impl Default for ScalarCosts {
             alu: 1,
             branch_taken: 2,
             branch: 1,
-            load: 2,
+            load: 3,
             store: 1,
             mul: 3,
             div: 34,

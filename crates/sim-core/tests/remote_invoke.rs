@@ -116,19 +116,19 @@ fn descriptor_assembly_precedes_each_invoke() {
     // forwarded_invoke_with_a_dep_back_on_the_invoker with the default
     // descriptor costs on sm0 (c_base 8, c_dep 3, c_word 1), charged on
     // sm0's scalar before each c_invoke 8:
-    // * P0 (no deps; 2 + 2 + 16 + 52 = 72 B = 9 words): c_desc 8 + 9 = 17,
-    //   [0, 17), then c_invoke [17, 25); P0 runs [25, 217), completes 221.
-    // * M (one dep; 80 B = 10 words): c_desc 8 + 3 + 10 = 21, [25, 46),
-    //   then c_invoke [46, 54): queued and sent at 54. Its path as before
-    //   (32 cycles): M enters sm1's scoreboard at 86; its Await to sm0
-    //   arrives 112, before P0 completes (Registered).
+    // * P0 (no deps; 24 + 72 = 96 B = 12 words): c_desc 8 + 12 = 20,
+    //   [0, 20), then c_invoke [20, 28); P0 runs [28, 220), completes 224.
+    // * M (one dep; 104 B = 13 words): c_desc 8 + 3 + 13 = 24, [28, 52),
+    //   then c_invoke [52, 60): queued and sent at 60. Its path as before
+    //   (32 cycles, 2 message beats): M enters sm1's scoreboard at 92; its
+    //   Await to sm0 arrives 118, before P0 completes (Registered).
     // * A bridge (capacity 1/2 at the 64 B message beat) has its slot at
-    //   odd cycles. Resolve(A) leaves sm0 at 221: sm0's up bridge
-    //   [221, 222) + 10, the crossbar ports [232, 234), sm1's down bridge
-    //   [234, 236) + 10: it arrives 246. M runs [246, 438), completes 442;
-    //   Resolve(M) takes sm1's up bridge [442, 444) + 10, the ports
-    //   [454, 456) and sm0's down bridge [456, 458) + 10: for sm0's wait it
-    //   arrives 468.
+    //   odd cycles. Resolve(A) leaves sm0 at 224 and waits for the slot at
+    //   225: sm0's up bridge [225, 226) + 10, the crossbar ports
+    //   [236, 238), sm1's down bridge [238, 240) + 10: it arrives 250. M
+    //   runs [250, 442), completes 446; Resolve(M) takes sm1's up bridge,
+    //   the ports and sm0's down bridge as before: for sm0's wait it
+    //   arrives 472.
     let b = two_sm(&[
         "root.gpc0.sm0.neutrino.c_base=8",
         "root.gpc0.sm0.neutrino.c_dep=3",
@@ -139,31 +139,31 @@ fn descriptor_assembly_precedes_each_invoke() {
     let c = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
     let p0 = matmul(&b, "root.gpc0.sm0.atlas", a, vec![]);
     let m = matmul(&b, "root.gpc0.sm1.atlas", c, vec![v1(a)]).with_inferred_version(1);
-    assert_eq!((p0.wire_bytes(), m.wire_bytes()), (72, 80));
+    assert_eq!((p0.wire_bytes(), m.wire_bytes()), (96, 104));
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.invoke(p0).await;
-        assert_eq!(ctx.now(), 25);
+        assert_eq!(ctx.now(), 28);
         let h = ctx.invoke(m).await;
-        assert_eq!(ctx.now(), 54, "the invoke returns once queued");
+        assert_eq!(ctx.now(), 60, "the invoke returns once queued");
         ctx.wait(h.addr, 1).await;
-        assert_eq!(ctx.now(), 468);
+        assert_eq!(ctx.now(), 472);
     });
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let (tp, tm) = (&s.tasks[0], &s.tasks[1]);
-    assert_eq!((tp.invoke, tp.complete), (25, Some(221)));
-    assert_eq!(tm.invoke, 86);
-    assert_eq!(tm.ready, Some(246));
-    assert_eq!((tm.chunks[0].start, tm.chunks[0].end), (246, 438));
-    assert_eq!(s.end_time, 468);
-    // sm0's scalar: 17 + 8 + 21 + 8 + c_wait 2.
+    assert_eq!((tp.invoke, tp.complete), (28, Some(224)));
+    assert_eq!(tm.invoke, 92);
+    assert_eq!(tm.ready, Some(250));
+    assert_eq!((tm.chunks[0].start, tm.chunks[0].end), (250, 442));
+    assert_eq!(s.end_time, 472);
+    // sm0's scalar: 20 + 8 + 24 + 8 + c_wait 2.
     let scalar = s
         .resources
         .iter()
         .find(|r| r.name == "root.gpc0.sm0.scalar")
         .unwrap();
-    assert_eq!(scalar.busy_cycles, 56);
+    assert_eq!(scalar.busy_cycles, 62);
 }
 
 #[test]
@@ -500,7 +500,7 @@ fn the_deadlock_detector_fires_on_a_cycle() {
 
 #[test]
 fn a_join_with_20_deps_travels_in_3_beats() {
-    // 2 + 2 + 16 + 8 x 20 = 180 B: 3 beats, 20 + 6 x 3 = 38 cycles. sm1
+    // 24 + 8 x 20 = 184 B: 3 beats, 20 + 6 x 3 = 38 cycles. sm1
     // first writes version 1 of 20 ranges with local joins (done by 208);
     // sm0 forwards the join on them at 208, so it is ready on arrival.
     let b = built_with(&[]);
@@ -519,7 +519,7 @@ fn a_join_with_20_deps_travels_in_3_beats() {
     let mut join =
         Descriptor::join(j, (1..21).map(|i| v1(at(i))).collect()).with_inferred_version(1);
     join.versioned = true;
-    assert_eq!(join.wire_bytes(), 180);
+    assert_eq!(join.wire_bytes(), 184);
     let mut sim = b.sim;
     sim.spawn(sm1, move |ctx: NuCtx| async move {
         for d in signals {

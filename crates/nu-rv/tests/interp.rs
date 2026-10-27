@@ -137,8 +137,8 @@ fn a_load_from_another_nodes_data_scratch_takes_the_memory_path() {
 
 #[test]
 fn the_instruction_classes_cost_their_cycles() {
-    // 4 ALU (1), 2 loads (2), 1 store (1), a taken jump (2): 4 + 4 + 1 +
-    // 2 = 11 scalar cycles, then the exit.
+    // 4 ALU (1), 2 loads (3), 1 store (1), a taken jump (2): 4 + 6 + 1 +
+    // 2 = 13 scalar cycles, then the exit.
     let consts = [SCRATCH];
     let code = [
         rv::addi(rv::A0, rv::ZERO, 1),
@@ -159,7 +159,7 @@ fn the_instruction_classes_cost_their_cycles() {
         .iter()
         .find(|x| x.name == "root.scalar")
         .unwrap();
-    assert_eq!(s.busy_cycles, 11);
+    assert_eq!(s.busy_cycles, 13);
     assert_eq!(u64_at(&r.scratch, 0x100), 5);
 }
 
