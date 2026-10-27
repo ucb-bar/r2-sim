@@ -1,4 +1,5 @@
-"""End to end: `r2sim run --program hello` on configs/2p.yaml with the
+"""End to end: `r2sim run --program rv` with the RV hello fixture
+(crates/nu-rv/tests/fixtures/rv/hello.bin) on configs/2p.yaml, with the
 Python plane (`--functional python`) and a memory image. A and B are
 random bf16 matrices from a fixed seed; C, read back with --image-out, must
 equal numpy's A @ B computed in fp32 and rounded to bf16 once (exact
@@ -15,6 +16,7 @@ from safetensors.numpy import load_file, save_file
 
 REPO = Path(__file__).resolve().parents[2]
 BF16 = ml_dtypes.bfloat16
+HELLO_BIN = REPO / "crates/nu-rv/tests/fixtures/rv/hello.bin"
 
 
 def r2sim() -> Path:
@@ -35,7 +37,11 @@ def test_hello_with_the_python_plane(tmp_path):
     np.save(tmp_path / "a.npy", a.astype(np.float32))
     save_file({"B": b}, str(tmp_path / "b.safetensors"))
     (tmp_path / "image.toml").write_text(
-        """
+        f"""
+[[entry]]
+imem = "root"
+bin = "{HELLO_BIN}"
+
 [[entry]]
 name = "A"
 at = "root.gpc0.hbm+0x0"
@@ -57,7 +63,7 @@ shape = [128, 128]
     )
     out = tmp_path / "out.safetensors"
     subprocess.run(
-        [str(r2sim()), "run", "--config", str(REPO / "configs/2p.yaml"), "--program", "hello",
+        [str(r2sim()), "run", "--config", str(REPO / "configs/2p.yaml"), "--program", "rv",
          "--functional", "python", "--image", str(tmp_path / "image.toml"),
          "--image-out", str(out)],
         check=True, stdout=subprocess.DEVNULL,
@@ -69,12 +75,8 @@ shape = [128, 128]
     assert np.array_equal(got["C"], want)
 
 
-HELLO_BIN = REPO / "crates/nu-rv/tests/fixtures/rv/hello.bin"
-
-
-def test_the_rv_hello_image(tmp_path):
-    """`--program rv` with the RV64 image of hello in the root's IMEM:
-    C = A @ B with the Numeric backend and with the Python plane."""
+def test_hello_with_each_backend(tmp_path):
+    """C = A @ B with the Numeric backend and with the Python plane."""
     rng = np.random.default_rng(2026)
     a = rng.standard_normal((128, 128)).astype(BF16)
     b = rng.standard_normal((128, 128)).astype(BF16)

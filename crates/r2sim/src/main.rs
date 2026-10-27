@@ -43,8 +43,6 @@ fn parse(argv: &[String]) -> Result<Options, String> {
             "--program" => a.program = Some(val()?),
             "--params" => a.params = Some(val()?.into()),
             "--param" => a.overrides.push(val()?),
-            "--trace" => a.trace = Some(val()?.into()),
-            "--synthetic" => a.synthetic = Some(val()?.parse().map_err(|e| format!("{e}"))?),
             "--functional" => a.functional = Some(val()?.parse()?),
             "--functional-cmd" => a.functional_cmd = Some(val()?),
             "--image" => a.image = Some(val()?.into()),

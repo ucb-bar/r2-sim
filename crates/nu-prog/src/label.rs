@@ -1,22 +1,12 @@
 //! The label scheme: software identity of a task, for the tracer and for
 //! Trace records. `kind:8 | step:8 | layer:8 | unit:8 | index:32`.
 
-/// Task kinds.
+/// Task kinds of the kernels program. The numbers 1 to 11 but 8 were
+/// the kinds of earlier programs; [`kind_name`] keeps their names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum Kind {
-    Router = 1,
-    Qkv = 2,
-    Attn = 3,
-    Wo = 4,
-    FfnGate = 5,
-    FfnUp = 6,
-    FfnDown = 7,
     Vec = 8,
-    DmaW = 9,
-    DmaAct = 10,
-    Join = 11,
-    /// The kernels program's task roles.
     Load = 12,
     Store = 13,
     Matmul = 14,
@@ -44,12 +34,6 @@ pub(crate) fn label(kind: Kind, step: u32, layer: u32, unit: u32, index: u32) ->
         | (((layer & 0xff) as u64) << 40)
         | (((unit & 0xff) as u64) << 32)
         | index as u64
-}
-
-/// The router output of (step, layer): the only label the Trace backend
-/// looks up in the AdaMoE program.
-pub fn router(step: u32, layer: u32) -> u64 {
-    label(Kind::Router, step, layer, 0, 0)
 }
 
 /// (kind, step, layer, unit, index) of a label.

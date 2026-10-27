@@ -15,14 +15,21 @@ fn dir(test: &str) -> PathBuf {
     d
 }
 
-/// Runs hello with the image `toml` (written into `d`); the output.
+/// Runs the RV hello fixture with the image `toml` (written into `d`);
+/// the output. The fixture goes into the root's IMEM unless `toml`
+/// loads the root's IMEM itself.
 fn run(d: &Path, toml: &str) -> std::process::Output {
-    std::fs::write(d.join("image.toml"), toml).unwrap();
-    let cfg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/2p.yaml");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let hello = root.join("../nu-rv/tests/fixtures/rv/hello.bin");
+    let mut text = toml.to_string();
+    if !toml.contains("imem = \"root\"") {
+        text += &format!("\n[[entry]]\nimem = \"root\"\nbin = {:?}\n", hello);
+    }
+    std::fs::write(d.join("image.toml"), text).unwrap();
     Command::new(R2SIM)
         .args(["run", "--config"])
-        .arg(cfg)
-        .args(["--program", "hello", "--functional", "numeric", "--image"])
+        .arg(root.join("../../configs/2p.yaml"))
+        .args(["--program", "rv", "--functional", "numeric", "--image"])
         .arg(d.join("image.toml"))
         .arg("--image-out")
         .arg(d.join("out.safetensors"))
@@ -178,8 +185,8 @@ fn a_bad_at_is_an_error() {
 
 #[test]
 fn imem_and_data_scratch_entries_load_into_the_control_plane() {
-    // A raw image into the root's IMEM and bytes into gpc0's data
-    // scratch; both read back. The IMEM entry gives its node and offset.
+    // A raw image into gpc0's IMEM and bytes into gpc0's data scratch;
+    // both read back. The IMEM entry gives its node and offset.
     let d = dir("core");
     std::fs::write(d.join("code.bin"), b"\x13\x00\x00\x00code").unwrap();
     std::fs::write(d.join("args.bin"), b"arguments").unwrap();
@@ -188,7 +195,7 @@ fn imem_and_data_scratch_entries_load_into_the_control_plane() {
         r#"
 [[entry]]
 name = "code"
-imem = "root"
+imem = "root.gpc0"
 bin = "code.bin"
 
 [[entry]]
@@ -209,7 +216,7 @@ bin = "args.bin"
     let code: Value = serde_json::from_str(meta["code"].as_str().unwrap()).unwrap();
     assert_eq!(
         (code["imem"].as_str(), code["offset"].as_str()),
-        (Some("root"), Some("0x0"))
+        (Some("root.gpc0"), Some("0x0"))
     );
     let args: Value = serde_json::from_str(meta["args"].as_str().unwrap()).unwrap();
     // gpc0's data scratch: its prefix 1 << 36 plus the end of its

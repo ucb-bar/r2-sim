@@ -11,7 +11,7 @@ fn micro(params: &[&str]) -> Value {
         build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).expect("config");
     let mut ov: Vec<String> = vec!["l2=\"root.hbm\"".into(), "dram=\"root.hbm\"".into()];
     ov.extend(params.iter().map(|s| s.to_string()));
-    let l = nu_prog::launch("micro", &b, 512, "", &ov).expect("launch");
+    let l = nu_prog::launch("micro", &b, "", &ov).expect("launch");
     b.sim.set_timeline(true);
     let mut sim = b.sim;
     sim.spawn_named(l.nu, l.name, l.program);
@@ -114,7 +114,7 @@ fn bad_parameters_are_errors() {
     let b = build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).unwrap();
     let err = |p: &[&str]| {
         let ov: Vec<String> = p.iter().map(|s| s.to_string()).collect();
-        nu_prog::launch("micro", &b, 512, "", &ov)
+        nu_prog::launch("micro", &b, "", &ov)
             .err()
             .expect("an error")
     };
@@ -129,7 +129,7 @@ fn tmem_launch(params: &[&str]) -> Result<Value, String> {
     let mut b =
         build_config_file::<&str>(&path, &[], ProfileRegistry::with_builtins()).expect("config");
     let ov: Vec<String> = params.iter().map(|s| s.to_string()).collect();
-    let l = nu_prog::launch("micro", &b, 512, "", &ov)?;
+    let l = nu_prog::launch("micro", &b, "", &ov)?;
     b.sim.set_timeline(true);
     let mut sim = b.sim;
     sim.spawn_named(l.nu, l.name, l.program);

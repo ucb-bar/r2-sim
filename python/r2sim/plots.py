@@ -5,24 +5,22 @@ uses the figure style of `style.py`.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 
 from . import style
-from .data import Trace, acc_buffer, run_label
+from .data import Trace
 
-# One color per task kind in Gantt charts (Okabe-Ito, fixed).
+# One color per task kind of the kernels program in Gantt charts
+# (Okabe-Ito, fixed); other kinds are gray.
 KIND_COLORS = {
-    "dma_w": style.OKABE_ITO["orange"],
-    "dma_act": style.OKABE_ITO["sky_blue"],
-    "qkv": style.OKABE_ITO["blue"],
-    "attn": style.OKABE_ITO["bluish_green"],
-    "wo": style.OKABE_ITO["blue"],
-    "ffn_gate": style.OKABE_ITO["vermillion"],
-    "ffn_up": style.OKABE_ITO["vermillion"],
-    "ffn_down": style.OKABE_ITO["purple"],
+    "load": style.OKABE_ITO["orange"],
+    "store": style.OKABE_ITO["sky_blue"],
+    "matmul": style.OKABE_ITO["blue"],
+    "softmax": style.OKABE_ITO["bluish_green"],
+    "rescale": style.OKABE_ITO["black"],
+    "norm": style.OKABE_ITO["vermillion"],
+    "eltwise": style.OKABE_ITO["purple"],
     "vec": style.OKABE_ITO["yellow"],
-    "router": style.OKABE_ITO["black"],
 }
 
 
@@ -147,108 +145,3 @@ def gantt(ax: plt.Axes, trace: Trace, node_prefix: str = "", window: tuple[int, 
     ax.set_ylim(-0.6, len(pes) - 0.4 + 0.8)
     if window:
         ax.set_xlim(window[0] / 1e6, window[1] / 1e6)
-
-
-def _phase_labels(ph: pd.DataFrame) -> list[str]:
-    """Phase names, with the stage only when there are several stages."""
-    if ph["stage"].nunique() == 1:
-        return list(ph["name"])
-    return [f"{a} {b}" for a, b in zip(ph["stage"], ph["name"])]
-
-
-def culprit_shares(ax: plt.Axes, trace: Trace, top: int = 5) -> None:
-    """Per phase, the share of chunk time for which each resource class was
-    the culprit (stacked bars; the `top` classes overall, the rest as
-    other)."""
-    ch = trace.chunks.dropna(subset=["culprit"])
-    ph = trace.phases.reset_index(drop=True)
-    rows = []
-    for _, p in ph.iterrows():
-        m = ch[(ch["start"] >= p["start"]) & (ch["start"] < p["end"])]
-        d = (m["end"] - m["start"]).groupby(m["culprit"].map(resource_class)).sum()
-        rows.append(d / max(d.sum(), 1))
-    shares = pd.DataFrame(rows).fillna(0.0)
-    keep = shares.sum().nlargest(top).index
-    rest = shares.drop(columns=keep).sum(axis=1)
-    shares = shares[list(keep)]
-    if rest.max() > 1e-3:
-        shares["rest"] = rest
-    x = np.arange(len(shares))
-    base = np.zeros(len(shares))
-    colors = list(style.OKABE_ITO.values())[1:] + ["#bbbbbb"]
-    for c, color in zip(shares.columns, colors):
-        ax.bar(x, shares[c], bottom=base, color=color, width=0.8, label=c, linewidth=0)
-        base += shares[c].to_numpy()
-    ax.set_xticks(x)
-    ax.set_xticklabels(_phase_labels(ph))
-    ax.set_ylabel("Culprit share of chunk time")
-    ax.set_ylim(0, 1)
-    ax.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))
-
-
-def phase_roofline(ax: plt.Axes, trace: Trace) -> None:
-    """Per GEMM phase: measured cycles against the model's estimate and the
-    roofline (log scale)."""
-    ph = trace.phases.dropna(subset=["roofline"]).reset_index(drop=True)
-    x = np.arange(len(ph))
-    meas = (ph["end"] - ph["start"]) / 1e3
-    ax.bar(x, meas, width=0.7, color=style.OKABE_ITO["blue"], linewidth=0)
-    ax.plot(x, ph["estimate"] / 1e3, "_", color=style.OKABE_ITO["orange"], markersize=6, markeredgewidth=1.0)
-    ax.plot(x, ph["roofline"] / 1e3, "_", color=style.OKABE_ITO["black"], markersize=6, markeredgewidth=1.0)
-    ax.set_yscale("log")
-    ax.set_xticks(x)
-    ax.set_xticklabels(_phase_labels(ph))
-    ax.set_ylabel("Phase time (k cycles)")
-    # Direct labels on the last phase instead of a legend.
-    last = len(ph) - 1
-    for y, text, color in (
-        (meas.iloc[last], "measured", style.OKABE_ITO["blue"]),
-        (ph["estimate"].iloc[last] / 1e3, "estimate", style.OKABE_ITO["orange"]),
-        (ph["roofline"].iloc[last] / 1e3, "roofline", style.OKABE_ITO["black"]),
-    ):
-        ax.annotate(text, (last + 0.45, y), fontsize=5, va="center", color="black")
-
-
-def stage_bars(ax: plt.Axes, runs: list[dict]) -> None:
-    """The headline: per run, the forward-pass stages as stacked bars (M
-    cycles), with the three bounds of the total as markers."""
-    y = np.arange(len(runs))
-    for i, run in enumerate(runs):
-        f = run["forward"]
-        config, weight = run_label(run)
-        color = style.config_color(config, weight)
-        left = 0.0
-        for st, (_, alpha) in zip(f["stages"], style.STAGE_ALPHA):
-            w = st["cycles"] / 1e6
-            ax.barh(i, w, left=left, height=0.55, color=color, alpha=alpha, linewidth=0)
-            if i == 0:
-                # Direct labels of the three stages, above the first bar.
-                ax.annotate(st["name"], (left + w / 2, -0.45), fontsize=5, ha="center", va="bottom")
-            left += w
-        # The bounds of the total on a thin row just below the bar.
-        tot = f["total"]
-        bounds = [(tot[style.BOUND_KEYS[k]], m) for k, m, _ in style.bound_styles(horizontal=True)]
-        ax.hlines(i + 0.4, 0, max(v for v, _ in bounds) / 1e6, color="#cccccc", linewidth=0.3)
-        for v, marker in bounds:
-            ax.plot(
-                v / 1e6,
-                i + 0.4,
-                marker,
-                color="black",
-                markersize=2.5,
-                markeredgewidth=0.5,
-                fillstyle="none",
-            )
-    labels = []
-    for run in runs:
-        config, weight = run_label(run)
-        acc = acc_buffer(run)
-        labels.append(f"{config.removesuffix('.yaml')} {weight}" + (f" acc {acc >> 20} MiB" if acc else ""))
-    ax.set_yticks(y)
-    ax.set_yticklabels(labels)
-    ax.invert_yaxis()
-    ax.set_xlabel("One inference step (M cycles = ms at 1 GHz)")
-    ax.axvline(100, color="#999999", linewidth=0.4, linestyle="--")
-    names = [n for _, _, n in style.bound_styles(horizontal=True)]
-    ax.legend(style.bound_handles(horizontal=True), names, loc="lower right", handletextpad=0.3)
-    ax.annotate("100 ms control step", (100, -0.8), fontsize=5, ha="center", va="bottom", annotation_clip=False)

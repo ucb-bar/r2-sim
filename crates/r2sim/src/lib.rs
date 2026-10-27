@@ -20,7 +20,7 @@ use sim_core::{build_config_file, Built, ProfileRegistry, SimWarning, Stats};
 
 /// The command line.
 pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
-[--trace FILE | --synthetic SEED] [--functional trace|numeric|python|null [--functional-cmd CMD]] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--quantize tile|none] \
+[--functional trace|numeric|python|null [--functional-cmd CMD]] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--quantize tile|none] \
 [--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]";
 
 /// A functional backend of the command line.
@@ -82,16 +82,12 @@ pub fn spawn_process(cmd: Option<&str>) -> Result<func::Process, String> {
 pub struct Options {
     /// `--config`: the configuration file.
     pub config: Option<PathBuf>,
-    /// `--program`: a program of `nu_prog::launch` ([`run`]).
+    /// `--program`: `rv` or a program of `nu_prog::launch` ([`run`]).
     pub program: Option<String>,
     /// `--params`: the program's parameter file (TOML).
     pub params: Option<PathBuf>,
     /// `--param key=value`: parameter overrides.
     pub overrides: Vec<String>,
-    /// `--trace`: the functional records of a run (routing decisions).
-    pub trace: Option<PathBuf>,
-    /// `--synthetic SEED`: synthetic routing records.
-    pub synthetic: Option<u64>,
     /// `--functional`: the functional backend (default: Null for the
     /// kernels program, Trace for the others).
     pub functional: Option<Functional>,
@@ -260,8 +256,7 @@ struct Out<'a> {
     step_end: Vec<u64>,
     step_time: Vec<u64>,
     hbm_bytes: u64,
-    /// HBM bytes loaded again because every attention SM computes the MQA
-    /// K/V projection and streams the prefix KV itself.
+    /// HBM bytes loaded again by a program (0: no program reports it).
     mqa_dup_bytes: u64,
     hbm_rate_bytes_per_cycle: f64,
     hbm_bound_cycles: u64,
@@ -294,9 +289,6 @@ struct Out<'a> {
     /// Resources chunks queued on, by share of start delay.
     delays: Vec<(String, f64)>,
     resources: Vec<ResourceOut>,
-    report: &'a nu_prog::adamoe::Report,
-    prefill: Option<&'a nu_prog::prefill::Report>,
-    forward: Option<&'a nu_prog::forward::Report>,
     /// A micro-benchmark's measured quantities (absent for the other
     /// programs, so their JSON does not change).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -306,20 +298,6 @@ struct Out<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     kernels: Option<serde_json::Value>,
     stats: &'a Stats,
-}
-
-/// The action expert's parameters of `program` (for the trace).
-fn action_params(
-    program: &str,
-    text: &str,
-    overrides: &[String],
-) -> Result<nu_prog::adamoe::Params, String> {
-    if program == "forward" {
-        let p: nu_prog::forward::Params = nu_prog::params(text, overrides)?;
-        Ok(p.action)
-    } else {
-        nu_prog::params(text, overrides)
-    }
 }
 
 /// Runs the program `o.program` (a program of `nu_prog::launch`) on the
@@ -344,26 +322,7 @@ pub fn run(o: &Options) -> Result<(), String> {
         .neutrino_config(nu_model::NeutrinoId(0))
         .tables
         .granule;
-    let records = match (&a.trace, a.synthetic) {
-        (Some(p), None) => func::load_trace(p).map_err(|e| e.0)?,
-        (None, Some(seed)) => {
-            let p = action_params(&program, &params_text, &a.overrides)?;
-            nu_prog::synthetic_trace(&p, seed, 4.0, 0.9)
-        }
-        (None, None) if program != "adamoe" => Default::default(),
-        (None, None) => return Err("adamoe needs --trace or --synthetic".into()),
-        _ => return Err("give only one of --trace and --synthetic".into()),
-    };
-    // Activation probabilities for cmem placement, from the trace.
-    let mut overrides = a.overrides.clone();
-    if (program == "adamoe" || program == "forward")
-        && !overrides.iter().any(|o| o.starts_with("expert_prob"))
-    {
-        let p = action_params(&program, &params_text, &overrides)?;
-        let probs = nu_prog::adamoe::expert_prob(&records, &p);
-        overrides.push(format!("expert_prob={probs:?}"));
-    }
-    // Before the launch: the prefill cost model reads the Atlas knob.
+    // Before the launch: the kernel sequences read the Atlas knobs.
     if let Some(on) = a.row_panel {
         b.sim.set_atlas_row_panel(on);
     }
@@ -373,10 +332,10 @@ pub fn run(o: &Options) -> Result<(), String> {
     let launch = if program == "rv" {
         rv_launch(a, &b)?
     } else {
-        nu_prog::launch(&program, &b, granule, &params_text, &overrides)?
+        nu_prog::launch(&program, &b, &params_text, &a.overrides)?
     };
     let cfg = cfg_path.display().to_string();
-    execute(a, b, launch, records, &cfg, program, granule)
+    execute(a, b, launch, &cfg, program, granule)
 }
 
 /// `--program rv` ([`nu_rv::launch`]): the root program of the root's
@@ -430,7 +389,7 @@ pub fn run_program(
     let launch = launch(&b)?;
     let program = launch.name.to_string();
     let cfg = cfg_path.display().to_string();
-    execute(o, b, launch, Default::default(), &cfg, program, granule)
+    execute(o, b, launch, &cfg, program, granule)
 }
 
 /// Runs `launch` on `b` and writes the outputs (the shared tail of [`run`]
@@ -439,7 +398,6 @@ fn execute(
     a: &Options,
     mut b: Built,
     mut launch: nu_prog::Launch,
-    records: func::Records,
     cfg: &str,
     program: String,
     granule: u64,
@@ -459,12 +417,8 @@ fn execute(
         return Err("no memory named hbm".into());
     }
 
-    let driver_scalars: Vec<String> = launch
-        .drivers
-        .iter()
-        .map(|&n| format!("{}.scalar", b.sim.topology().path_name(n)))
-        .collect();
-    let home_path = b.sim.topology().path_name(launch.home);
+    let home_path = b.sim.topology().path_name(launch.nu);
+    let driver_scalar = format!("{home_path}.scalar");
     // The tracer export needs the timeline, the marks and the resource logs.
     let tracing = a.trace_out.is_some();
     // A micro-benchmark measures from the task timeline.
@@ -496,7 +450,7 @@ fn execute(
     });
     let backend: Box<dyn sim_core::FunctionalBackend> = match functional {
         Functional::Null => Box::new(sim_core::NullBackend),
-        Functional::Trace => Box::new(func::Trace::new(records)),
+        Functional::Trace => Box::new(func::Trace::new(Default::default())),
         Functional::Numeric => Box::new(func::Numeric::new()),
         // Spawned here, on the main thread: the child's parent-death
         // signal follows the thread that spawns it.
@@ -584,44 +538,24 @@ fn execute(
         .kernels
         .as_ref()
         .map(|r| nu_prog::kernels::result(&r.borrow(), &stats));
-    let prefill = launch.prefill.as_ref().map(|r| r.borrow().clone());
-    let forward = launch.forward.as_ref().map(|r| r.borrow().clone());
+    // No program reports phases: the phase rows of the raw summary and
+    // of the tracer files are empty.
     if let Some((dir, out)) = &raw {
-        let phases = trace_phases(prefill.as_ref(), forward.as_ref(), &launch.report.borrow());
-        let rows: Vec<traceraw::PhaseRow> = phases
-            .iter()
-            .map(|p| traceraw::PhaseRow {
-                stage: &p.stage,
-                name: &p.name,
-                layer: p.layer,
-                start: p.start,
-                end: p.end,
-                estimate: p.estimate,
-                roofline: p.roofline,
-                bound_by: &p.bound_by,
-            })
-            .collect();
         let out = out.borrow();
-        traceraw::write_summary(dir, &stats, wall, &out, &rows)
+        traceraw::write_summary(dir, &stats, wall, &out, &[])
             .map_err(|e| format!("--trace-raw: {e}"))?;
         if let Some(e) = &out.error {
             return Err(format!("--trace-raw: {e}"));
         }
     }
     if let (Some(dir), Some(names)) = (&a.trace_out, &names) {
-        let phases = trace_phases(prefill.as_ref(), forward.as_ref(), &launch.report.borrow());
         let opts = trace::Opts {
             dir: dir.clone(),
             bin: a.bin.unwrap_or(10_000),
             window: a.window,
             node: a.node.clone(),
         };
-        trace::write(&opts, names, &stats, &phases).map_err(|e| format!("--trace-out: {e}"))?;
-    }
-    let mut report = launch.report.borrow().clone();
-    if let Some(p) = &prefill {
-        report.step_end = p.layer_end.clone();
-        report.hbm_bytes = p.hbm_bytes;
+        trace::write(&opts, names, &stats, &[]).map_err(|e| format!("--trace-out: {e}"))?;
     }
     // The warning list can be long (one record per pipelined slot reuse);
     // the JSON keeps the first ones and the per-kind counts.
@@ -689,13 +623,6 @@ fn execute(
         .map(|r| (r.name.clone(), r.delay_share))
         .collect();
     let warnings = warning_counts(&stats);
-    let mut step_time = Vec::new();
-    let mut prev = 0;
-    for &e in &report.step_end {
-        step_time.push(e - prev);
-        prev = e;
-    }
-    let bound = (report.hbm_bytes as f64 / rate_f).ceil() as u64;
     let phase_stats = phase_stats(&stats);
     let mut stats_out = stats.clone();
     stats_out.marks.clear();
@@ -719,16 +646,18 @@ fn execute(
             Some(sim_core::Flow::Ticket) => "ticket",
         },
         end_time: stats.end_time,
-        step_end: report.step_end.clone(),
-        step_time,
-        hbm_bytes: report.hbm_bytes,
-        mqa_dup_bytes: report.mqa_dup_bytes,
+        // No program reports steps or HBM bytes; the keys stay for the
+        // readers of the JSON.
+        step_end: Vec::new(),
+        step_time: Vec::new(),
+        hbm_bytes: 0,
+        mqa_dup_bytes: 0,
         hbm_rate_bytes_per_cycle: rate_f,
-        hbm_bound_cycles: bound,
-        end_over_hbm_bound: stats.end_time as f64 / bound.max(1) as f64,
+        hbm_bound_cycles: 0,
+        end_over_hbm_bound: stats.end_time as f64,
         driver_scalar_utilization: res
             .iter()
-            .filter(|r| driver_scalars.contains(&r.name))
+            .filter(|r| r.name == driver_scalar)
             .map(|r| r.utilization)
             .fold(0.0, f64::max),
         wall_seconds: wall,
@@ -749,9 +678,6 @@ fn execute(
         culprits,
         delays,
         resources: res,
-        report: &report,
-        prefill: prefill.as_ref(),
-        forward: forward.as_ref(),
         micro,
         kernels,
         stats: &stats_out,
@@ -814,66 +740,6 @@ fn warning_counts(stats: &Stats) -> BTreeMap<String, u64> {
         *warnings.entry(k).or_insert(0) += 1;
     }
     warnings
-}
-
-/// The phase rows of the tracer: the prefill phases of each prefill stage,
-/// and the denoise steps of the action expert when there is no prefill
-/// program.
-fn trace_phases(
-    prefill: Option<&nu_prog::prefill::Report>,
-    forward: Option<&nu_prog::forward::Report>,
-    action: &nu_prog::adamoe::Report,
-) -> Vec<trace::Phase> {
-    let mut phases = Vec::new();
-    let mut add = |stage: &str, r: &nu_prog::prefill::Report| {
-        for p in &r.phases {
-            phases.push(trace::Phase {
-                stage: stage.into(),
-                name: p.name.clone(),
-                layer: p.layer,
-                start: p.start,
-                end: p.end,
-                estimate: p.grid.map(|g| g.cost),
-                roofline: p.roofline.map(|x| x.bound),
-                bound_by: p.roofline.map_or("", |x| x.bound_by).to_string(),
-            });
-        }
-    };
-    if let Some(p) = prefill {
-        add("prefill", p);
-    }
-    if let Some(f) = forward {
-        if let Some(v) = &f.vision {
-            add("vision", v);
-        }
-        if let Some(v) = &f.vlm {
-            add("vlm", v);
-        }
-    }
-    if prefill.is_none() {
-        let mut prev = forward
-            .and_then(|f| {
-                f.stages
-                    .iter()
-                    .find(|s| s.name == "action")
-                    .map(|s| s.start)
-            })
-            .unwrap_or(0);
-        for (i, &e) in action.step_end.iter().enumerate() {
-            phases.push(trace::Phase {
-                stage: "action".into(),
-                name: format!("step {i}"),
-                layer: 0,
-                start: prev,
-                end: e,
-                estimate: None,
-                roofline: None,
-                bound_by: String::new(),
-            });
-            prev = e;
-        }
-    }
-    phases
 }
 
 /// The one-line summary with the SMEM spread, the top culprits and queues.

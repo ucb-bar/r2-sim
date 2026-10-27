@@ -63,8 +63,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sim_core::{Args, Built, Descriptor, Dtype, NuCtx, PeId, Stats};
 
-use crate::machine::parse_dtype;
-
 /// The alignment of every range a task writes (the Neutrino granule).
 const GRANULE: u64 = 512;
 
@@ -319,6 +317,16 @@ fn sync_of(s: &Sm) -> Result<u64, String> {
 /// The range a task writes for `bytes` at `base`: at least one granule.
 fn dst_range(base: u64, bytes: u64) -> Range {
     Range::from_len(base, bytes.max(1).div_ceil(GRANULE) * GRANULE)
+}
+
+/// The element type named `s`.
+fn parse_dtype(s: &str) -> Result<Dtype, String> {
+    match s {
+        "bf16" => Ok(Dtype::Bf16),
+        "fp8" => Ok(Dtype::Fp8),
+        "mxfp4" => Ok(Dtype::Mxfp4),
+        _ => Err(format!("unknown weight_dtype {s:?} (bf16, fp8, mxfp4)")),
+    }
 }
 
 /// Builds the run of `p` on `b`.

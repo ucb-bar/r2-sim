@@ -18,7 +18,7 @@ fn run_with(config: &str, params: &str, sets: &[&str]) -> (Stats, Report) {
     let mut b = build_config_file(&path, sets, ProfileRegistry::with_builtins()).expect("config");
     // C stays in the Atlas accumulator until the last k-tile.
     b.sim.set_atlas_acc_buffer(1 << 17);
-    let l = nu_prog::launch("kernels", &b, 512, params, &[]).expect("launch");
+    let l = nu_prog::launch("kernels", &b, params, &[]).expect("launch");
     let mut sim = b.sim;
     sim.set_timeline(true);
     sim.spawn_named(l.nu, l.name, l.program);
@@ -348,21 +348,21 @@ fn attention_holds_s_and_o_in_the_accumulator_by_default() {
     };
     let b = built(1 << 18);
     let smem = ATT.replace("ctas_per_sm = 2", "ctas_per_sm = 2\ns_in = \"smem\"");
-    let e = nu_prog::launch("kernels", &b, 512, &smem, &[])
+    let e = nu_prog::launch("kernels", &b, &smem, &[])
         .err()
         .expect("error");
     assert!(
         e.contains("S 32768 B and 2 x O 16384 B do not fit in 65536 B"),
         "{e}"
     );
-    let e = nu_prog::launch("kernels", &built(1 << 17), 512, ATT, &[])
+    let e = nu_prog::launch("kernels", &built(1 << 17), ATT, &[])
         .err()
         .expect("error");
     assert!(
         e.contains("S and O of 81920 B per tensor unit do not fit in the CTA's 65536 B"),
         "{e}"
     );
-    let l = nu_prog::launch("kernels", &b, 512, ATT, &[]).expect("launch");
+    let l = nu_prog::launch("kernels", &b, ATT, &[]).expect("launch");
     let mut sim = b.sim;
     sim.spawn_named(l.nu, l.name, l.program);
     let s = sim.run();
@@ -434,12 +434,12 @@ fn a_cta_that_does_not_fit_in_its_smem_is_an_error() {
     )
     .unwrap();
     let p = GEMM.replace("stages = 2", "stages = 2\nctas_per_sm = 4");
-    let e = nu_prog::launch("kernels", &b, 512, &p, &[])
+    let e = nu_prog::launch("kernels", &b, &p, &[])
         .err()
         .expect("error");
     assert!(e.contains("do not fit"), "{e}");
     let p = GEMM.replace("op = \"gemm\"", "op = \"conv\"");
-    let e = nu_prog::launch("kernels", &b, 512, &p, &[])
+    let e = nu_prog::launch("kernels", &b, &p, &[])
         .err()
         .expect("error");
     assert!(e.contains("unknown op"), "{e}");
@@ -614,7 +614,7 @@ fn simt_util_scales_a_muon_tasks_lane_ops() {
         let p = format!(
             "tensors = [{{name = \"x\", bytes = 16384}}, {{name = \"y\", bytes = 16384}}]\n[[kernels]]\nname = \"ln\"\nop = \"layernorm\"\ninputs = [\"x\"]\noutput = \"y\"\nrows = 1\ncols = 8192\n{bad}\n"
         );
-        let e = nu_prog::launch("kernels", &b, 512, &p, &[])
+        let e = nu_prog::launch("kernels", &b, &p, &[])
             .err()
             .expect("error");
         assert!(e.contains("simt_util"), "{e}");

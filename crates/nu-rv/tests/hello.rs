@@ -1,12 +1,12 @@
-//! The hello image (tests/fixtures/rv/hello.bin, the RV64 build of
-//! `--program hello`) on configs/2p.yaml makes the same tasks as the Rust
-//! program: the same PEs, destination ranges and dependencies.
+//! The hello image (tests/fixtures/rv/hello.bin) on configs/2p.yaml: the
+//! device loads A and B from gpc0's DRAM into root.gpc0.sm0's SMEM,
+//! multiplies them on that SM's Atlas, and copies C back to the DRAM.
 
 mod common;
 
-use common::{two_p, Tasks};
+use common::two_p;
 use nu_model::{Dep, Range};
-use sim_core::{Descriptor, Stats};
+use sim_core::{Descriptor, Dtype, Stats};
 
 const HELLO: &[u8] = include_bytes!("fixtures/rv/hello.bin");
 
@@ -22,17 +22,6 @@ fn key(d: &Descriptor) -> impl PartialEq + std::fmt::Debug {
         d.deps.clone(),
         d.args.clone(),
     )
-}
-
-fn rust_hello() -> (Stats, Vec<Descriptor>) {
-    let mut b = two_p();
-    let l = nu_prog::hello::launch(&b).unwrap();
-    let tasks = Tasks::default();
-    b.sim.set_tracer(Box::new(tasks.clone()));
-    b.sim.spawn_named(l.nu, l.name, l.program);
-    let s = b.sim.run();
-    let t = tasks.0.borrow().clone();
-    (s, t)
 }
 
 fn scalar(s: &Stats) -> u64 {
@@ -54,35 +43,69 @@ fn the_record_of_the_root() {
 }
 
 #[test]
-fn hello_makes_the_tasks_of_the_rust_program() {
-    let (rs, rust) = rust_hello();
+fn hello_makes_its_four_tasks() {
+    let b = two_p();
+    let (dram, smem) = (b.memory("root.gpc0.hbm"), b.memory("root.gpc0.sm0.smem"));
+    let (sm_dma, atlas, gpc_dma) = (
+        b.pe("root.gpc0.sm0.dma"),
+        b.pe("root.gpc0.sm0.atlas"),
+        b.pe("root.gpc0.dma"),
+    );
+    // A, B and C: 128 x 128 bf16, 32 KiB apart.
+    const N: u64 = 128;
+    let bytes = N * N * 2;
+    let at = |r: Range, i: u64| Range::from_len(r.base + i * bytes, bytes);
+    let (a, bb, c, out) = (at(smem, 0), at(smem, 1), at(smem, 2), at(dram, 2));
+    let v1 = |r: Range| Dep::Versioned {
+        addr: r.base,
+        version: 1,
+    };
+    // The loads are DMAs on the SM's engine (a pull by the owner of the
+    // SMEM), the matmul waits for version 1 of A and B, and the copy back
+    // is a DMA on the cluster's engine after version 1 of C.
+    let load_a = Descriptor::dma(sm_dma, at(dram, 0).base, a, bytes).with_inferred_version(1);
+    let load_b = Descriptor::dma(sm_dma, at(dram, 1).base, bb, bytes).with_inferred_version(1);
+    let mm = Descriptor::matmul(atlas, a.base, bb.base, c, N, N, N, Dtype::Bf16)
+        .with_deps(vec![v1(a), v1(bb)])
+        .with_inferred_version(1);
+    let back = Descriptor::dma(gpc_dma, c.base, out, bytes)
+        .with_deps(vec![v1(c)])
+        .with_inferred_version(1);
+    assert_eq!(
+        (a.base, c.base, out),
+        (
+            0x12_0000_0000,
+            0x12_0001_0000,
+            Range::from_len(0x10_0001_0000, 0x8000)
+        )
+    );
+
     let rv = common::run(HELLO, &[]);
-    assert_eq!(rs.fatal, None);
     assert_eq!(rv.stats.fatal, None);
-    assert_eq!(rust.len(), 4);
     assert_eq!(rv.tasks.len(), 4);
-    for (a, b) in rust.iter().zip(&rv.tasks) {
-        assert_eq!(key(a), key(b));
-    }
     // The toolchain's dry run: the two loads at 0x8a, the matmul at
-    // 0xe2, the copy back at 0x122. The tracer sees the tasks in the order
-    // they enter their owners' tables: the copy back reaches gpc0 before
-    // the matmul reaches sm0.
+    // 0xe2, the copy back at 0x122.
     let mut pcs: Vec<_> = rv.tasks.iter().map(|t| t.pc.unwrap()).collect();
     pcs.sort();
     assert_eq!(pcs, [0x8a, 0x8a, 0xe2, 0x122]);
-    let at = |pc| rv.tasks.iter().find(|t| t.pc == Some(pc)).unwrap();
-    let v1 = |addr| Dep::Versioned { addr, version: 1 };
-    let mm = at(0xe2);
-    assert_eq!(mm.dst.base, 0x12_0001_0000);
-    assert_eq!(mm.deps, vec![v1(0x12_0000_0000), v1(0x12_0000_8000)]);
-    let back = at(0x122);
-    assert_eq!(back.dst, Range::from_len(0x10_0001_0000, 0x8000));
-    assert_eq!(back.deps, vec![v1(0x12_0001_0000)]);
+    let task = |want: &Descriptor| {
+        rv.tasks
+            .iter()
+            .find(|t| t.dst == want.dst)
+            .unwrap_or_else(|| panic!("no task writes {:?}", want.dst))
+    };
+    for (want, pc) in [
+        (&load_a, 0x8a),
+        (&load_b, 0x8a),
+        (&mm, 0xe2),
+        (&back, 0x122),
+    ] {
+        let got = task(want);
+        assert_eq!(key(got), key(want));
+        assert_eq!(got.pc, Some(pc));
+    }
     println!(
-        "hello: Rust {} cycles, root scalar {}; RV {} cycles, root scalar {}",
-        rs.end_time,
-        scalar(&rs),
+        "hello: {} cycles, root scalar {}",
         rv.stats.end_time,
         scalar(&rv.stats)
     );

@@ -29,45 +29,8 @@ OKABE_ITO = {
     "purple": "#CC79A7",
 }
 
-# One fixed color per (configuration file, weight type), in every figure.
-CONFIG_COLORS = {
-    ("2p.yaml", "bf16"): OKABE_ITO["black"],
-    ("2p.yaml", "mxfp4"): OKABE_ITO["blue"],
-    ("2p-cmem64.yaml", "mxfp4"): OKABE_ITO["bluish_green"],
-    ("2p-cmem-large.yaml", "mxfp4"): OKABE_ITO["orange"],
-    ("2p-smem2m.yaml", "mxfp4"): OKABE_ITO["sky_blue"],
-    ("2p-smem512.yaml", "mxfp4"): OKABE_ITO["vermillion"],
-}
-
 # Continuous data (utilization heatmaps).
 CMAP = "viridis"
-
-# Shades of the forward-pass stages in stacked bars.
-STAGE_ALPHA = (("vision", 0.45), ("vlm", 0.7), ("action", 1.0))
-
-# JSON keys of the three lower bounds of a stage, by short name.
-BOUND_KEYS = {"own": "own_traffic_bound", "roofline": "roofline", "once": "weights_once_bound"}
-
-
-def bound_styles(horizontal: bool) -> tuple[tuple[str, str, str], ...]:
-    """(short name, marker, label) of the three bounds. The own-traffic
-    tick crosses the value axis: `horizontal` is True when values run
-    along x."""
-    return (
-        ("own", "|" if horizontal else "_", "own-traffic bound"),
-        ("roofline", "x", "roofline"),
-        ("once", "o", "weights-once bound"),
-    )
-
-
-def bound_handles(horizontal: bool) -> list[plt.Line2D]:
-    """Legend handles of the three bounds."""
-    return [
-        plt.Line2D([], [], linestyle="none", marker=m, color="black", markersize=3, markeredgewidth=0.6,
-                   fillstyle="none")
-        for _, m, _ in bound_styles(horizontal)
-    ]
-
 
 def _font_family() -> list[str]:
     """Arial or Helvetica when installed, else the metric-compatible
@@ -105,11 +68,6 @@ def apply() -> None:
             "savefig.dpi": 300,
         }
     )
-
-
-def config_color(config: str, weight: str) -> str:
-    """The fixed color of a configuration, gray when it has none."""
-    return CONFIG_COLORS.get((config, weight), "#7f7f7f")
 
 
 def panel_label(ax: plt.Axes, letter: str) -> None:

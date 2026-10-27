@@ -17,21 +17,29 @@ Install [pixi](https://pixi.sh), then from the repository root (with Rust
 ```bash
 pixi run build
 mkdir -p out
-target/release/r2sim run --config configs/2p.yaml --program hello \
+target/release/r2sim run --config configs/2p.yaml --program rv \
+  --image crates/nu-rv/tests/fixtures/rv/hello.toml \
   --stats out/hello.json --trace-out out/hello
 ```
 
-The `hello` program ([crates/nu-prog/src/hello.rs](crates/nu-prog/src/hello.rs))
-copies two 128 x 128 bf16 tiles from the DRAM of a cluster into the SMEM
-of an SM, multiplies them on the Atlas of that SM, and copies the product
-back. The run prints its end cycle and writes:
+`--program rv` runs the RV64 program in the IMEM of the root node. The
+memory image `hello.toml` loads the program `hello.bin` into that IMEM.
+The program copies two 128 x 128 bf16 tiles from the DRAM of a cluster
+into the SMEM of an SM, multiplies them on the Atlas of that SM, and
+copies the product back. The run prints its end cycle and writes:
 
 - `out/hello.json`: the statistics of the run;
 - `out/hello/`: the trace, as CSV and JSON files (`tasks.csv.gz` has one
   row per task, `resources.csv.gz` the use of each resource over time).
 
-To write a program, start from `hello.rs` and register it in
-`nu_prog::launch`, or define it outside the crates as in
+An RV program is an image of the Neutrino ABI: RV64IMC code with the
+`nu.*` instructions, which invoke task descriptors (Neutrino
+specification, Sections 4 and 5). The README in
+[crates/nu-rv/tests/fixtures/rv/](crates/nu-rv/tests/fixtures/rv/)
+describes the test images and their sources. The programs `kernels` and
+`micro` calibrate the model against measurements on a card.
+
+A program can also be written in Rust outside the crates, as in
 [crates/r2sim/examples/custom.rs](crates/r2sim/examples/custom.rs):
 
 ```bash

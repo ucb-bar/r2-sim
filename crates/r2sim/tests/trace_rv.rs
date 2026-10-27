@@ -203,8 +203,19 @@ fn the_three_level_dump() {
 
 #[test]
 fn a_rust_program_has_no_pc_image_or_images() {
-    let d = dir("hello");
-    let m = run(&d, &["--program", "hello"]);
+    // A micro-benchmark: two SMs copy into their gpc's DRAM.
+    let d = dir("micro");
+    let m = run(
+        &d,
+        &[
+            "--program",
+            "micro",
+            "--param",
+            "mode=untracked",
+            "--param",
+            "sms=2",
+        ],
+    );
     assert_eq!(m["version"], serde_json::json!([1, 10]));
     assert!(m.get("images").is_none());
     for t in records(&d, "tasks", 120) {

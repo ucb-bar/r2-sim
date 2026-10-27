@@ -64,19 +64,22 @@ fn spawn(cmd: &str, pidfile: &Path) -> func::Process {
     func::Process::spawn_with_env(&words, &env, "child: ").unwrap()
 }
 
-/// r2sim running hello on 2p.yaml with the process backend `cmd`.
+/// r2sim running the RV hello fixture on 2p.yaml with the process
+/// backend `cmd`.
 fn r2sim(cmd: &str, pidfile: &Path) -> Command {
     let mut c = Command::new(R2SIM);
     c.args(["run", "--config"])
         .arg(root().join("configs/2p.yaml"))
         .args([
             "--program",
-            "hello",
+            "rv",
             "--functional",
             "python",
             "--functional-cmd",
             cmd,
         ])
+        .arg("--image")
+        .arg(root().join("crates/nu-rv/tests/fixtures/rv/hello.toml"))
         .env("R2SIM_CHILD_PID", pidfile)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

@@ -1,4 +1,4 @@
-"""Loaders for r2sim outputs: the --stats JSON and the --trace-out folder."""
+"""The loader of the --trace-out folder of r2sim."""
 
 from __future__ import annotations
 
@@ -39,22 +39,3 @@ def load_trace(folder: Path) -> Trace:
         phases=pd.read_csv(folder / "phases.csv"),
         tree=json.loads((folder / "tree.json").read_text()),
     )
-
-
-def load_run(path: Path) -> dict:
-    """Reads one --stats JSON."""
-    return json.loads(Path(path).read_text())
-
-
-def run_label(run: dict) -> tuple[str, str]:
-    """(configuration file name, weight type) of a run."""
-    config = Path(run["config"]).name
-    params = (run.get("forward") or {}).get("params") or (run.get("prefill") or {}).get("params")
-    if params is None:
-        params = (run.get("report") or {}).get("params") or {}
-    return config, params.get("weight_dtype", "bf16")
-
-
-def acc_buffer(run: dict) -> int:
-    """The Atlas accumulator buffer of a run, in bytes."""
-    return int(run.get("acc_buffer", 0))

@@ -1,8 +1,14 @@
 # RV test images
 
-`hello.bin` (384 bytes) is the IMEM image of the device program of
-`--program hello` as an RV64 program. The image was built by the
-r2-toolchain (`r2-build --config configs/2p.yaml`) from this source:
+Each image `NAME.bin` has an image file `NAME.toml` that loads it into
+the IMEM of the root node, for `r2sim run --config configs/2p.yaml
+--program rv --image NAME.toml`. The golden check (`tools/golden.sh`)
+runs the three images.
+
+`hello.bin` (384 bytes) is a device program as an RV64 program: it loads
+two tiles into the SMEM of an SM, multiplies them there and copies the
+product back. The image was built by the r2-toolchain
+(`r2-build --config configs/2p.yaml`) from this source:
 
 ```rust
 #[nu_program(node = root, stack = 4096)]
@@ -86,3 +92,17 @@ embedded images `gpc_fanout` (node type `gpc`, a 544-byte image at
 offset 0xd8 of the device image) and `sm_tile` (node type `sm`, a
 224-byte image at offset 0xf8 of the cluster image). Each record has
 entry 0x2a.
+
+`encoder.bin` (5768 bytes) is a vision encoder kernel (27 layers of width
+1152, 16 heads of 72, an FFN of 4304, three images of 256 patches, and a
+projector to a width of 2048), built by the r2-toolchain for
+configs/2p.yaml. It models time only: the functional plane does not
+compute its values. The image holds every program of the kernel: the
+device program `encoder` (node type `root`) embeds the image of the
+cluster program `encoder_cluster` (node type `gpc`), which embeds the
+images of the SM programs `gemm` and `attention` (node type `sm`). The
+device starts `encoder_cluster` on each cluster. A cluster holds one half
+of the patches of each image and runs the steps of the encoder one after
+the other on its SMs: a GEMM splits its output tiles over the SMs, and
+attention splits the heads. Attention reads the keys and values of the
+other half of each image from the HBM of the other cluster.

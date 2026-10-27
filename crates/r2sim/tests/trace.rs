@@ -1,5 +1,6 @@
-//! The tracer export (--trace-out) on the tiny config: a one-layer VLM
-//! prefill of 64 tokens.
+//! The tracer export (--trace-out) and the raw trace dump (--trace-raw)
+//! on the tiny config: a micro-benchmark stream in which each of the three
+//! SMs reads 128 KiB from the HBM.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -13,39 +14,32 @@ fn gunzip(p: PathBuf) -> String {
     s
 }
 
-/// The arguments of a one-layer VLM prefill of 64 tokens on the tiny
-/// config.
+/// The arguments of the stream on the tiny config.
 const TINY: &[&str] = &[
     "run",
     "--config",
     "crates/nu-prog/tests/configs/tiny.yaml",
     "--program",
-    "prefill",
+    "micro",
     "--param",
-    "layers=1",
+    "mode=stream",
     "--param",
-    "d=256",
+    "l2=root.hbm",
     "--param",
-    "heads=2",
+    "dram=root.hbm",
     "--param",
-    "kv_heads=1",
+    "mem=dram",
     "--param",
-    "head_dim=128",
+    "sms=3",
     "--param",
-    "ffn=256",
+    "bytes=131072",
     "--param",
-    "images=1",
+    "chunk=4096",
     "--param",
-    "tokens_per_image=64",
-    "--param",
-    "text_tokens=0",
-    "--param",
-    "quantize=false",
-    "--param",
-    "action={layers=1,tokens=16,d=256,ffn=128,heads=1,head_dim=128,prefix=64,experts=1}",
+    "inflight=2",
 ];
 
-/// Runs the tiny prefill with `extra` arguments; returns the --stats JSON.
+/// Runs the tiny stream with `extra` arguments; returns the --stats JSON.
 fn run_tiny(dir: &std::path::Path, extra: &[&str]) -> serde_json::Value {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let stats = dir.join("run.json");
@@ -84,6 +78,8 @@ fn trace_raw_writes_whole_records_that_match_the_stats() {
         read(plain.join("summary.json")),
     );
     assert_eq!(summary["end_time"], j["end_time"]);
+    // No program reports phases; the key stays, an empty list.
+    assert_eq!(summary["phases"], serde_json::json!([]));
     // Each node gives its Neutrino's table sizes (tiny_sm.yaml for an SM):
     let sm1 = manifest["nodes"]
         .as_array()
@@ -261,9 +257,13 @@ fn trace_out_writes_consistent_files() {
             r["name"]
         );
     }
-    // Every GEMM phase is in phases.csv; the tree has the root.
+    // No program reports phases: phases.csv has its header only. The
+    // tree has the root.
     let phases = std::fs::read_to_string(tmp.join("phases.csv")).unwrap();
-    assert!(phases.lines().any(|l| l.starts_with("prefill,up,")));
+    assert_eq!(
+        phases.lines().collect::<Vec<_>>(),
+        ["stage,name,layer,start,end,estimate,roofline,bound_by"]
+    );
     let tree: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(tmp.join("tree.json")).unwrap()).unwrap();
     assert_eq!(tree[0]["node"], "root");
@@ -283,13 +283,11 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
                 "--config",
                 "configs/2p.yaml",
                 "--program",
-                "adamoe",
+                "micro",
                 "--param",
-                "steps=1",
+                "mode=untracked",
                 "--param",
-                "layers=1",
-                "--synthetic",
-                "7",
+                "sms=2",
                 "--set",
                 set,
             ])

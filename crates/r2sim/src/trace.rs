@@ -13,7 +13,8 @@
 //! * `chunks.csv.gz`: gid, index, start, end, culprit.
 //! * `marks.csv`: time, name (program marks).
 //! * `phases.csv`: stage, name, layer, start, end, estimate, roofline,
-//!   bound_by (prefill phases; action denoise steps).
+//!   bound_by (the phases a program reports; the programs of today
+//!   report none).
 //! * `tree.json`: per node, the culprit cycles of its own resources (from
 //!   the chunks in the window) and the largest one in its subtree.
 //!
