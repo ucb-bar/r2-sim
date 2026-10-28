@@ -22,7 +22,7 @@ use std::task::{Context, Poll, Waker};
 
 use nu_model::{
     Addr, AddressHash, Dep, DepError, DepTables, Effects, NeutrinoId, OutboundDeps, OwnerMap,
-    Phase, Purpose, Range, TaskId, TaskSpec, WaitId, WaitStatus,
+    Phase, Purpose, Range, TaskId, TaskSpec, WaitId, WaitStatus, EPOCH_SHIFT,
 };
 
 use crate::config::{MemBlock, NeutrinoConfig, PeConfig, RaceCheck};
@@ -186,6 +186,8 @@ struct Neutrino {
     op: Option<Request>,
     /// The cycle the program made the request in `op`.
     op_call: Cycle,
+    /// The program's last call and the key of a wait (a deadlock report).
+    call: (&'static str, Option<Dep>),
     /// Invoke and spawn calls of the program so far (their numbers,
     /// [`TaskCall::n`]).
     calls: u64,
@@ -252,6 +254,19 @@ impl Neutrino {
 
     fn rec_mut(&mut self, t: TaskId) -> &mut TaskRec {
         self.tasks[t.0 as usize].as_mut().expect("live task record")
+    }
+
+    /// Where the program is blocked; `None` when it returned or never
+    /// started.
+    fn blocked(&self) -> Option<Blocked> {
+        Some(match self.state {
+            ProgState::Idle => return None,
+            ProgState::Busy => Blocked::Busy,
+            ProgState::Stalled(e) => Blocked::Stall(e),
+            ProgState::Waiting(_) | ProgState::WaitingRemote(_) | ProgState::Returning(_) => {
+                Blocked::Wait
+            }
+        })
     }
 }
 
@@ -799,6 +814,31 @@ impl Sim {
     }
 
     /// The occupancy of every Neutrino's tables.
+    /// Every program that has not returned and what it waits on (a
+    /// deadlock report).
+    pub(super) fn blocked_programs(&self) -> Vec<crate::stats::BlockedProgram> {
+        self.nus
+            .iter()
+            .filter_map(|n| {
+                let blocked = n.blocked()?;
+                let (call, key) = match n.state {
+                    ProgState::Returning(_) => ("return", None),
+                    _ => n.call,
+                };
+                let key = key.filter(|k| *k != FENCE);
+                let owner =
+                    key.and_then(|k| self.owners.owner_of_range(&Range::from_len(k.addr(), 1)));
+                Some(crate::stats::BlockedProgram {
+                    nu: n.id,
+                    blocked,
+                    call,
+                    key,
+                    owner,
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn table_states(&self) -> Vec<crate::stats::TableState> {
         self.nus
             .iter()
@@ -860,6 +900,7 @@ impl Sim {
             mb: Rc::new(RefCell::new(Mailbox::default())),
             op: None,
             op_call: 0,
+            call: ("", None),
             calls: 0,
             prog_name: "",
             state: ProgState::Idle,
@@ -1264,9 +1305,13 @@ impl Sim {
             self.topo.node(nu).children.clone(),
             n.cfg.costs.plan,
             n.core.clone(),
+            0,
         );
         // A program start resets the Neutrino's version table (Neutrino spec Section 7.7).
-        n.tables.vreset_all();
+        // The host start of the device program has epoch 0.
+        n.tables
+            .start(0)
+            .expect("a start in epoch 0 finds no pending entry of an earlier epoch");
         n.program = Some(Box::pin(program.run(ctx)));
         n.prog_name = name;
         n.state = ProgState::Busy;
@@ -1379,14 +1424,15 @@ impl Sim {
 
     fn finish(mut self) -> (Stats, Option<Box<dyn FunctionalBackend>>) {
         self.worker_failed();
-        // A message still in a stage, or an invoke in an inbound table,
-        // when no event is left: nothing can move it.
+        // A message still in a stage, an invoke in an inbound table, or a
+        // program that has not returned when no event is left: nothing can
+        // move it.
         if self.stats.fatal.is_none()
             && (self.stages.values().any(|q| q.occ() > 0)
                 || self
                     .nus
                     .iter()
-                    .any(|n| !n.inbound.is_empty() || n.held_len > 0))
+                    .any(|n| !n.inbound.is_empty() || n.held_len > 0 || n.state != ProgState::Idle))
         {
             self.deadlock(NeutrinoId(0));
         }
@@ -1446,15 +1492,9 @@ impl Sim {
                     last_writer,
                 });
             }
-            let blocked = match n.state {
-                ProgState::Idle => continue,
-                ProgState::Busy => Blocked::Busy,
-                ProgState::Stalled(e) => Blocked::Stall(e),
-                ProgState::Waiting(_) | ProgState::WaitingRemote(_) | ProgState::Returning(_) => {
-                    Blocked::Wait
-                }
-            };
-            self.stats.unfinished.push((n.id, blocked));
+            if let Some(blocked) = n.blocked() {
+                self.stats.unfinished.push((n.id, blocked));
+            }
         }
         if let Some(t) = self.tracer.take() {
             t.finish(&mut self.stats);
@@ -1590,6 +1630,7 @@ impl Sim {
         }
         let end = self.charge(r, cost, who);
         let n = &mut self.nus[nu.0 as usize];
+        n.call = (req.name(), req.key());
         n.op = Some(req);
         n.op_call = self.now;
         n.state = ProgState::Busy;
@@ -1817,6 +1858,14 @@ impl Sim {
             } => {
                 let n = &mut self.nus[nu.0 as usize];
                 let start = n.pending_spawn.take().expect("spawn program");
+                if start.epoch as u64 > nu_model::EPOCH_MAX {
+                    let msg = format!(
+                        "spawn with epoch {}, above {}",
+                        start.epoch,
+                        nu_model::EPOCH_MAX
+                    );
+                    return self.fatal(nu, None, FatalError::Invalid(msg));
+                }
                 if self.topo.node(child).parent != Some(nu) {
                     let msg = format!("spawn on {child:?}, which is not a direct child");
                     return self.fatal(nu, None, FatalError::Invalid(msg));
@@ -2394,10 +2443,12 @@ impl Sim {
         };
         // Debug check of the program's inference (Neutrino spec Section 7.8): invokes of
         // one requester reach the owner in program order, so the version
-        // the program infers is the one the owner assigns (the counter + 1).
+        // the program infers is the one the owner assigns (the counter + 1;
+        // without an entry, the epoch base + 1).
         if cfg!(debug_assertions) && desc.versioned {
             let t = &self.nus[nu.0 as usize].tables;
-            let assigns = t.version_counter(desc.dst.base).unwrap_or(0) + 1;
+            let counter = t.version_counter(desc.dst.base);
+            let assigns = counter.unwrap_or(t.epoch() << EPOCH_SHIFT) + 1;
             if let Some(v) = desc.inferred_version.filter(|v| *v != assigns) {
                 let msg = format!(
                     "{}: the program infers version {v}, the owner assigns {assigns}",

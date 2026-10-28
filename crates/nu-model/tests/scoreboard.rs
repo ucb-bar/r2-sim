@@ -1,6 +1,9 @@
 use nu_model::{
-    Dep, DepConfig, DepError, DepTables, Phase, Range, TaskId, TaskSpec, WaitStatus, Warning,
+    epoch_order, handle_await, version_order, AwaitMsg, Dep, DepConfig, DepError, DepTables,
+    NeutrinoId, Phase, Range, RequestId, TaskId, TaskSpec, WaitStatus, Warning, COUNT_MASK,
+    EPOCH_SHIFT,
 };
+use std::cmp::Ordering::{Equal, Greater, Less};
 
 const G: u64 = 512;
 
@@ -584,4 +587,361 @@ fn a_range_without_a_granule_is_empty() {
     let mut tb = tables();
     let e = Range::from_len(at(3), 0);
     assert_eq!(tb.invoke(t(e, &[]), 0), Err(DepError::Empty(e)));
+}
+
+// ---- epochs ----
+
+/// Version `count` of epoch `epoch`.
+fn ev(epoch: u64, count: u64) -> u64 {
+    epoch << EPOCH_SHIFT | count
+}
+
+#[test]
+fn a_key_of_an_earlier_epoch_whose_producer_retired_is_done() {
+    let mut tb = tables();
+    let a = r(0, 4);
+    let p = run(&mut tb, tv(a, &[]));
+    tb.complete(p);
+    tb.start(1).unwrap();
+    assert_eq!(tb.epoch(), 1);
+    assert_eq!(
+        tb.version_counter(a.base),
+        None,
+        "the start clears the table"
+    );
+    assert_eq!(tb.wait(key(a, 1)).unwrap().0, WaitStatus::Done);
+    // The first version of a base in epoch 1 follows the epoch base.
+    let inv = tb.invoke(tv(a, &[]), 0).unwrap();
+    assert_eq!(inv.version, Some(ev(1, 1)));
+}
+
+#[test]
+fn a_key_of_an_earlier_epoch_waits_for_its_producer_in_flight() {
+    // P writes (A, 1) in epoch 0 and is still executing at the start of
+    // epoch 1. N writes (A, 1 << 24 | 1), the same count in epoch 1. A
+    // consumer of (A, 1) waits for P, not for N.
+    let mut tb = tables();
+    let a = r(0, 4);
+    let p = run(&mut tb, tv(a, &[]));
+    tb.start(1).unwrap();
+    let n = run(&mut tb, tv(a, &[]));
+    let c = tb
+        .invoke(TaskSpec::new(r(8, 1), vec![key(a, 1)]), 0)
+        .unwrap();
+    assert!(!c.ready);
+    assert!(tb.complete(n).ready.is_empty(), "N is not the producer");
+    assert_eq!(tb.complete(p).ready, vec![c.task]);
+}
+
+#[test]
+fn a_key_of_a_later_epoch_is_adopted_by_the_write_of_that_epoch() {
+    // In epoch 1 a consumer names (A, 2 << 24 | 1): pending. The write of
+    // count 1 in epoch 1 does not adopt it; the write of count 1 in
+    // epoch 2 does.
+    let mut tb = tables();
+    let a = r(0, 4);
+    tb.start(1).unwrap();
+    let c = tb
+        .invoke(TaskSpec::new(r(8, 1), vec![key(a, ev(2, 1))]), 0)
+        .unwrap();
+    assert!(!c.ready);
+    assert_eq!(tb.pending_len(), 1);
+    let w1 = tb.invoke(tv(a, &[]), 0).unwrap();
+    assert_eq!(w1.version, Some(ev(1, 1)));
+    assert!(w1.effects.adopted.is_empty());
+    tb.issue(w1.task).unwrap();
+    assert!(tb.complete(w1.task).ready.is_empty());
+    tb.start(2).unwrap();
+    let w2 = tb.invoke(tv(a, &[]), 0).unwrap();
+    assert_eq!(w2.version, Some(ev(2, 1)));
+    assert_eq!(w2.effects.adopted.len(), 1);
+    tb.issue(w2.task).unwrap();
+    assert_eq!(tb.complete(w2.task).ready, vec![c.task]);
+}
+
+#[test]
+fn a_version_that_would_enter_the_next_epoch_is_an_error() {
+    let mut tb = tables();
+    let a = r(0, 4);
+    tb.set_version(a.base, COUNT_MASK).unwrap();
+    assert_eq!(
+        tb.invoke(tv(a, &[]), 0).unwrap_err(),
+        DepError::VersionOverflow {
+            addr: a.base,
+            counter: COUNT_MASK
+        }
+    );
+    tb.start(1).unwrap();
+    tb.set_version(a.base, ev(1, COUNT_MASK - 1)).unwrap();
+    assert_eq!(
+        tb.invoke(tv(a, &[]), 0).unwrap().version,
+        Some(ev(1, COUNT_MASK))
+    );
+}
+
+#[test]
+fn a_pending_key_of_an_earlier_epoch_at_a_start_is_an_error() {
+    // (A, 1) is pending in epoch 0; a start of epoch 1 ends epoch 0
+    // without its producer. A pending key of the new epoch is legal.
+    let mut tb = tables();
+    let a = r(0, 4);
+    assert!(matches!(
+        tb.wait(key(a, 1)).unwrap().0,
+        WaitStatus::Pending(_)
+    ));
+    assert_eq!(
+        tb.start(1).unwrap_err(),
+        DepError::StalePending {
+            addr: a.base,
+            version: 1,
+            epoch: 1
+        }
+    );
+    assert_eq!(tb.epoch(), 0, "a refused start changes nothing");
+    tb.start(0).unwrap();
+    let mut tb = tables();
+    assert!(matches!(
+        tb.wait(key(a, ev(1, 1))).unwrap().0,
+        WaitStatus::Pending(_)
+    ));
+    tb.start(1).unwrap();
+}
+
+#[test]
+fn a_key_that_its_epoch_never_produced_is_an_error() {
+    // Epoch 0 writes A twice. In epoch 1, (A, 2) is done; (A, 3) and
+    // (B, 1) were never produced: a wait, a dependency and an Await
+    // report it.
+    let mut tb = tables();
+    let (a, b) = (r(0, 4), r(4, 4));
+    for _ in 0..2 {
+        let p = run(&mut tb, tv(a, &[]));
+        tb.complete(p);
+    }
+    tb.start(1).unwrap();
+    assert_eq!(tb.wait(key(a, 2)).unwrap().0, WaitStatus::Done);
+    let never_a = DepError::Unproduced {
+        addr: a.base,
+        version: 3,
+        highest: Some(2),
+    };
+    assert_eq!(tb.wait(key(a, 3)).unwrap_err(), never_a);
+    assert_eq!(
+        tb.invoke(TaskSpec::new(r(8, 1), vec![key(b, 1)]), 0)
+            .unwrap_err(),
+        DepError::Unproduced {
+            addr: b.base,
+            version: 1,
+            highest: None
+        }
+    );
+    let msg = AwaitMsg {
+        from: NeutrinoId(1),
+        to: NeutrinoId(0),
+        request: RequestId(0),
+        key: key(a, 3),
+    };
+    assert_eq!(handle_await(&mut tb, &msg).unwrap_err(), never_a);
+}
+
+#[test]
+fn a_start_that_reuses_epoch_numbers_drops_their_records() {
+    // C is written in epoch 1. After a start of epoch 2 its key is done.
+    // A new lifetime starts again at epoch 1: the record of epoch 1 is
+    // dropped, so after epoch 2 the same key was never produced.
+    let mut tb = tables();
+    let c = r(0, 4);
+    tb.start(1).unwrap();
+    let p = run(&mut tb, tv(c, &[]));
+    tb.complete(p);
+    tb.start(2).unwrap();
+    assert_eq!(tb.wait(key(c, ev(1, 1))).unwrap().0, WaitStatus::Done);
+    tb.start(1).unwrap();
+    tb.start(2).unwrap();
+    assert!(matches!(
+        tb.wait(key(c, ev(1, 1))).unwrap_err(),
+        DepError::Unproduced { highest: None, .. }
+    ));
+}
+
+#[test]
+fn vreset_keeps_the_epoch() {
+    let mut tb = tables();
+    let a = r(0, 4);
+    tb.start(3).unwrap();
+    run(&mut tb, tv(a, &[]));
+    tb.vreset(a.base);
+    tb.vreset_all();
+    assert_eq!(tb.epoch(), 3);
+}
+
+#[test]
+fn versions_order_by_the_serial_order_of_their_epochs() {
+    // d = 0: the counts.
+    assert_eq!(version_order(ev(7, 2), ev(7, 3)), Some(Less));
+    assert_eq!(version_order(ev(7, 3), ev(7, 3)), Some(Equal));
+    assert_eq!(version_order(ev(7, 4), ev(7, 3)), Some(Greater));
+    // The epochs decide, whatever the counts.
+    let order = |d: u64| version_order(ev((5 + d) % 256, 1), ev(5, 9));
+    assert_eq!(order(1), Some(Greater));
+    assert_eq!(order(127), Some(Greater));
+    assert_eq!(order(128), None);
+    assert_eq!(order(129), Some(Less));
+    assert_eq!(order(255), Some(Less));
+    // Across the wrap.
+    assert_eq!(epoch_order(0, 255), Some(Greater));
+    assert_eq!(epoch_order(255, 0), Some(Less));
+    assert_eq!(epoch_order(200, 72), None);
+}
+
+#[test]
+fn lookups_across_the_wrap_of_the_epochs() {
+    // P writes (A, 255:1) in epoch 255 and is still executing in epoch 1.
+    let mut tb = tables();
+    let a = r(0, 4);
+    tb.start(255).unwrap();
+    let p = run(&mut tb, tv(a, &[]));
+    assert_eq!(tb.version_counter(a.base), Some(ev(255, 1)));
+    tb.start(0).unwrap();
+    tb.start(1).unwrap();
+    let c = tb
+        .invoke(TaskSpec::new(r(8, 1), vec![key(a, ev(255, 1))]), 0)
+        .unwrap();
+    assert!(!c.ready, "the key waits for its producer in flight");
+    assert_eq!(tb.complete(p).ready, vec![c.task]);
+    assert_eq!(tb.wait(key(a, ev(255, 1))).unwrap().0, WaitStatus::Done);
+    // A key of epoch 2 is after the epoch base of epoch 1: pending.
+    assert!(matches!(
+        tb.wait(key(a, ev(2, 1))).unwrap().0,
+        WaitStatus::Pending(_)
+    ));
+    // Epoch 129 is 128 from epoch 1: no order.
+    assert_eq!(
+        tb.wait(key(a, ev(129, 1))).unwrap_err(),
+        DepError::EpochWindow {
+            addr: a.base,
+            version: ev(129, 1),
+            counter: ev(1, 0)
+        }
+    );
+}
+
+#[test]
+fn the_records_of_the_highest_versions_across_the_wrap() {
+    // Epoch 255 writes B once. In epoch 0, (B, 255:1) is done and
+    // (B, 255:2) was never produced.
+    let mut tb = tables();
+    let b = r(4, 4);
+    tb.start(254).unwrap();
+    tb.start(255).unwrap();
+    let p = run(&mut tb, tv(b, &[]));
+    tb.complete(p);
+    tb.start(0).unwrap();
+    assert_eq!(tb.wait(key(b, ev(255, 1))).unwrap().0, WaitStatus::Done);
+    assert_eq!(
+        tb.wait(key(b, ev(255, 2))).unwrap_err(),
+        DepError::Unproduced {
+            addr: b.base,
+            version: ev(255, 2),
+            highest: Some(ev(255, 1))
+        }
+    );
+    // Epoch 0 writes X. A start of epoch 128 (128 after epoch 0) drops
+    // the record of epoch 0: in epoch 1 the key of epoch 0 was never
+    // produced. Without that start it is done.
+    let x = r(0, 4);
+    let produced_then_started = |mid: &[u64]| {
+        let mut tb = tables();
+        let p = run(&mut tb, tv(x, &[]));
+        tb.complete(p);
+        for &e in mid {
+            tb.start(e).unwrap();
+        }
+        tb.start(1).unwrap();
+        tb.wait(key(x, ev(0, 1))).map(|w| w.0)
+    };
+    assert_eq!(produced_then_started(&[]), Ok(WaitStatus::Done));
+    assert_eq!(
+        produced_then_started(&[128]),
+        Err(DepError::Unproduced {
+            addr: x.base,
+            version: ev(0, 1),
+            highest: None
+        })
+    );
+}
+
+#[test]
+fn stale_pending_keys_across_the_wrap() {
+    // A pending key of epoch 255 at a start of epoch 1: epoch 255 is
+    // before epoch 1.
+    let mut tb = tables();
+    let a = r(0, 4);
+    tb.start(255).unwrap();
+    assert!(matches!(
+        tb.wait(key(a, ev(255, 1))).unwrap().0,
+        WaitStatus::Pending(_)
+    ));
+    assert_eq!(
+        tb.start(1).unwrap_err(),
+        DepError::StalePending {
+            addr: a.base,
+            version: ev(255, 1),
+            epoch: 1
+        }
+    );
+    // A pending key of epoch 1 at a start of epoch 0: epoch 1 is after it.
+    let mut tb = tables();
+    assert!(matches!(
+        tb.wait(key(a, ev(1, 1))).unwrap().0,
+        WaitStatus::Pending(_)
+    ));
+    tb.start(0).unwrap();
+}
+
+#[test]
+fn an_unversioned_wait_on_a_versioned_range_warns() {
+    let a = r(0, 4);
+    let unversioned_wait = |tb: &mut DepTables, addr: u64| {
+        let (status, fx) = tb.wait(Dep::Unversioned(addr)).unwrap();
+        assert!(matches!(status, WaitStatus::Pending(_)));
+        fx.warnings
+    };
+    // The base of a version table entry.
+    let mut tb = tables();
+    let p = run(&mut tb, tv(a, &[]));
+    tb.complete(p);
+    assert_eq!(
+        unversioned_wait(&mut tb, a.base),
+        vec![Warning::UnversionedWait {
+            addr: a.base,
+            versioned: key(a, 1)
+        }]
+    );
+    // An address that a versioned task in the tables holds.
+    let mut tb = tables();
+    run(&mut tb, tv(a, &[]));
+    tb.vreset(a.base);
+    assert_eq!(
+        unversioned_wait(&mut tb, at(2)),
+        vec![Warning::UnversionedWait {
+            addr: at(2),
+            versioned: key(a, 1)
+        }]
+    );
+    // A versioned invoke whose dst holds an unversioned pending address.
+    let mut tb = tables();
+    assert!(unversioned_wait(&mut tb, at(1)).is_empty());
+    let inv = tb.invoke(tv(a, &[]), 0).unwrap();
+    assert_eq!(
+        inv.effects.warnings,
+        vec![Warning::UnversionedWait {
+            addr: at(1),
+            versioned: key(a, 1)
+        }]
+    );
+    // An unversioned producer adopts the key: no warning.
+    let mut tb = tables();
+    unversioned_wait(&mut tb, at(1));
+    assert!(tb.invoke(t(a, &[]), 0).unwrap().effects.warnings.is_empty());
 }

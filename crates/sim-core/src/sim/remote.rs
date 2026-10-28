@@ -1214,6 +1214,7 @@ impl Sim {
         let idle = self.now.saturating_sub(self.last_progress);
         let tables = self.table_states();
         let stages = self.stage_states();
+        let programs = self.blocked_programs();
         self.fatal(
             nu,
             None,
@@ -1221,6 +1222,7 @@ impl Sim {
                 idle,
                 tables,
                 stages,
+                programs,
             },
         );
     }
@@ -1424,9 +1426,14 @@ impl Sim {
             self.topo.node(child).children.clone(),
             n.cfg.costs.plan,
             n.core.clone(),
+            start.epoch as u64,
         );
-        // A program start resets the Neutrino's version table (Neutrino spec Section 7.7).
-        n.tables.vreset_all();
+        // A program start resets the Neutrino's version table (Neutrino spec Section 7.7)
+        // and sets its epoch.
+        if let Err(e) = n.tables.start(start.epoch as u64) {
+            return self.fatal(child, None, FatalError::Dep(e));
+        }
+        let n = &mut self.nus[child.0 as usize];
         n.program = Some((start.run)(ctx));
         let name = match start.name {
             crate::program::ProgramName::Fixed(s) => s,

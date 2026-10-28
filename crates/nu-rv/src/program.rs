@@ -2,7 +2,8 @@
 //!
 //! At its start the program writes the start mailbox `{entry, args,
 //! done}` to offset 0 of its data scratch and starts at IMEM offset 4,
-//! with CSR 0xFC0 the node's prefix. It then runs instructions in
+//! with CSR 0xFC0 the node's prefix and CSR 0xFC1 its epoch (that of the
+//! spawn that started it). It then runs instructions in
 //! batches: a batch ends at a `nu.*` instruction or at a load or store
 //! outside the IMEM and the own data scratch. The batch's instruction
 //! cycles are charged on the scalar resource (the `scalar` costs of the
@@ -358,6 +359,7 @@ impl RvProgram {
         }
         let costs = node.scalar;
         let mut hart = Hart::new(abi::START_VECTOR, core.prefix);
+        hart.epoch = ctx.epoch();
         let mut resume = None;
         loop {
             let mut cycles = 0;
@@ -428,6 +430,7 @@ impl RvProgram {
                             done,
                             deps,
                             child,
+                            epoch,
                             entry,
                             args,
                         }) => {
@@ -446,7 +449,7 @@ impl RvProgram {
                                 nu,
                                 Some(entry as u64),
                             )));
-                            ctx.spawn_program(nu, name, done, deps, Some(pc), move |c| {
+                            ctx.spawn_in_epoch(nu, name, done, deps, Some(pc), epoch, move |c| {
                                 program.run(c)
                             })
                             .await;

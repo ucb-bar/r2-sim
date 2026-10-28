@@ -28,6 +28,9 @@ pub const START_VECTOR: u64 = 4;
 pub const RECORD_BYTES: u64 = 72;
 /// The CSR that holds the global prefix of the node.
 pub const CSR_PREFIX: u16 = 0xfc0;
+/// The read-only CSR that holds the epoch of the node: the one its
+/// program started with.
+pub const CSR_EPOCH: u16 = 0xfc1;
 
 /// The granule of the configuration, as a shift.
 pub fn granule_shift(b: &Built) -> u32 {

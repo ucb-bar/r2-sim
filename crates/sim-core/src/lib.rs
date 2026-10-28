@@ -45,8 +45,8 @@ pub use resource::{
 pub use sim::cache::{CacheCounts, CacheFlush, CacheStats};
 pub use sim::{Flow, Sim, MESSAGE_KINDS};
 pub use stats::{
-    Blocked, ChunkRec, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats,
-    TableState, TaskTimeline, WarningRec,
+    Blocked, BlockedProgram, ChunkRec, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning,
+    Stall, Stats, TableState, TaskTimeline, WarningRec,
 };
 pub use time::{Cycle, Ratio};
 pub use topology::{

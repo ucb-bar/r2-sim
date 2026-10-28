@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use nu_model::{epoch_of, Dep, NeutrinoId, Warning, COUNT_MASK};
 use serde::Serialize;
-use sim_core::{build_config_file, Built, ProfileRegistry, SimWarning, Stats};
+use sim_core::{build_config_file, Built, FatalError, ProfileRegistry, SimWarning, Stats};
 
 /// The command line.
 pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
@@ -460,6 +461,9 @@ fn execute(
         None => None,
     };
     let mut sim = b.sim;
+    let nodes: Vec<String> = (0..sim.topology().len())
+        .map(|i| sim.topology().path_name(NeutrinoId(i as u32)))
+        .collect();
     match launch.start_name.take() {
         Some(name) => sim.spawn_program(launch.nu, name, launch.program),
         None => sim.spawn_named(launch.nu, launch.name, launch.program),
@@ -618,7 +622,7 @@ fn execute(
         kernels,
         stats: &stats_out,
     };
-    print_summary(&out, &stats);
+    print_summary(&out, &stats, &nodes);
     if let Some(p) = &a.stats {
         let json = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
         std::fs::write(p, json).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -678,8 +682,10 @@ fn warning_counts(stats: &Stats) -> BTreeMap<String, u64> {
     warnings
 }
 
-/// The one-line summary with the SMEM spread, the top culprits and queues.
-fn print_summary(out: &Out, stats: &Stats) {
+/// The one-line summary with the SMEM spread, the top culprits and queues;
+/// the first warning of a kind that names a likely hang, and the report
+/// of a deadlock. `nodes`: the node names by Neutrino.
+fn print_summary(out: &Out, stats: &Stats, nodes: &[String]) {
     let s = &out.smem_port_util;
     let spread = format!(
         "SMEM port utilization over workers min {:.3} mean {:.3} max {:.3}, home {:.3}",
@@ -701,10 +707,92 @@ fn print_summary(out: &Out, stats: &Stats) {
     for (n, sh) in out.delays.iter().take(3) {
         println!("  queued on {:<24} {:>6.1}% of start delay", n, 100.0 * sh);
     }
-    if let Some(f) = &stats.fatal {
-        println!("FATAL: {f:?}");
+    let first = stats.warnings.iter().find_map(|w| match w.warning {
+        SimWarning::Dep(Warning::UnversionedWait { addr, versioned }) => Some((w, addr, versioned)),
+        _ => None,
+    });
+    if let Some((w, addr, versioned)) = first {
+        println!(
+            "warning UnversionedWait ({} in all; the first at cycle {} on {}): the unversioned key {addr:#x} meets the versioned key {}",
+            out.warnings.get("UnversionedWait").copied().unwrap_or(0),
+            w.time,
+            nodes[w.nu.0 as usize],
+            key_name(&versioned)
+        );
     }
-    if !stats.unfinished.is_empty() {
-        println!("unfinished: {:?}", stats.unfinished);
+    match &stats.fatal {
+        Some(f) if matches!(f.error, FatalError::Deadlock { .. }) => print_deadlock(stats, nodes),
+        Some(f) => {
+            println!("FATAL: {f:?}");
+            if !stats.unfinished.is_empty() {
+                println!("unfinished: {:?}", stats.unfinished);
+            }
+        }
+        None => {}
+    }
+}
+
+/// `addr` and the epoch and count of a versioned key.
+fn key_name(k: &Dep) -> String {
+    match *k {
+        Dep::Versioned { addr, version } => format!(
+            "({addr:#x}, epoch {} count {})",
+            epoch_of(version),
+            version & COUNT_MASK
+        ),
+        Dep::Unversioned(addr) => format!("({addr:#x}, unversioned)"),
+    }
+}
+
+/// The deadlock report: the programs that have not returned and what they
+/// wait on, the open pending entries and the channel stages that hold
+/// messages.
+fn print_deadlock(stats: &Stats, nodes: &[String]) {
+    let Some(f) = &stats.fatal else { return };
+    let FatalError::Deadlock {
+        idle,
+        programs,
+        stages,
+        ..
+    } = &f.error
+    else {
+        return;
+    };
+    let name = |nu: NeutrinoId| nodes[nu.0 as usize].as_str();
+    println!(
+        "FATAL: Deadlock at cycle {} on {} (no progress for {idle} cycles)",
+        f.time,
+        name(f.nu)
+    );
+    for p in programs {
+        let on = match (p.key, p.owner) {
+            (Some(k), Some(o)) => format!(" on {} owned by {}", key_name(&k), name(o)),
+            (Some(k), None) => format!(" on {}", key_name(&k)),
+            _ => String::new(),
+        };
+        println!(
+            "  program on {}: {:?} in {}{on}",
+            name(p.nu),
+            p.blocked,
+            p.call
+        );
+    }
+    for p in &stats.open_pending {
+        let key = match p.pending.version {
+            Some(version) => Dep::Versioned {
+                addr: p.pending.addr,
+                version,
+            },
+            None => Dep::Unversioned(p.pending.addr),
+        };
+        println!(
+            "  open pending entry {} at its owner {}: {} waiters",
+            key_name(&key),
+            name(p.nu),
+            p.pending.waiters
+        );
+    }
+    for s in stages {
+        println!("  stage {}: {} messages", s.stage, s.messages);
     }
 }

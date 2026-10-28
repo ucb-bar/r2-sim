@@ -16,7 +16,7 @@
 //! producer's `dst`. The version table maps a base address to its version
 //! counter only. A lookup of `(a, v)` checks the scoreboard and the
 //! execution table first (their entries carry `dst` and version), then the
-//! counter (`counter >= v`: done), and otherwise waits on a pending entry
+//! counter (`v` not after the counter: done), and otherwise waits on a pending entry
 //! keyed `(a, v)` for the producer's invoke. Hazards are RAW only; hardware
 //! counts no readers.
 //!
@@ -28,13 +28,57 @@
 //!
 //! The tables have no notion of time. Every mutation returns [`Effects`],
 //! which the caller turns into events.
+//!
+//! Epochs: a version is `epoch << EPOCH_SHIFT | count`. Each Neutrino has a
+//! current epoch, set by a program start. A base without a version table
+//! entry reads as the epoch base `epoch << EPOCH_SHIFT`, both for version
+//! assignment and for the lookup. Epochs compare as serial numbers of 8
+//! bits ([`version_order`]): the numbering wraps from 255 to 0, and two
+//! epochs that a lookup compares must be less than 128 apart. So a key of
+//! an earlier epoch is done (unless its producer is still in flight), and
+//! a key of a later epoch waits on a pending entry. With epoch 0
+//! everywhere a base without an entry reads as 0, as without epochs.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::addr::Range;
 use crate::dst::{Dst, FULL_MASK};
 use crate::remote::Awaiter;
 use crate::slab::Slab;
+
+/// The bit of a version where its epoch starts; the count is below it.
+pub const EPOCH_SHIFT: u32 = 24;
+/// The highest epoch.
+pub const EPOCH_MAX: u64 = 255;
+/// The bits of the count of a version.
+pub const COUNT_MASK: u64 = (1 << EPOCH_SHIFT) - 1;
+
+/// The epoch of version `v`.
+pub fn epoch_of(v: u64) -> u64 {
+    v >> EPOCH_SHIFT
+}
+
+/// The serial order of epochs `a` and `b`: with d = (a - b) mod 256, `a`
+/// is after `b` for d in 1..=127, before it for d in 129..=255, and equal
+/// for d = 0. `None` (no order) for d = 128.
+pub fn epoch_order(a: u64, b: u64) -> Option<Ordering> {
+    match a.wrapping_sub(b) & EPOCH_MAX {
+        0 => Some(Ordering::Equal),
+        1..=127 => Some(Ordering::Greater),
+        128 => None,
+        _ => Some(Ordering::Less),
+    }
+}
+
+/// The order of versions `a` and `b`: the serial order of their epochs
+/// ([`epoch_order`]), and in one epoch the order of their counts.
+pub fn version_order(a: u64, b: u64) -> Option<Ordering> {
+    match epoch_order(epoch_of(a), epoch_of(b))? {
+        Ordering::Equal => Some((a & COUNT_MASK).cmp(&(b & COUNT_MASK))),
+        o => Some(o),
+    }
+}
 
 /// A task entry, stable from invoke to retire. The task instance ID on the
 /// issue port.
@@ -238,6 +282,47 @@ pub enum DepError {
         /// The version.
         version: u64,
     },
+    /// The next version of a base would carry its count into the next
+    /// epoch (the count reached `COUNT_MASK`).
+    VersionOverflow {
+        /// The base address.
+        addr: u64,
+        /// The version counter.
+        counter: u64,
+    },
+    /// At a program start, a pending entry of a versioned key whose epoch
+    /// is not the start's epoch and not after it: no producer can adopt
+    /// it.
+    StalePending {
+        /// The base address of the key.
+        addr: u64,
+        /// The version of the key.
+        version: u64,
+        /// The epoch of the start.
+        epoch: u64,
+    },
+    /// A lookup compared a key with the counter of its base, and their
+    /// epochs are 128 apart: no order.
+    EpochWindow {
+        /// The base address of the key.
+        addr: u64,
+        /// The version of the key.
+        version: u64,
+        /// The counter of the base (the epoch base without an entry).
+        counter: u64,
+    },
+    /// A lookup found a key of an earlier epoch done by the counter, but
+    /// its base never reached the key's count in that epoch at this
+    /// Neutrino.
+    Unproduced {
+        /// The base address of the key.
+        addr: u64,
+        /// The version of the key.
+        version: u64,
+        /// The highest version of the base in the key's epoch; `None`
+        /// when the base had no write in that epoch.
+        highest: Option<u64>,
+    },
     /// Scoreboard and execution table leave no issue headroom (stall).
     NoHeadroom,
     /// The scoreboard has no free slot for this invoke (stall).
@@ -264,6 +349,20 @@ pub enum Warning {
         addr: u64,
         /// Executing entries that contain `addr`.
         count: u32,
+    },
+    /// An unversioned key and a versioned write meet at one address: no
+    /// write of the versioned range adopts or resolves the unversioned
+    /// key, so its waiters may never wake. Raised when an unversioned
+    /// lookup makes a pending entry for an address that is the base of a
+    /// version table entry or that a versioned task in the tables holds,
+    /// and when a versioned invoke's `dst` holds the address of an
+    /// unversioned pending entry.
+    UnversionedWait {
+        /// The address of the unversioned key.
+        addr: u64,
+        /// The versioned key: the counter of the base, or the key of the
+        /// versioned task.
+        versioned: Dep,
     },
 }
 
@@ -450,6 +549,11 @@ pub struct DepTables {
     /// Fences (program waits on the key 0) that wait for `untracked_len`
     /// to reach 0.
     fences: Vec<WaitId>,
+    /// The current epoch (set by a program start).
+    epoch: u64,
+    /// The highest version per (epoch, base) that a version assignment
+    /// or `nu.version` reached: a simulator check, not hardware state.
+    produced: HashMap<(u64, u64), u64>,
 }
 
 impl DepTables {
@@ -475,6 +579,29 @@ impl DepTables {
             version_peak: 0,
             untracked_len: 0,
             fences: Vec::new(),
+            epoch: 0,
+            produced: HashMap::new(),
+        }
+    }
+
+    /// The current epoch.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The counter of a base without a version table entry.
+    fn epoch_base(&self) -> u64 {
+        self.epoch << EPOCH_SHIFT
+    }
+
+    /// Records that base `addr` reached version `v`.
+    fn record_produced(&mut self, addr: u64, v: u64) {
+        let h = self
+            .produced
+            .entry((epoch_of(v) & EPOCH_MAX, addr))
+            .or_insert(v);
+        if version_order(v, *h) == Some(Ordering::Greater) {
+            *h = v;
         }
     }
 
@@ -572,12 +699,16 @@ impl DepTables {
 
     /// Looks `key` up: an in-flight producer in the scoreboard or the
     /// execution table, then the version counter (a versioned key), then
-    /// the pending table.
-    fn find(&self, key: &Dep) -> Found {
+    /// the pending table. A base without an entry reads as the epoch base.
+    /// The key is done when its version is not after the counter.
+    /// `EpochWindow` when the two have no order; `Unproduced` when a key of
+    /// an earlier epoch is done by the counter although its base never
+    /// reached it in that epoch.
+    fn find(&self, key: &Dep) -> Result<Found, DepError> {
         if let Some(&p) = self.pending_keys.get(key) {
-            return Found::Tags(vec![Tag::Pending(p)]);
+            return Ok(Found::Tags(vec![Tag::Pending(p)]));
         }
-        match *key {
+        Ok(match *key {
             Dep::Unversioned(a) => {
                 let tags = self.bind(self.covers(a));
                 if tags.is_empty() {
@@ -588,16 +719,46 @@ impl DepTables {
             }
             Dep::Versioned { addr, version } => {
                 if let Some(&t) = self.in_flight.get(&(addr, version)) {
-                    return Found::Tags(vec![Tag::Task(t)]);
+                    return Ok(Found::Tags(vec![Tag::Task(t)]));
                 }
-                let counter = self.versions.get(&addr).map_or(0, |e| e.counter);
-                if counter >= version {
-                    Found::Done
-                } else {
-                    Found::New
+                let counter = self
+                    .versions
+                    .get(&addr)
+                    .map_or(self.epoch_base(), |e| e.counter);
+                match version_order(version, counter) {
+                    None => {
+                        return Err(DepError::EpochWindow {
+                            addr,
+                            version,
+                            counter,
+                        })
+                    }
+                    Some(Ordering::Greater) => Found::New,
+                    Some(_) => {
+                        self.check_produced(addr, version)?;
+                        Found::Done
+                    }
                 }
             }
+        })
+    }
+
+    /// A key of an earlier epoch that a lookup finds done: its base must
+    /// have reached its version in that epoch.
+    fn check_produced(&self, addr: u64, version: u64) -> Result<(), DepError> {
+        let e = epoch_of(version);
+        if epoch_order(e, self.epoch) != Some(Ordering::Less) {
+            return Ok(());
         }
+        let highest = self.produced.get(&(e & EPOCH_MAX, addr)).copied();
+        if highest.is_some_and(|h| version_order(version, h) != Some(Ordering::Greater)) {
+            return Ok(());
+        }
+        Err(DepError::Unproduced {
+            addr,
+            version,
+            highest,
+        })
     }
 
     /// Enters a task in the scoreboard. `external_deps` counts the
@@ -656,12 +817,18 @@ impl DepTables {
                         new_mask: mask,
                     });
                 }
+                if e.counter & COUNT_MASK == COUNT_MASK {
+                    return Err(DepError::VersionOverflow {
+                        addr,
+                        counter: e.counter,
+                    });
+                }
                 e.counter + 1
             }
             None if self.versions.len() >= self.cfg.version_capacity => {
                 return Err(DepError::VersionsFull)
             }
-            None => 1,
+            None => self.epoch_base() + 1,
         };
         if self.in_flight.contains_key(&(addr, v)) {
             return Err(DepError::VersionInFlight { addr, version: v });
@@ -708,7 +875,7 @@ impl DepTables {
             }
             let plan = match new_pending.iter().position(|np| np == d) {
                 Some(k) => DepPlan::NewPending(k),
-                None => match self.find(d) {
+                None => match self.find(d)? {
                     Found::New => {
                         new_pending.push(*d);
                         DepPlan::NewPending(new_pending.len() - 1)
@@ -788,12 +955,19 @@ impl DepTables {
             );
             self.version_peak = self.version_peak.max(self.versions.len());
             self.in_flight.insert((spec.dst.base, v), task);
+            self.record_produced(spec.dst.base, v);
         }
 
+        if let Some(v) = version {
+            self.warn_unversioned_pending(spec.dst(), v, &mut effects);
+        }
         let new_pending_ids: Vec<PendingId> = new_pending
             .iter()
             .map(|k| self.insert_pending(*k))
             .collect();
+        for k in &new_pending {
+            self.warn_versioned_at(*k, &mut effects);
+        }
         effects.pending_created.extend(
             new_pending_ids
                 .iter()
@@ -900,19 +1074,56 @@ impl DepTables {
                 self.version_peak = self.version_peak.max(self.versions.len());
             }
         }
+        self.record_produced(addr, v);
         Ok(())
     }
 
     /// `nu.vreset` (local or from a `VersionReset` message): frees the entry of
     /// base address `addr`; an absent entry is a no-op. A producer still in
-    /// the tables keeps resolving its consumers by its own entry.
+    /// the tables keeps resolving its consumers by its own entry. The epoch
+    /// does not change.
     pub fn vreset(&mut self, addr: u64) {
         self.versions.remove(&addr);
     }
 
-    /// `nu.vreset_all`, and a program start: clears the version table.
+    /// `nu.vreset_all`: clears the version table. The epoch does not
+    /// change.
     pub fn vreset_all(&mut self) {
         self.versions.clear();
+    }
+
+    /// A program start with epoch `epoch`: clears the version table and
+    /// sets the epoch; pending and task entries stay. `StalePending` when a
+    /// pending entry names a versioned key whose epoch is not `epoch` and
+    /// not after it (nothing changes then). The records of the highest
+    /// versions keep only the epochs before `epoch`: after the start, the
+    /// numbers of the others are the current epoch, later epochs or the
+    /// epoch with no order. Panics on an epoch above [`EPOCH_MAX`].
+    pub fn start(&mut self, epoch: u64) -> Result<(), DepError> {
+        assert!(epoch <= EPOCH_MAX, "epoch {epoch} above {EPOCH_MAX}");
+        let stale = self.pending.iter().find_map(|(_, p)| match p.key {
+            Dep::Versioned { addr, version }
+                if !matches!(
+                    epoch_order(epoch_of(version), epoch),
+                    Some(Ordering::Equal | Ordering::Greater)
+                ) =>
+            {
+                Some((addr, version))
+            }
+            _ => None,
+        });
+        if let Some((addr, version)) = stale {
+            return Err(DepError::StalePending {
+                addr,
+                version,
+                epoch,
+            });
+        }
+        self.produced
+            .retain(|&(e, _), _| epoch_order(e, epoch) == Some(Ordering::Less));
+        self.versions.clear();
+        self.epoch = epoch;
+        Ok(())
     }
 
     /// The program returned: done unversioned entries retire, and executing
@@ -980,7 +1191,7 @@ impl DepTables {
     /// nothing produces it. No state changes on error.
     fn lookup_pending(&mut self, key: Dep, remote: bool) -> Result<(Vec<Tag>, Effects), DepError> {
         let mut out = Effects::default();
-        let pending: Vec<Tag> = match self.find(&key) {
+        let pending: Vec<Tag> = match self.find(&key)? {
             Found::Done => Vec::new(),
             Found::Tags(tags) => {
                 self.warn_covers(&tags, key, &mut out);
@@ -1143,7 +1354,52 @@ impl DepTables {
         }
         let p = self.insert_pending(key);
         out.pending_created.push((p, key));
+        self.warn_versioned_at(key, out);
         Ok(p)
+    }
+
+    /// Warns when a new pending entry of an unversioned key names the base
+    /// of a version table entry or an address that a versioned task in
+    /// the tables holds.
+    fn warn_versioned_at(&self, key: Dep, out: &mut Effects) {
+        let Dep::Unversioned(addr) = key else {
+            return;
+        };
+        let entry = self.versions.get(&addr).map(|e| Dep::Versioned {
+            addr,
+            version: e.counter,
+        });
+        let task = || {
+            self.tasks
+                .iter()
+                .filter(|(_, t)| t.version.is_some() && t.held().holds(self.cfg.granule, addr))
+                .max_by_key(|(_, t)| t.seq)
+                .map(|(_, t)| Dep::Versioned {
+                    addr: t.dst.base,
+                    version: t.version.expect("versioned"),
+                })
+        };
+        if let Some(versioned) = entry.or_else(task) {
+            out.warnings
+                .push(Warning::UnversionedWait { addr, versioned });
+        }
+    }
+
+    /// Warns when a versioned invoke of `dst` (version `v`) holds the
+    /// address of an unversioned pending entry.
+    fn warn_unversioned_pending(&self, dst: Dst, v: u64, out: &mut Effects) {
+        let versioned = Dep::Versioned {
+            addr: dst.span.base,
+            version: v,
+        };
+        for (_, p) in self.pending.iter() {
+            if let Dep::Unversioned(addr) = p.key {
+                if dst.holds(self.cfg.granule, addr) {
+                    out.warnings
+                        .push(Warning::UnversionedWait { addr, versioned });
+                }
+            }
+        }
     }
 
     /// Warns when a lookup of `key` resolves to more than one executing

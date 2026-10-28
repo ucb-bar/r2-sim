@@ -6,7 +6,7 @@ mod common;
 
 use common::{node, smem, sync, v1, Knobs};
 use nu_model::{Dep, DepError, Range, Warning};
-use sim_core::{Blocked, FatalError, SimWarning, Stats};
+use sim_core::{Blocked, BlockedProgram, FatalError, SimWarning, Stats};
 
 const KB8: u64 = 8192;
 
@@ -232,6 +232,22 @@ fn wait_on_a_range_nobody_produces_is_reported() {
     });
     let s = sim.run();
     assert_eq!(s.unfinished, vec![(n.nu, Blocked::Wait)]);
+    // A run that ends with a program that has not returned is a deadlock;
+    // the report names the wait and its key.
+    let f = s.fatal.as_ref().expect("a deadlock");
+    let FatalError::Deadlock { programs, .. } = &f.error else {
+        panic!("{f:?}");
+    };
+    assert_eq!(
+        programs,
+        &vec![BlockedProgram {
+            nu: n.nu,
+            blocked: Blocked::Wait,
+            call: "wait",
+            key: Some(Dep::Unversioned(x.base)),
+            owner: Some(n.nu),
+        }]
+    );
     assert_eq!(s.open_pending.len(), 1);
     assert_eq!(s.open_pending[0].pending.addr, x.base);
     assert_eq!(s.open_pending[0].last_writer, None, "nobody wrote X");
@@ -460,6 +476,10 @@ fn range_dep_on_versioned_data(check: bool) -> Stats {
 fn late_consumer_is_diagnosed() {
     let s = range_dep_on_versioned_data(true);
     assert_eq!(s.unfinished, vec![(s.tasks[0].nu, Blocked::Wait)]);
+    assert!(matches!(
+        s.fatal.as_ref().map(|f| &f.error),
+        Some(FatalError::Deadlock { .. })
+    ));
     // The end-of-run report names the completed writer.
     // (The wait on (C, 1) waits on the matmul itself, not a pending entry.)
     assert_eq!(s.open_pending.len(), 1);
@@ -479,10 +499,26 @@ fn late_consumer_is_diagnosed() {
             writer: Some(0)
         }
     );
-    // Off (the default): no warning; the deadlock and the report stay.
+    // The unversioned key names the base of a version table entry.
+    let unversioned: Vec<_> = s
+        .warnings
+        .iter()
+        .filter(|w| matches!(w.warning, SimWarning::Dep(_)))
+        .map(|w| w.warning)
+        .collect();
+    assert_eq!(
+        unversioned,
+        vec![SimWarning::Dep(Warning::UnversionedWait {
+            addr: smem(0, KB8).base,
+            versioned: v1(smem(0, KB8))
+        })]
+    );
+    // Off (the default): no LateConsumer warning; the deadlock, the report
+    // and the UnversionedWait warning stay.
     let s = range_dep_on_versioned_data(false);
-    assert!(s.warnings.is_empty());
+    assert_eq!(s.warnings.len(), 1);
     assert_eq!(s.unfinished.len(), 1);
+    assert!(s.fatal.is_some());
 }
 
 #[test]

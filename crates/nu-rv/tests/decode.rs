@@ -217,7 +217,8 @@ fn spawn_and_imem_copy() {
     let done = 0x1_F000_0000_u64;
     let mut args = Vec::new();
     args.extend(1u16.to_le_bytes());
-    args.extend(0u16.to_le_bytes());
+    // The epoch of the started program.
+    args.extend(3u16.to_le_bytes());
     args.extend(0x2au32.to_le_bytes());
     args.extend(0x1_F100_0100_u64.to_le_bytes());
     let d = Desc {
@@ -236,6 +237,7 @@ fn spawn_and_imem_copy() {
             done: Range::from_len(done, 512),
             deps: vec![],
             child: 1,
+            epoch: 3,
             entry: 0x2a,
             args: 0x1_F100_0100
         }

@@ -105,6 +105,35 @@ pub(crate) enum Request {
     Fail(String),
 }
 
+impl Request {
+    /// The name of the call (a deadlock report).
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Request::Invoke(_) => "invoke",
+            Request::Wait(FENCE) => "fence",
+            Request::Wait(_) => "wait",
+            Request::Version(..) => "version",
+            Request::VersionReset => "version_reset",
+            Request::VReset(_) => "vreset",
+            Request::Cycles(_) => "cycles",
+            Request::Load { .. } => "load",
+            Request::Store { .. } => "store",
+            Request::Mark(_) => "mark",
+            Request::CacheFlush => "cache_flush",
+            Request::Spawn { .. } => "spawn",
+            Request::Fail(_) => "fail",
+        }
+    }
+
+    /// The key of a wait.
+    pub(crate) fn key(&self) -> Option<Dep> {
+        match self {
+            Request::Wait(k) => Some(*k),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Response {
     Invoked(TaskHandle),
@@ -128,6 +157,9 @@ pub enum ProgramName {
 pub(crate) struct StartFn {
     pub run: Box<dyn FnOnce(NuCtx) -> ProgramFuture>,
     pub name: ProgramName,
+    /// The epoch of the started program; above `EPOCH_MAX` is an error at
+    /// the spawn.
+    pub epoch: u16,
 }
 
 #[derive(Default)]
@@ -208,6 +240,8 @@ pub struct NuCtx {
     /// The Neutrino's `c_plan`.
     plan_cost: Cycle,
     core: Core,
+    /// The epoch the program started with.
+    epoch: u64,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -228,6 +262,7 @@ impl NuCtx {
         children: Vec<NeutrinoId>,
         plan_cost: Cycle,
         core: Core,
+        epoch: u64,
     ) -> Self {
         Self {
             id,
@@ -236,7 +271,13 @@ impl NuCtx {
             children: Rc::new(children),
             plan_cost,
             core,
+            epoch,
         }
+    }
+
+    /// The epoch of the Neutrino: the one its program started with.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// The Neutrino's scalar core: IMEM, data scratch and prefix.
@@ -283,7 +324,8 @@ impl NuCtx {
     }
 
     /// [`NuCtx::spawn_named`] with a [`ProgramName`], and the PC of the
-    /// spawn descriptor of an RV program (which charges no `c_desc`).
+    /// spawn descriptor of an RV program (which charges no `c_desc`). The
+    /// child starts in epoch 0.
     pub async fn spawn_program(
         &self,
         child: NeutrinoId,
@@ -293,9 +335,28 @@ impl NuCtx {
         pc: Option<u64>,
         program: impl NeutrinoProgram + 'static,
     ) -> TaskHandle {
+        self.spawn_in_epoch(child, name, done, deps, pc, 0, program)
+            .await
+    }
+
+    /// [`NuCtx::spawn_program`] with the epoch of the child's program: its
+    /// start clears the child's version table and sets the child's epoch.
+    /// An epoch above `EPOCH_MAX` stops the run at the spawn.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_in_epoch(
+        &self,
+        child: NeutrinoId,
+        name: ProgramName,
+        done: Range,
+        deps: Vec<Dep>,
+        pc: Option<u64>,
+        epoch: u16,
+        program: impl NeutrinoProgram + 'static,
+    ) -> TaskHandle {
         let start = StartFn {
             run: Box::new(move |ctx| Box::pin(program.run(ctx))),
             name,
+            epoch,
         };
         self.mb.borrow_mut().spawn = Some(start);
         match self

@@ -1,7 +1,7 @@
 //! Run outputs (r2sim spec Section 11): plain structs that serialize to
 //! the `--stats` JSON.
 
-use nu_model::{Addr, DepError, NeutrinoId, OpenPending, Range, TaskId, Warning};
+use nu_model::{Addr, Dep, DepError, NeutrinoId, OpenPending, Range, TaskId, Warning};
 
 use crate::profile::{OpcodeId, PeId};
 use crate::resource::{ResourceId, ResourceStats};
@@ -116,8 +116,9 @@ pub enum FatalError {
     /// A feature of a later step.
     Unsupported(&'static str),
     /// No task issued or completed, no PE ran and no message moved for
-    /// `idle` cycles (checked at an `Await` resend), or messages are left
-    /// in the channels when no event is left.
+    /// `idle` cycles (checked at an `Await` resend), or, when no event is
+    /// left, messages are left in the channels or a program has not
+    /// returned.
     Deadlock {
         /// Cycles since the last issue, completion or message move.
         idle: Cycle,
@@ -125,7 +126,25 @@ pub enum FatalError {
         tables: Vec<TableState>,
         /// Every channel stage that holds messages.
         stages: Vec<StageState>,
+        /// Every program that has not returned.
+        programs: Vec<BlockedProgram>,
     },
+}
+
+/// A program that has not returned, and what it waits on (a deadlock
+/// report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct BlockedProgram {
+    /// The program's Neutrino.
+    pub nu: NeutrinoId,
+    /// Where it is blocked.
+    pub blocked: Blocked,
+    /// Its last call (`return`: the return waits for its untracked tasks).
+    pub call: &'static str,
+    /// The key of a wait (not the fence).
+    pub key: Option<Dep>,
+    /// The owner of `key`.
+    pub owner: Option<NeutrinoId>,
 }
 
 /// A channel stage that holds messages (a deadlock report).

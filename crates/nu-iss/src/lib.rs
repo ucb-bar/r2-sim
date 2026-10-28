@@ -73,8 +73,8 @@ pub enum Event {
     Break { pc: u64 },
 }
 
-/// One hart: program counter, integer registers with their taint, and the
-/// node prefix that CSR 0xFC0 returns.
+/// One hart: program counter, integer registers with their taint, the node
+/// prefix that CSR 0xFC0 returns and the epoch that CSR 0xFC1 returns.
 #[derive(Debug, Clone)]
 pub struct Hart {
     pub pc: u64,
@@ -83,6 +83,8 @@ pub struct Hart {
     pub t: [u64; 32],
     /// CSR 0xFC0: the global prefix of the node.
     pub prefix: u64,
+    /// CSR 0xFC1: the epoch of the node (0 unless the client sets it).
+    pub epoch: u64,
     /// Instructions retired (CSRs cycle and instret return it).
     pub retired: u64,
     /// Set by the first branch or jump that depends on a tainted value.
@@ -91,6 +93,7 @@ pub struct Hart {
 
 /// CSR numbers.
 pub const CSR_PREFIX: u16 = 0xfc0;
+pub const CSR_EPOCH: u16 = 0xfc1;
 const CSR_CYCLE: u16 = 0xc00;
 const CSR_INSTRET: u16 = 0xc02;
 const CSR_MHARTID: u16 = 0xf14;
@@ -102,6 +105,7 @@ impl Hart {
             x: [0; 32],
             t: [0; 32],
             prefix,
+            epoch: 0,
             retired: 0,
             uncertain: false,
         }
@@ -123,6 +127,7 @@ impl Hart {
     fn csr(&self, pc: u64, csr: u16) -> Result<u64, Fault> {
         match csr {
             CSR_PREFIX => Ok(self.prefix),
+            CSR_EPOCH => Ok(self.epoch),
             CSR_CYCLE | CSR_INSTRET => Ok(self.retired),
             CSR_MHARTID => Ok(0),
             _ => Err(Fault::Csr { pc, csr }),

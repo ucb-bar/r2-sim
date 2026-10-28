@@ -33,12 +33,13 @@ pub enum Decoded {
     /// A task: JOIN, DMA, MATMUL or VECTOR.
     Task(Descriptor),
     /// SPAWN: start `entry` on direct child `child` (its index among the
-    /// direct children) with the arguments at `args`; `done` completes
-    /// when the child's program returns.
+    /// direct children) in epoch `epoch` with the arguments at `args`;
+    /// `done` completes when the child's program returns.
     Spawn {
         done: Range,
         deps: Vec<nu_model::Dep>,
         child: u16,
+        epoch: u16,
         entry: u32,
         args: u64,
     },
@@ -201,6 +202,7 @@ pub fn decode(
             done: dst,
             deps,
             child: u16_at(a, 0),
+            epoch: u16_at(a, 2),
             entry: u32_at(a, 4),
             args: u64_at(a, 8),
         },
