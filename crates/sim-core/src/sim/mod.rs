@@ -1310,7 +1310,7 @@ impl Sim {
         // A program start resets the Neutrino's version table (Neutrino spec Section 7.7).
         // The host start of the device program has epoch 0.
         n.tables
-            .start(0)
+            .set_epoch(0)
             .expect("a start in epoch 0 finds no pending entry of an earlier epoch");
         n.program = Some(Box::pin(program.run(ctx)));
         n.prog_name = name;
@@ -1605,7 +1605,7 @@ impl Sim {
         let cost = match &req {
             Request::Invoke(_) => c.invoke,
             Request::Wait(_) => c.wait,
-            Request::Version(..) | Request::VersionReset => c.version,
+            Request::Version(..) | Request::VersionReset | Request::Epoch(_) => c.version,
             Request::VReset(_) => c.vreset,
             Request::Cycles(k) => *k,
             Request::Load { .. } => c.load,
@@ -1803,6 +1803,19 @@ impl Sim {
             }
             Request::VersionReset => {
                 self.nus[nu.0 as usize].tables.vreset_all();
+                let now = self.now;
+                trace!(self, t => t.entries_clear(nu, Table::Versions, now));
+                self.respond(nu, Response::Done);
+            }
+            Request::Epoch(e) => {
+                if e > nu_model::EPOCH_MAX {
+                    let msg = format!("epoch {e}, above {}", nu_model::EPOCH_MAX);
+                    return self.fatal(nu, None, FatalError::Invalid(msg));
+                }
+                // An epoch change as at a program start.
+                if let Err(err) = self.nus[nu.0 as usize].tables.set_epoch(e) {
+                    return self.fatal(nu, None, FatalError::Dep(err));
+                }
                 let now = self.now;
                 trace!(self, t => t.entries_clear(nu, Table::Versions, now));
                 self.respond(nu, Response::Done);

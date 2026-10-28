@@ -602,7 +602,7 @@ fn a_key_of_an_earlier_epoch_whose_producer_retired_is_done() {
     let a = r(0, 4);
     let p = run(&mut tb, tv(a, &[]));
     tb.complete(p);
-    tb.start(1).unwrap();
+    tb.set_epoch(1).unwrap();
     assert_eq!(tb.epoch(), 1);
     assert_eq!(
         tb.version_counter(a.base),
@@ -623,7 +623,7 @@ fn a_key_of_an_earlier_epoch_waits_for_its_producer_in_flight() {
     let mut tb = tables();
     let a = r(0, 4);
     let p = run(&mut tb, tv(a, &[]));
-    tb.start(1).unwrap();
+    tb.set_epoch(1).unwrap();
     let n = run(&mut tb, tv(a, &[]));
     let c = tb
         .invoke(TaskSpec::new(r(8, 1), vec![key(a, 1)]), 0)
@@ -640,7 +640,7 @@ fn a_key_of_a_later_epoch_is_adopted_by_the_write_of_that_epoch() {
     // epoch 2 does.
     let mut tb = tables();
     let a = r(0, 4);
-    tb.start(1).unwrap();
+    tb.set_epoch(1).unwrap();
     let c = tb
         .invoke(TaskSpec::new(r(8, 1), vec![key(a, ev(2, 1))]), 0)
         .unwrap();
@@ -651,7 +651,7 @@ fn a_key_of_a_later_epoch_is_adopted_by_the_write_of_that_epoch() {
     assert!(w1.effects.adopted.is_empty());
     tb.issue(w1.task).unwrap();
     assert!(tb.complete(w1.task).ready.is_empty());
-    tb.start(2).unwrap();
+    tb.set_epoch(2).unwrap();
     let w2 = tb.invoke(tv(a, &[]), 0).unwrap();
     assert_eq!(w2.version, Some(ev(2, 1)));
     assert_eq!(w2.effects.adopted.len(), 1);
@@ -671,7 +671,7 @@ fn a_version_that_would_enter_the_next_epoch_is_an_error() {
             counter: COUNT_MASK
         }
     );
-    tb.start(1).unwrap();
+    tb.set_epoch(1).unwrap();
     tb.set_version(a.base, ev(1, COUNT_MASK - 1)).unwrap();
     assert_eq!(
         tb.invoke(tv(a, &[]), 0).unwrap().version,
@@ -690,7 +690,7 @@ fn a_pending_key_of_an_earlier_epoch_at_a_start_is_an_error() {
         WaitStatus::Pending(_)
     ));
     assert_eq!(
-        tb.start(1).unwrap_err(),
+        tb.set_epoch(1).unwrap_err(),
         DepError::StalePending {
             addr: a.base,
             version: 1,
@@ -698,13 +698,13 @@ fn a_pending_key_of_an_earlier_epoch_at_a_start_is_an_error() {
         }
     );
     assert_eq!(tb.epoch(), 0, "a refused start changes nothing");
-    tb.start(0).unwrap();
+    tb.set_epoch(0).unwrap();
     let mut tb = tables();
     assert!(matches!(
         tb.wait(key(a, ev(1, 1))).unwrap().0,
         WaitStatus::Pending(_)
     ));
-    tb.start(1).unwrap();
+    tb.set_epoch(1).unwrap();
 }
 
 #[test]
@@ -718,7 +718,7 @@ fn a_key_that_its_epoch_never_produced_is_an_error() {
         let p = run(&mut tb, tv(a, &[]));
         tb.complete(p);
     }
-    tb.start(1).unwrap();
+    tb.set_epoch(1).unwrap();
     assert_eq!(tb.wait(key(a, 2)).unwrap().0, WaitStatus::Done);
     let never_a = DepError::Unproduced {
         addr: a.base,
@@ -751,13 +751,13 @@ fn a_start_that_reuses_epoch_numbers_drops_their_records() {
     // dropped, so after epoch 2 the same key was never produced.
     let mut tb = tables();
     let c = r(0, 4);
-    tb.start(1).unwrap();
+    tb.set_epoch(1).unwrap();
     let p = run(&mut tb, tv(c, &[]));
     tb.complete(p);
-    tb.start(2).unwrap();
+    tb.set_epoch(2).unwrap();
     assert_eq!(tb.wait(key(c, ev(1, 1))).unwrap().0, WaitStatus::Done);
-    tb.start(1).unwrap();
-    tb.start(2).unwrap();
+    tb.set_epoch(1).unwrap();
+    tb.set_epoch(2).unwrap();
     assert!(matches!(
         tb.wait(key(c, ev(1, 1))).unwrap_err(),
         DepError::Unproduced { highest: None, .. }
@@ -768,7 +768,7 @@ fn a_start_that_reuses_epoch_numbers_drops_their_records() {
 fn vreset_keeps_the_epoch() {
     let mut tb = tables();
     let a = r(0, 4);
-    tb.start(3).unwrap();
+    tb.set_epoch(3).unwrap();
     run(&mut tb, tv(a, &[]));
     tb.vreset(a.base);
     tb.vreset_all();
@@ -799,11 +799,11 @@ fn lookups_across_the_wrap_of_the_epochs() {
     // P writes (A, 255:1) in epoch 255 and is still executing in epoch 1.
     let mut tb = tables();
     let a = r(0, 4);
-    tb.start(255).unwrap();
+    tb.set_epoch(255).unwrap();
     let p = run(&mut tb, tv(a, &[]));
     assert_eq!(tb.version_counter(a.base), Some(ev(255, 1)));
-    tb.start(0).unwrap();
-    tb.start(1).unwrap();
+    tb.set_epoch(0).unwrap();
+    tb.set_epoch(1).unwrap();
     let c = tb
         .invoke(TaskSpec::new(r(8, 1), vec![key(a, ev(255, 1))]), 0)
         .unwrap();
@@ -832,11 +832,11 @@ fn the_records_of_the_highest_versions_across_the_wrap() {
     // (B, 255:2) was never produced.
     let mut tb = tables();
     let b = r(4, 4);
-    tb.start(254).unwrap();
-    tb.start(255).unwrap();
+    tb.set_epoch(254).unwrap();
+    tb.set_epoch(255).unwrap();
     let p = run(&mut tb, tv(b, &[]));
     tb.complete(p);
-    tb.start(0).unwrap();
+    tb.set_epoch(0).unwrap();
     assert_eq!(tb.wait(key(b, ev(255, 1))).unwrap().0, WaitStatus::Done);
     assert_eq!(
         tb.wait(key(b, ev(255, 2))).unwrap_err(),
@@ -855,9 +855,9 @@ fn the_records_of_the_highest_versions_across_the_wrap() {
         let p = run(&mut tb, tv(x, &[]));
         tb.complete(p);
         for &e in mid {
-            tb.start(e).unwrap();
+            tb.set_epoch(e).unwrap();
         }
-        tb.start(1).unwrap();
+        tb.set_epoch(1).unwrap();
         tb.wait(key(x, ev(0, 1))).map(|w| w.0)
     };
     assert_eq!(produced_then_started(&[]), Ok(WaitStatus::Done));
@@ -877,13 +877,13 @@ fn stale_pending_keys_across_the_wrap() {
     // before epoch 1.
     let mut tb = tables();
     let a = r(0, 4);
-    tb.start(255).unwrap();
+    tb.set_epoch(255).unwrap();
     assert!(matches!(
         tb.wait(key(a, ev(255, 1))).unwrap().0,
         WaitStatus::Pending(_)
     ));
     assert_eq!(
-        tb.start(1).unwrap_err(),
+        tb.set_epoch(1).unwrap_err(),
         DepError::StalePending {
             addr: a.base,
             version: ev(255, 1),
@@ -896,7 +896,7 @@ fn stale_pending_keys_across_the_wrap() {
         tb.wait(key(a, ev(1, 1))).unwrap().0,
         WaitStatus::Pending(_)
     ));
-    tb.start(0).unwrap();
+    tb.set_epoch(0).unwrap();
 }
 
 #[test]

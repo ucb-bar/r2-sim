@@ -4,7 +4,9 @@
 //! [`Hart::step`] runs one instruction against a [`Bus`]. A `nu.*`
 //! instruction does not change the hart: `step` returns it as an
 //! [`Event`] for the caller, the Neutrino model, which then writes the
-//! result register with [`Hart::set`].
+//! result register with [`Hart::set`]. A CSR instruction that writes CSR
+//! 0xFC1 (the instruction `epoch`) sets [`Hart::epoch`] and also returns an
+//! [`Event`], so that the Neutrino model changes its epoch.
 //!
 //! Every bit of a register carries a taint bit, and a [`Bus`] keeps taint
 //! for the bytes of its memory. A load from a tainted byte taints the bits
@@ -67,6 +69,9 @@ pub enum Event {
     Vreset { pc: u64, base: u64, taint: u64 },
     /// `nu.vreset_all`.
     VresetAll { pc: u64 },
+    /// `epoch`: a CSR instruction wrote `epoch` to CSR 0xFC1 (the hart's
+    /// `epoch` already holds it).
+    Epoch { pc: u64, epoch: u64, taint: u64 },
     /// `nu.exit`: the program ends.
     Exit { pc: u64 },
     /// `ebreak` or `ecall`.
@@ -83,7 +88,8 @@ pub struct Hart {
     pub t: [u64; 32],
     /// CSR 0xFC0: the global prefix of the node.
     pub prefix: u64,
-    /// CSR 0xFC1: the epoch of the node (0 unless the client sets it).
+    /// CSR 0xFC1: the epoch of the node (0 unless the client sets it). A
+    /// CSR instruction that writes it sets it and returns [`Event::Epoch`].
     pub epoch: u64,
     /// Instructions retired (CSRs cycle and instret return it).
     pub retired: u64,
@@ -245,9 +251,29 @@ impl Hart {
                 csr,
             } => {
                 let old = self.csr(pc, csr)?;
-                // The CSRs here are read-only: a write is ignored.
-                let _ = (f, rs1, uimm);
+                let (src, taint) = if f >= 5 {
+                    (uimm as u64, 0)
+                } else {
+                    self.get(rs1)
+                };
+                // csrrs and csrrc (and their immediate forms) with x0 or
+                // a zero immediate only read.
+                let writes = matches!(f, 1 | 5) || rs1 != 0;
                 self.set(rd, old, 0);
+                // CSR 0xFC1 is read-write; a write to the others is
+                // ignored.
+                if writes && csr == CSR_EPOCH {
+                    self.epoch = match f & 3 {
+                        1 => src,
+                        2 => old | src,
+                        _ => old & !src,
+                    };
+                    event = Some(Event::Epoch {
+                        pc,
+                        epoch: self.epoch,
+                        taint,
+                    });
+                }
             }
             Fence => {}
             Ecall | Ebreak => event = Some(Event::Break { pc }),

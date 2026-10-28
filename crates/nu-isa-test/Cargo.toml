@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 nu-iss = { path = "../nu-iss" }
+nu-model = { path = "../nu-model" }
 object = { version = "0.36", default-features = false, features = ["read", "std", "elf"] }
 
 [lints]

@@ -1430,7 +1430,7 @@ impl Sim {
         );
         // A program start resets the Neutrino's version table (Neutrino spec Section 7.7)
         // and sets its epoch.
-        if let Err(e) = n.tables.start(start.epoch as u64) {
+        if let Err(e) = n.tables.set_epoch(start.epoch as u64) {
             return self.fatal(child, None, FatalError::Dep(e));
         }
         let n = &mut self.nus[child.0 as usize];

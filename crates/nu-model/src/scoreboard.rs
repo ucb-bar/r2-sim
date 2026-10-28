@@ -30,9 +30,9 @@
 //! which the caller turns into events.
 //!
 //! Epochs: a version is `epoch << EPOCH_SHIFT | count`. Each Neutrino has a
-//! current epoch, set by a program start. A base without a version table
-//! entry reads as the epoch base `epoch << EPOCH_SHIFT`, both for version
-//! assignment and for the lookup. Epochs compare as serial numbers of 8
+//! current epoch, set by a program start or by the instruction `epoch`. A
+//! base without a version table entry reads as the epoch base
+//! `epoch << EPOCH_SHIFT`, both for version assignment and for the lookup. Epochs compare as serial numbers of 8
 //! bits ([`version_order`]): the numbering wraps from 255 to 0, and two
 //! epochs that a lookup compares must be less than 128 apart. So a key of
 //! an earlier epoch is done (unless its producer is still in flight), and
@@ -549,7 +549,7 @@ pub struct DepTables {
     /// Fences (program waits on the key 0) that wait for `untracked_len`
     /// to reach 0.
     fences: Vec<WaitId>,
-    /// The current epoch (set by a program start).
+    /// The current epoch (set by a program start or the instruction `epoch`).
     epoch: u64,
     /// The highest version per (epoch, base) that a version assignment
     /// or `nu.version` reached: a simulator check, not hardware state.
@@ -1092,14 +1092,15 @@ impl DepTables {
         self.versions.clear();
     }
 
-    /// A program start with epoch `epoch`: clears the version table and
-    /// sets the epoch; pending and task entries stay. `StalePending` when a
-    /// pending entry names a versioned key whose epoch is not `epoch` and
-    /// not after it (nothing changes then). The records of the highest
-    /// versions keep only the epochs before `epoch`: after the start, the
-    /// numbers of the others are the current epoch, later epochs or the
-    /// epoch with no order. Panics on an epoch above [`EPOCH_MAX`].
-    pub fn start(&mut self, epoch: u64) -> Result<(), DepError> {
+    /// An epoch change, at a program start with epoch `epoch` or at the
+    /// instruction `epoch`: clears the version table and sets the epoch;
+    /// pending and task entries stay. `StalePending` when a pending entry
+    /// names a versioned key whose epoch is not `epoch` and not after it
+    /// (nothing changes then). The records of the highest versions keep
+    /// only the epochs before `epoch`: after the change, the numbers of the
+    /// others are the current epoch, later epochs or the epoch with no
+    /// order. Panics on an epoch above [`EPOCH_MAX`].
+    pub fn set_epoch(&mut self, epoch: u64) -> Result<(), DepError> {
         assert!(epoch <= EPOCH_MAX, "epoch {epoch} above {EPOCH_MAX}");
         let stale = self.pending.iter().find_map(|(_, p)| match p.key {
             Dep::Versioned { addr, version }

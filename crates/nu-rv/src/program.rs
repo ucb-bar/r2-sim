@@ -3,9 +3,10 @@
 //! At its start the program writes the start mailbox `{entry, args,
 //! done}` to offset 0 of its data scratch and starts at IMEM offset 4,
 //! with CSR 0xFC0 the node's prefix and CSR 0xFC1 its epoch (that of the
-//! spawn that started it). It then runs instructions in
-//! batches: a batch ends at a `nu.*` instruction or at a load or store
-//! outside the IMEM and the own data scratch. The batch's instruction
+//! spawn that started it, until the program writes it). It then runs
+//! instructions in batches: a batch ends at a `nu.*` instruction, at a
+//! write of CSR 0xFC1, or at a load or store outside the IMEM and the own
+//! data scratch. The batch's instruction
 //! cycles are charged on the scalar resource (the `scalar` costs of the
 //! Neutrino), then the request is made:
 //!
@@ -13,6 +14,8 @@
 //!   version of a local versioned invoke, else 0;
 //! * `nu.wait rs1`: the key, 0 for the fence;
 //! * `nu.version`, `nu.vreset` (granule addresses), `nu.vreset_all`;
+//! * a CSR instruction that writes CSR 0xFC1: the instruction `epoch` with
+//!   the value written;
 //! * `nu.exit`: the program returns;
 //! * a SPAWN descriptor: the RV program at `entry` on the direct child of
 //!   that index, with the arguments at `args`; the tracer names it by the
@@ -498,6 +501,7 @@ impl RvProgram {
                     ctx.vreset(base << self.abi.granule_shift).await
                 }
                 Stop::Event(Event::VresetAll { .. }) => ctx.vreset_all().await,
+                Stop::Event(Event::Epoch { epoch, .. }) => ctx.set_epoch(epoch).await,
             }
         }
     }

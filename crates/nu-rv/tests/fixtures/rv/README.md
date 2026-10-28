@@ -1,9 +1,10 @@
 # RV test images
 
 Each image `NAME.bin` has an image file `NAME.toml` that loads it into
-the IMEM of the root node, for `r2sim run --config configs/2p-smem.yaml
---program rv --image NAME.toml`. The golden check (`tools/golden.sh`)
-runs the three images.
+the IMEM of the root node, for `r2sim run --config CONFIG --program rv
+--image NAME.toml`. `hello.bin` and `three-level.bin` run on
+configs/2p-smem.yaml, and `encoder.bin` runs on configs/2p.yaml. The
+golden check (`tools/golden.sh`) runs the three images.
 
 `hello.bin` (384 bytes) is a device program as an RV64 program: it loads
 two tiles into the SMEM of an SM, multiplies them there and copies the
@@ -93,16 +94,22 @@ offset 0xd8 of the device image) and `sm_tile` (node type `sm`, a
 224-byte image at offset 0xf8 of the cluster image). Each record has
 entry 0x2a.
 
-`encoder.bin` (5768 bytes) is a vision encoder kernel (27 layers of width
-1152, 16 heads of 72, an FFN of 4304, three images of 256 patches, and a
-projector to a width of 2048), built by the r2-toolchain for
-configs/2p-smem.yaml. It models time only: the functional plane does not
-compute its values. The image holds every program of the kernel: the
-device program `encoder` (node type `root`) embeds the image of the
-cluster program `encoder_cluster` (node type `gpc`), which embeds the
-images of the SM programs `gemm` and `attention` (node type `sm`). The
-device starts `encoder_cluster` on each cluster. A cluster holds one half
-of the patches of each image and runs the steps of the encoder one after
-the other on its SMs: a GEMM splits its output tiles over the SMs, and
-attention splits the heads. Attention reads the keys and values of the
-other half of each image from the HBM of the other cluster.
+`encoder.bin` (14,608 bytes) is a vision encoder kernel (27 layers of
+width 1152, 16 heads of 72, an FFN of 4304, three images of 256 patches,
+and a projector to a width of 2048), built by the r2-toolchain
+(`r2-build --config configs/2p.yaml`). It models time only: the
+functional plane does not compute its values. It runs on configs/2p.yaml:
+the Atlas operands are in the tensor memory of each SM, and on
+configs/2p-smem.yaml the run stops with `Unowned`. The image holds every
+program of the kernel: the device program `encoder` (node type `root`,
+entry 0x2a) embeds the image of the cluster program `encoder_cluster`
+(node type `gpc`, entry 0x314, 14,288 bytes), which embeds the image of
+the SM program `encoder_step` (node type `sm`, entry 0x1e00, 10,496
+bytes). The device starts `encoder_cluster` on each cluster. A cluster
+holds one half of the patches of each image and runs the steps of the
+encoder in stream order: for each step it starts one `encoder_step`
+program on each SM, in epoch step + 1. A GEMM step splits its output
+tiles over the SMs, and an attention step splits the heads; attention
+reads the keys and values of the other half of each image from the HBM
+of the other cluster. A step program returns without waiting for its
+tasks, and the programs of the next step name the keys of those tasks.

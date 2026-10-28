@@ -137,6 +137,7 @@ name = "nu-isa-test"
 version = "0.1.0"
 dependencies = [
  "nu-iss",
+ "nu-model",
  "object",
 ]
 

@@ -79,6 +79,8 @@ pub(crate) enum Request {
     Version(u64, u64),
     VersionReset,
     VReset(u64),
+    /// The instruction `epoch`.
+    Epoch(u64),
     Cycles(u64),
     Load {
         addr: Addr,
@@ -115,6 +117,7 @@ impl Request {
             Request::Version(..) => "version",
             Request::VersionReset => "version_reset",
             Request::VReset(_) => "vreset",
+            Request::Epoch(_) => "epoch",
             Request::Cycles(_) => "cycles",
             Request::Load { .. } => "load",
             Request::Store { .. } => "store",
@@ -240,8 +243,9 @@ pub struct NuCtx {
     /// The Neutrino's `c_plan`.
     plan_cost: Cycle,
     core: Core,
-    /// The epoch the program started with.
-    epoch: u64,
+    /// The epoch of the Neutrino: the one the program started with, or
+    /// the last `set_epoch`.
+    epoch: Rc<Cell<u64>>,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -271,13 +275,23 @@ impl NuCtx {
             children: Rc::new(children),
             plan_cost,
             core,
-            epoch,
+            epoch: Rc::new(Cell::new(epoch)),
         }
     }
 
-    /// The epoch of the Neutrino: the one its program started with.
+    /// The epoch of the Neutrino: the one its program started with, or the
+    /// last [`NuCtx::set_epoch`].
     pub fn epoch(&self) -> u64 {
-        self.epoch
+        self.epoch.get()
+    }
+
+    /// The instruction `epoch e`: an epoch change as at a program start
+    /// with epoch `e`. It clears the version table and sets the epoch;
+    /// pending and task entries stay, and the checks of a start apply.
+    /// Costs `c_version`. An epoch above 255 stops the run (`Invalid`).
+    pub async fn set_epoch(&self, e: u64) {
+        self.call(Request::Epoch(e)).await;
+        self.epoch.set(e);
     }
 
     /// The Neutrino's scalar core: IMEM, data scratch and prefix.

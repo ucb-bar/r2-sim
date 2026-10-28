@@ -28,11 +28,13 @@
 //! error. Its test case n stops the run at the `ebreak` at `nu_fail_table
 //! + 4n`, and the PC of the error gives n.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nu_iss::{Bus, Event, Fault, Hart};
+use nu_model::{version_order, EPOCH_MAX, EPOCH_SHIFT};
 use object::{Object, ObjectSegment, ObjectSymbol};
 
 /// Bytes of the flat memory of a test on nu-iss.
@@ -198,9 +200,13 @@ impl Bus for Flat {
     }
 }
 
-/// The version table of the model Neutrino, by base granule.
+/// The version table of the model Neutrino, by base granule, and its
+/// epoch. A base without an entry reads as the epoch base.
 #[derive(Default)]
-struct Versions(HashMap<u64, u64>);
+struct Versions {
+    counters: HashMap<u64, u64>,
+    epoch: u64,
+}
 
 impl Versions {
     /// The result of `nu.invoke` on the descriptor at `desc`.
@@ -213,7 +219,10 @@ impl Versions {
         let base = u64::from_le_bytes(h[8..16].try_into().expect("8 bytes"));
         let versioned = flags & 1 != 0 && flags & 2 == 0;
         Ok(if versioned {
-            let v = self.0.entry(base).or_insert(0);
+            let v = self
+                .counters
+                .entry(base)
+                .or_insert(self.epoch << EPOCH_SHIFT);
             *v += 1;
             *v
         } else {
@@ -221,11 +230,29 @@ impl Versions {
         })
     }
 
+    /// The instruction `epoch`: clears the version table and sets the
+    /// epoch.
+    fn set_epoch(&mut self, epoch: u64) -> Result<(), String> {
+        if epoch > EPOCH_MAX {
+            return Err(format!("epoch {epoch}, above {EPOCH_MAX}"));
+        }
+        self.counters.clear();
+        self.epoch = epoch;
+        Ok(())
+    }
+
     /// Checks that `nu.wait` on `key` can return.
     fn wait(&self, key: u64) -> Result<(), String> {
         let (version, granule) = (key >> KEY_BITS, key & ((1 << KEY_BITS) - 1));
-        let made = self.0.get(&granule).copied().unwrap_or(0);
-        if version > made {
+        let made = self.counters.get(&granule).copied();
+        let made = made.unwrap_or(self.epoch << EPOCH_SHIFT);
+        // Version 0: an unversioned key, which the model does not check.
+        if version != 0
+            && !matches!(
+                version_order(version, made),
+                Some(Ordering::Less | Ordering::Equal)
+            )
+        {
             return Err(format!(
                 "nu.wait on version {version} of granule {granule:#x}, of which no invoke made more than {made}: the program would block"
             ));
@@ -274,17 +301,18 @@ fn execute(mut mem: Flat, entry: u64) -> (Outcome, Hart) {
             }
             Some(Event::Wait { key, .. }) => versions.wait(key),
             Some(Event::Version { base, counter, .. }) => {
-                versions.0.insert(base, counter);
+                versions.counters.insert(base, counter);
                 Ok(())
             }
             Some(Event::Vreset { base, .. }) => {
-                versions.0.remove(&base);
+                versions.counters.remove(&base);
                 Ok(())
             }
             Some(Event::VresetAll { .. }) => {
-                versions.0.clear();
+                versions.counters.clear();
                 Ok(())
             }
+            Some(Event::Epoch { epoch, .. }) => versions.set_epoch(epoch),
         };
         if let Err(e) = result {
             return (Outcome::Error(format!("pc {pc:#x}: {e}")), hart);
