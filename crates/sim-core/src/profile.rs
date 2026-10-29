@@ -209,6 +209,11 @@ pub struct Descriptor {
     /// instruction cycles, so the invoke charges no `c_desc`. `None` for
     /// the descriptors of the Rust programs.
     pub pc: Option<u64>,
+    /// The call path of the RV program at `pc`: the PCs of the call
+    /// instructions from the program function to the frame that made the
+    /// task, outermost first (raw trace 1.11). Empty for a task made in
+    /// the program function, and for the Rust programs.
+    pub call_path: Vec<u32>,
 }
 
 impl Descriptor {
@@ -224,6 +229,7 @@ impl Descriptor {
             dst_mask: FULL_MASK,
             inferred_version: None,
             pc: None,
+            call_path: Vec::new(),
             deps: Vec::new(),
             label: None,
             args,
@@ -389,6 +395,7 @@ impl Descriptor {
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             pc: None,
+            call_path: Vec::new(),
             deps,
             label: None,
             args: Args::Join,
@@ -1595,6 +1602,7 @@ device:
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 pc: None,
+                call_path: Vec::new(),
                 deps: vec![],
                 label: None,
                 args: Args::Dma {

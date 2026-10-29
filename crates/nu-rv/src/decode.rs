@@ -129,6 +129,7 @@ pub fn decode(
             label: None,
             args,
             pc: Some(pc),
+            call_path: Vec::new(),
         })
     };
     // The PE: an index into the PEs of the node it runs on.

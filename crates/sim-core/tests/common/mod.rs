@@ -180,6 +180,7 @@ impl Node {
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             pc: None,
+            call_path: Vec::new(),
             deps: vec![],
             label: None,
             args: Args::Dma {
@@ -205,6 +206,7 @@ impl Node {
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             pc: None,
+            call_path: Vec::new(),
             deps,
             label: None,
             args: Args::Matmul {

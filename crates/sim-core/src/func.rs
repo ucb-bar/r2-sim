@@ -33,6 +33,9 @@ use crate::stats::ThreadRecord;
 use crate::time::Cycle;
 
 /// What one functional op does.
+// Nearly every op is a task: boxing the descriptor would add an
+// allocation per op for the size of the rare store.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpKind {
     /// An issued PE task.

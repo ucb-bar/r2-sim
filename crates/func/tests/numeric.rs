@@ -96,6 +96,7 @@ fn a_split_operand_reads_its_halves() {
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             pc: None,
+            call_path: Vec::new(),
             deps: vec![],
             label: None,
             args: Args::Matmul {

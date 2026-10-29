@@ -42,6 +42,7 @@ fn task(label: Option<u64>, dst: Range) -> Descriptor {
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         args: Args::Vector {
             ops: 1,
             bytes_in: 0,
@@ -76,6 +77,7 @@ fn dma_copies_bytes() {
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         args: Args::Dma {
             src: Addr(0x100),
             dst: Addr(0x8000),

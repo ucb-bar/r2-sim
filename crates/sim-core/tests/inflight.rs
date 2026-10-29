@@ -58,6 +58,7 @@ fn copies(b: Built, nu: &str, pe: &str, src: u64, dst: u64, bytes: u64, n: u64) 
             dst_mask: nu_model::FULL_MASK,
             inferred_version: None,
             pc: None,
+            call_path: Vec::new(),
             deps: vec![],
             label: Some(i),
             args: Args::Dma {

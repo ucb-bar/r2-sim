@@ -95,6 +95,48 @@ pub struct Hart {
     pub retired: u64,
     /// Set by the first branch or jump that depends on a tainted value.
     pub uncertain: bool,
+    /// The shadow call stack (the return-address hints of JAL and JALR).
+    pub calls: CallStack,
+}
+
+/// A shadow call stack that follows the return-address-stack hints of
+/// the RISC-V unprivileged spec: x1 and x5 are link registers. A JAL whose
+/// rd is a link register pushes; a JALR pushes when rd is a link register
+/// and rs1 is not, pops when rs1 is a link register and rd is not, pops
+/// then pushes when both are link registers and differ, and pushes when
+/// both are the same link register. The compressed forms decode to JAL and
+/// JALR and follow the same rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallStack {
+    /// The PC of the call instruction of each frame, outermost first.
+    pub frames: Vec<u64>,
+    /// Pops on an empty stack (ignored).
+    pub underflows: u64,
+}
+
+fn is_link(r: u8) -> bool {
+    r == 1 || r == 5
+}
+
+impl CallStack {
+    /// A JAL (`rs1` `None`) or a JALR at `pc`.
+    pub fn jump(&mut self, pc: u64, rd: u8, rs1: Option<u8>) {
+        let (push, pop) = match rs1 {
+            None => (is_link(rd), false),
+            Some(rs1) => match (is_link(rd), is_link(rs1)) {
+                (false, false) => (false, false),
+                (false, true) => (false, true),
+                (true, false) => (true, false),
+                (true, true) => (true, rd != rs1),
+            },
+        };
+        if pop && self.frames.pop().is_none() {
+            self.underflows += 1;
+        }
+        if push {
+            self.frames.push(pc);
+        }
+    }
 }
 
 /// CSR numbers.
@@ -114,6 +156,7 @@ impl Hart {
             epoch: 0,
             retired: 0,
             uncertain: false,
+            calls: CallStack::default(),
         }
     }
 
@@ -154,12 +197,14 @@ impl Hart {
             Jal { rd, imm } => {
                 self.set(rd, next, 0);
                 next = pc.wrapping_add(imm as u64);
+                self.calls.jump(pc, rd, None);
             }
             Jalr { rd, rs1, imm } => {
                 let (b, tb) = self.get(rs1);
                 self.uncertain |= tb != 0;
                 self.set(rd, next, 0);
                 next = b.wrapping_add(imm as u64) & !1;
+                self.calls.jump(pc, rd, Some(rs1));
             }
             Branch { f, rs1, rs2, imm } => {
                 let ((a, ta), (b, tb)) = (self.get(rs1), self.get(rs2));

@@ -105,7 +105,9 @@ program of the kernel: the device program `encoder` (node type `root`,
 entry 0x2a) embeds the image of the cluster program `encoder_cluster`
 (node type `gpc`, entry 0x314, 14,288 bytes), which embeds the image of
 the SM program `encoder_step` (node type `sm`, entry 0x1e00, 10,496
-bytes). The device starts `encoder_cluster` on each cluster. A cluster
+bytes). The cluster image is at offset 248 of the device image, and the
+SM image at offset 3,704 of the cluster image (3,952 of the device
+image). The device starts `encoder_cluster` on each cluster. A cluster
 holds one half of the patches of each image and runs the steps of the
 encoder in stream order: for each step it starts one `encoder_step`
 program on each SM, in epoch step + 1. A GEMM step splits its output

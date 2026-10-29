@@ -1886,6 +1886,7 @@ impl Sim {
                 done,
                 deps,
                 pc,
+                call_path,
             } => {
                 let n = &mut self.nus[nu.0 as usize];
                 let start = n.pending_spawn.take().expect("spawn program");
@@ -1918,6 +1919,7 @@ impl Sim {
                     dst_mask: nu_model::FULL_MASK,
                     inferred_version: None,
                     pc,
+                    call_path,
                     deps,
                     label: None,
                     args: Args::Spawn { child },

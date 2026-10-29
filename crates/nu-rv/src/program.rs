@@ -25,6 +25,11 @@
 //!   memory path); the instruction then runs again with the value at
 //!   hand. A faulting step changes nothing, so the repeat is exact.
 //!
+//! Each task of a descriptor carries its call path (raw trace 1.11): the
+//! hart's shadow call stack (`Hart::calls`, the return-address hints of
+//! JAL and JALR; a new hart per program start) without the start code's
+//! call of the program function.
+//!
 //! An illegal instruction, an unknown CSR, `ecall`, `ebreak`, a fetch
 //! outside the IMEM, a store into the IMEM, a bad descriptor and the
 //! instruction limit stop the run with an error that names the node and
@@ -418,11 +423,13 @@ impl RvProgram {
                     };
                     match d {
                         Err(e) => return fail(at(pc, e)).await,
-                        Ok(Decoded::Task(d)) if d.untracked => {
+                        Ok(Decoded::Task(mut d)) if d.untracked => {
+                            d.call_path = call_path(&hart);
                             ctx.invoke_untracked(d).await;
                             hart.set(rd, 0, 0);
                         }
-                        Ok(Decoded::Task(d)) => {
+                        Ok(Decoded::Task(mut d)) => {
+                            d.call_path = call_path(&hart);
                             let h = ctx.invoke(d).await;
                             // A forwarded invoke returns 0: the owner
                             // assigns the version.
@@ -452,7 +459,8 @@ impl RvProgram {
                                 nu,
                                 Some(entry as u64),
                             )));
-                            ctx.spawn_in_epoch(nu, name, done, deps, Some(pc), epoch, move |c| {
+                            let path = call_path(&hart);
+                            ctx.spawn_rv(nu, name, done, deps, pc, path, epoch, move |c| {
                                 program.run(c)
                             })
                             .await;
@@ -486,6 +494,7 @@ impl RvProgram {
                                     bytes,
                                 },
                                 pc: Some(pc),
+                                call_path: call_path(&hart),
                             };
                             ctx.invoke(d).await;
                             hart.set(rd, 0, 0);
@@ -505,6 +514,18 @@ impl RvProgram {
             }
         }
     }
+}
+
+/// The call path of the instruction the hart stopped at: its shadow call
+/// stack without the first frame, the start code's call of the program
+/// function (frame 1). Empty in frame 1.
+fn call_path(hart: &Hart) -> Vec<u32> {
+    hart.calls
+        .frames
+        .iter()
+        .skip(1)
+        .map(|&pc| pc as u32)
+        .collect()
 }
 
 impl RvProgram {

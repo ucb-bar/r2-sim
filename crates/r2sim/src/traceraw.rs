@@ -6,7 +6,9 @@
 //! entry it frees ends then; a task record has `flags`, bit 0 untracked,
 //! and is 112 B; no dependency names an untracked task as producer) and
 //! 1.9 (`dst_mask` in place of the task record's `pad`: the mask of the
-//! destination range in granules; all ones for a plain range).
+//! destination range in granules; all ones for a plain range), up to 1.11
+//! (`call_path` in place of the task record's `pad`: an index into the
+//! manifest's `call_paths`, the call paths of the RV tasks).
 //! A dependency's unversioned producer holds the granule of its address
 //! under the producer's mask.
 //! The dump is `manifest.json` (written before the run), `strings.txt`,
@@ -88,7 +90,7 @@ const TASKS: &[(&str, &str)] = &[
     ("flags", "u32"),
     ("dst_mask", "u32"),
     ("pc", "u32"),
-    ("pad", "u32"),
+    ("call_path", "u32"),
 ];
 const CHUNKS: &[(&str, &str)] = &[
     ("gid", "u32"),
@@ -490,6 +492,8 @@ struct OpenTask {
     /// The IMEM offset of the `nu.*` instruction of an RV program that
     /// made the task (1.10).
     pc: Option<u32>,
+    /// The index of its call path in `call_paths` (1.11).
+    call_path: Option<u32>,
     /// Resolved deps kept until the task's retire decides the window.
     parked: u32,
     /// Its invoke call (source Neutrino, number), when it has one: the key
@@ -593,7 +597,12 @@ pub struct RawTracer {
     idma_pe: Vec<Option<u16>>,
     /// The manifest's `images` (1.10), with their SHA-256.
     images: Vec<(String, Value)>,
-    /// The manifest, written again at the end when it has `images`.
+    /// The manifest's `call_paths` (1.11), in order of first use, and the
+    /// index of each.
+    call_paths: Vec<Vec<u32>>,
+    call_path_index: HashMap<Vec<u32>, u32>,
+    /// The manifest, written again at the end when it has `images` or
+    /// `call_paths`.
     manifest: Value,
     dir: std::path::PathBuf,
     /// Owners (trace-raw 1.6): the gid of an invoke call (source, number)
@@ -770,6 +779,8 @@ impl RawTracer {
                 .collect(),
             idma_pe: idma_pes(&b.sim),
             images: Vec::new(),
+            call_paths: Vec::new(),
+            call_path_index: HashMap::new(),
             manifest,
             dir: o.dir.clone(),
             named: IdMap::default(),
@@ -858,7 +869,7 @@ impl RawTracer {
             .u32(t.flags)
             .u32(t.dst_mask)
             .u32(o32(t.pc))
-            .u32(0);
+            .u32(o32(t.call_path));
         self.emit(T_TASKS, r.done());
     }
 
@@ -978,6 +989,22 @@ impl RawTracer {
             .u64(start)
             .u64(o64(end));
         self.emit(T_PROGRAMS, r.done());
+    }
+
+    /// The index of `path` in the manifest's `call_paths` (1.11), added at
+    /// its first use; `None` for an empty path (frame 1, or not an RV
+    /// program).
+    fn call_path(&mut self, path: &[u32]) -> Option<u32> {
+        if path.is_empty() {
+            return None;
+        }
+        if let Some(&i) = self.call_path_index.get(path) {
+            return Some(i);
+        }
+        let i = self.call_paths.len() as u32;
+        self.call_paths.push(path.to_vec());
+        self.call_path_index.insert(path.to_vec(), i);
+        Some(i)
     }
 
     /// The index in the manifest's `images` of the image at offset 0 of the
@@ -1244,6 +1271,7 @@ impl Tracer for RawTracer {
             flags: d.untracked as u32 * UNTRACKED,
             dst_mask: d.dst_mask,
             pc: d.pc.map(|pc| pc as u32),
+            call_path: self.call_path(&d.call_path),
             parked: NONE,
             call_key: None,
         };
@@ -1683,10 +1711,16 @@ impl Tracer for RawTracer {
                 }
             }
         }
-        // The images of RV programs (1.10): the manifest again, with them.
-        if !self.images.is_empty() {
-            let images: Vec<Value> = self.images.iter().map(|(_, v)| v.clone()).collect();
-            self.manifest["images"] = Value::Array(images);
+        // The images of RV programs (1.10) and the call paths of their
+        // tasks (1.11): the manifest again, with them.
+        if !self.images.is_empty() || !self.call_paths.is_empty() {
+            if !self.images.is_empty() {
+                let images: Vec<Value> = self.images.iter().map(|(_, v)| v.clone()).collect();
+                self.manifest["images"] = Value::Array(images);
+            }
+            if !self.call_paths.is_empty() {
+                self.manifest["call_paths"] = json!(self.call_paths);
+            }
             let text = serde_json::to_string_pretty(&self.manifest).expect("JSON");
             if let Err(e) = std::fs::write(self.dir.join("manifest.json"), text) {
                 err.get_or_insert(e);
@@ -2153,7 +2187,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         .collect();
     json!({
         "format": "r2raw",
-        "version": [1, 10],
+        "version": [1, 11],
         "run": {
             "config": run.config, "program": run.program,
             "params": {"file": run.params_file, "overrides": run.params},

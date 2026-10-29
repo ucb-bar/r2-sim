@@ -43,6 +43,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>, label: u64) -> Descript
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         deps,
         label: Some(label),
         args: Args::Matmul {

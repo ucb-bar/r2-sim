@@ -102,6 +102,8 @@ pub(crate) enum Request {
         done: Range,
         deps: Vec<Dep>,
         pc: Option<u64>,
+        /// The call path of the RV instruction at `pc`.
+        call_path: Vec<u32>,
     },
     /// The program stops the run with an error (an RV program's fault).
     Fail(String),
@@ -367,6 +369,41 @@ impl NuCtx {
         epoch: u16,
         program: impl NeutrinoProgram + 'static,
     ) -> TaskHandle {
+        self.spawn_with(child, name, done, deps, pc, Vec::new(), epoch, program)
+            .await
+    }
+
+    /// The spawn descriptor of an RV program: [`NuCtx::spawn_in_epoch`]
+    /// with the PC of the instruction that made it and the call path of
+    /// that instruction ([`Descriptor::call_path`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_rv(
+        &self,
+        child: NeutrinoId,
+        name: ProgramName,
+        done: Range,
+        deps: Vec<Dep>,
+        pc: u64,
+        call_path: Vec<u32>,
+        epoch: u16,
+        program: impl NeutrinoProgram + 'static,
+    ) -> TaskHandle {
+        self.spawn_with(child, name, done, deps, Some(pc), call_path, epoch, program)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with(
+        &self,
+        child: NeutrinoId,
+        name: ProgramName,
+        done: Range,
+        deps: Vec<Dep>,
+        pc: Option<u64>,
+        call_path: Vec<u32>,
+        epoch: u16,
+        program: impl NeutrinoProgram + 'static,
+    ) -> TaskHandle {
         let start = StartFn {
             run: Box::new(move |ctx| Box::pin(program.run(ctx))),
             name,
@@ -379,6 +416,7 @@ impl NuCtx {
                 done,
                 deps,
                 pc,
+                call_path,
             })
             .await
         {

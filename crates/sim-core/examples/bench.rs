@@ -147,6 +147,7 @@ fn main() {
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
                         pc: None,
+                        call_path: Vec::new(),
                         deps: war,
                         label: None,
                         args: Args::Dma {
@@ -167,6 +168,7 @@ fn main() {
                         dst_mask: nu_model::FULL_MASK,
                         inferred_version: None,
                         pc: None,
+                        call_path: Vec::new(),
                         deps: vec![ha.key()],
                         label: None,
                         args: Args::Matmul {

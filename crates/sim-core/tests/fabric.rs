@@ -81,6 +81,7 @@ fn gemm_array_cycles(sets: &[&str], d: Dtype) -> u64 {
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Matmul {
@@ -383,6 +384,7 @@ device:
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         deps: vec![],
         label: Some(i),
         args: Args::Vector {
@@ -450,6 +452,7 @@ fn demands_record_reads_and_writes() {
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Dma {
@@ -469,6 +472,7 @@ fn demands_record_reads_and_writes() {
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Matmul {
@@ -584,6 +588,7 @@ fn two_transfers(dma: &str) -> (u64, u64) {
         dst_mask: nu_model::FULL_MASK,
         inferred_version: None,
         pc: None,
+        call_path: Vec::new(),
         deps: vec![],
         label: Some(i),
         args: Args::Dma {

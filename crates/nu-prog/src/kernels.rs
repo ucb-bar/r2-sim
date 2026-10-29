@@ -721,6 +721,7 @@ impl Builder {
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 pc: None,
+                call_path: Vec::new(),
                 deps,
                 label: None,
                 args: Args::Dma {
@@ -814,6 +815,7 @@ impl Builder {
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 pc: None,
+                call_path: Vec::new(),
                 deps,
                 label: None,
                 args: Args::Matmul {
@@ -869,6 +871,7 @@ impl Builder {
                 dst_mask: nu_model::FULL_MASK,
                 inferred_version: None,
                 pc: None,
+                call_path: Vec::new(),
                 deps,
                 label: None,
                 args: Args::Vector {

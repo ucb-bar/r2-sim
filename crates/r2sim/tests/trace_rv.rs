@@ -89,7 +89,7 @@ fn the_three_level_dump() {
             image.to_str().unwrap(),
         ],
     );
-    assert_eq!(m["version"], serde_json::json!([1, 10]));
+    assert_eq!(m["version"], serde_json::json!([1, 11]));
     // Three images in order of first use.
     let images = m["images"].as_array().unwrap();
     let want = [
@@ -216,7 +216,7 @@ fn a_rust_program_has_no_pc_image_or_images() {
             "sms=2",
         ],
     );
-    assert_eq!(m["version"], serde_json::json!([1, 10]));
+    assert_eq!(m["version"], serde_json::json!([1, 11]));
     assert!(m.get("images").is_none());
     for t in records(&d, "tasks", 120) {
         assert_eq!(u32_at(&t, 112), NULL32);
