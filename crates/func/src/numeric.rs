@@ -1,8 +1,11 @@
 //! The `Numeric` backend.
 
+use std::collections::HashMap;
+
 use nu_model::{Addr, Range};
 use sim_core::{
     split_row, Args, Descriptor, Dtype, FuncError, FuncOp, FunctionalBackend, MemBlock, OpKind,
+    PeId,
 };
 
 use crate::dtype::{bf16_to_f32, f32_to_bf16};
@@ -10,9 +13,16 @@ use crate::memory::{check_in_dst, err, Memory};
 
 /// Executes ops on sparse byte memory: DMA copies, GEMM, stores. Muon
 /// vector tasks are opaque in phase 1 and write nothing.
+///
+/// A GEMM is output stationary, as in the Python plane: the partial C of a
+/// chain stays in the accumulator of its Atlas (fp32, keyed by the PE and
+/// the C base) while the tasks keep it, and is written once.
 #[derive(Default)]
 pub struct Numeric {
     mem: Memory,
+    /// The partials held in the Atlas accumulators, by (PE, C base):
+    /// `m x n` row-major fp32.
+    acc: HashMap<(Option<PeId>, u64), Vec<f32>>,
 }
 
 impl Numeric {
@@ -76,10 +86,10 @@ impl Numeric {
                 b_dtype,
                 out_dtype,
                 accumulate,
+                keep,
                 a2,
                 b2,
                 tile,
-                ..
             } => {
                 for dt in [in_dtype, b_dtype, out_dtype] {
                     if !matches!(dt, Dtype::Bf16 | Dtype::F32) {
@@ -128,29 +138,55 @@ impl Numeric {
                         v
                     }
                 };
-                let mut cv = if accumulate {
-                    self.read_matrix(c, m, n, ldc, out_dtype)?
-                } else {
-                    vec![0.0; (m * n) as usize]
+                // A task that accumulates starts from the held partial of
+                // its C, else from C in memory; any task drops the partial.
+                let partial = self.acc.remove(&(desc.pe, c));
+                let start = match (accumulate, partial) {
+                    (false, _) => None,
+                    (true, Some(p)) if p.len() as u64 == m * n => Some(p),
+                    (true, Some(p)) => {
+                        return err(format!(
+                            "matmul on C {c:#x} of {m} x {n}: the held partial has {} elements",
+                            p.len()
+                        ))
+                    }
+                    (true, None) => Some(self.read_matrix(c, m, n, ldc, out_dtype)?),
                 };
-                gemm(&av, &bv, &mut cv, m as usize, n as usize, k as usize);
-                self.write_matrix(c, m, n, ldc, out_dtype, &cv)
+                let mut cv = gemm(&av, &bv, m as usize, n as usize, k as usize);
+                if let Some(start) = start {
+                    for (x, s) in cv.iter_mut().zip(start) {
+                        *x += s;
+                    }
+                }
+                if keep {
+                    self.acc.insert((desc.pe, c), cv);
+                    Ok(())
+                } else {
+                    self.write_matrix(c, m, n, ldc, out_dtype, &cv)
+                }
             }
         }
     }
 }
 
-/// `c[i][j] += sum over p in 0..k, in order, of a[i][p] * b[p][j]`, in f32.
-fn gemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = c[i * n + j];
-            for p in 0..k {
-                acc += a[i * k + p] * b[p * n + j];
+/// The product A B (`m x k` times `k x n`, row-major) in f32: each
+/// `c[i][j]` is the sum over p in 0..k, in order, of `a[i][p] * b[p][j]`.
+/// The loop order i-p-j keeps the inner loop contiguous over a row of B
+/// and of C, so that the compiler vectorizes it; the sum order per element
+/// is that of the plain triple loop, so the result is deterministic.
+fn gemm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    if n == 0 || k == 0 {
+        return c;
+    }
+    for (row, ar) in c.chunks_exact_mut(n).zip(a.chunks_exact(k)) {
+        for (&x, br) in ar.iter().zip(b.chunks_exact(n)) {
+            for (o, &y) in row.iter_mut().zip(br) {
+                *o += x * y;
             }
-            c[i * n + j] = acc;
         }
     }
+    c
 }
 
 fn decode(bytes: &[u8], dt: Dtype) -> impl Iterator<Item = f32> + '_ {
