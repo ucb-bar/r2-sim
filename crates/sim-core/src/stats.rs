@@ -242,6 +242,61 @@ pub enum Blocked {
     Busy,
 }
 
+/// One interval of the wall-clock timeline of a thread. Times are
+/// nanoseconds from the start of the functional plane, on one monotonic
+/// clock. The fields that do not apply to a record are `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ThreadRecord {
+    /// `control` (the timing thread) or `worker` (the functional worker).
+    pub thread: &'static str,
+    /// Control: `run` (the event loop), `emit_wait` (no room in the op
+    /// queue), `load_wait` (a load waits for the worker's reply) or
+    /// `finish_wait` (the end of the run waits for the worker to apply the
+    /// ops left). Worker: `apply` (one op), `load` (one load served) or
+    /// `wait` (no work).
+    pub state: &'static str,
+    /// Start, in ns.
+    pub start: u64,
+    /// End, in ns.
+    pub end: u64,
+    /// Control: the simulated cycle at the end of the interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cycle: Option<u64>,
+    /// Control: the seq of the last emitted op at the end of the interval.
+    /// Worker `apply`: the op's seq; `load`: the last applied seq.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// Worker `apply`: `dma`, `matmul`, `vector`, `join`, `spawn`,
+    /// `imem_copy` or `store`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<&'static str>,
+    /// Worker `apply`: the Neutrino that emitted the op.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nu: Option<u32>,
+    /// Worker `apply`: the bytes of a DMA, an IMEM copy or a store.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Worker `apply` of a matmul: m, n and k.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub m: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub k: Option<u64>,
+    /// `load_wait` and worker `load`: the address and length of the load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub addr: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub len: Option<u64>,
+    /// `load_wait`: the seq the load waits for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq_needed: Option<u64>,
+    /// Worker `apply` with a process backend that reports it: the time the
+    /// child process spent on the op, in ns, by its own clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub child_ns: Option<u64>,
+}
+
 /// One functional sync point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct LoadRec {
@@ -290,6 +345,11 @@ pub struct Stats {
     pub func_ops: u64,
     /// Functional sync points, one per load, in order.
     pub loads: Vec<LoadRec>,
+    /// The wall-clock timeline of the timing thread and the functional
+    /// worker, when on ([`crate::Sim::set_thread_timeline`]); ordered by
+    /// start. Not in the stats JSON.
+    #[serde(skip)]
+    pub thread_timeline: Vec<ThreadRecord>,
     /// Fabric messages sent (remote protocol, forwarded invoke, spawn).
     pub messages: u64,
     /// `Await`s rejected by the owner for capacity.

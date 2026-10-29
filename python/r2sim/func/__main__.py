@@ -5,6 +5,7 @@ stdout, and exits at FINISH or at end of file on stdin."""
 from __future__ import annotations
 
 import sys
+import time
 
 from r2sim.func import protocol as p
 from r2sim.func.memory import FuncError
@@ -13,6 +14,9 @@ from r2sim.func.plane import Plane
 
 def serve(inp, out) -> int:
     plane = Plane()
+    # CONFIGURE asks for the time of each TASK and STORE (the thread
+    # timeline): the OK then carries {"ns": ..}.
+    op_time = False
     while True:
         frame = p.read_frame(inp)
         if frame is None:
@@ -28,13 +32,15 @@ def serve(inp, out) -> int:
                 p.write_frame(out, p.OK, {"protocol": p.PROTOCOL, "backend": "r2sim.func"})
             elif kind == p.CONFIGURE:
                 plane.configure(obj["memories"], obj["sync_only"], obj["granule"])
+                op_time = bool(obj.get("op_time"))
                 p.write_frame(out, p.OK)
-            elif kind == p.TASK:
-                plane.task(obj["desc"])
-                p.write_frame(out, p.OK)
-            elif kind == p.STORE:
-                plane.store(obj["addr"], blob)
-                p.write_frame(out, p.OK)
+            elif kind in (p.TASK, p.STORE):
+                start = time.perf_counter_ns()
+                if kind == p.TASK:
+                    plane.task(obj["desc"])
+                else:
+                    plane.store(obj["addr"], blob)
+                p.write_frame(out, p.OK, {"ns": time.perf_counter_ns() - start} if op_time else None)
             elif kind == p.WRITE:
                 plane.memory.write(obj["addr"], blob)
                 p.write_frame(out, p.OK)

@@ -49,6 +49,7 @@ fn parse(argv: &[String]) -> Result<Options, String> {
             "--image-out" => a.image_out = Some(val()?.into()),
             "--stats" => a.stats = Some(val()?.into()),
             "--timeline" => a.timeline = true,
+            "--thread-timeline" => a.thread_timeline = Some(val()?.into()),
             "--phase-stats" => a.phase_stats = true,
             "--trace-out" => a.trace_out = Some(val()?.into()),
             "--trace-raw" => a.trace_raw = Some(val()?.into()),

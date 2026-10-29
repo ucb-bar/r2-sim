@@ -365,6 +365,9 @@ pub struct Sim {
     /// check or the open-pending table report.
     track_writers: bool,
     late_consumer_check: bool,
+    /// Record the wall-clock timeline of the timing thread and the
+    /// functional worker.
+    thread_timeline: bool,
     open_pending_report: bool,
     writers: LastWriters,
     owners: OwnerMap,
@@ -434,6 +437,7 @@ impl Sim {
             init: Vec::new(),
             track_writers: false,
             late_consumer_check: false,
+            thread_timeline: false,
             open_pending_report: true,
             writers: LastWriters::default(),
             owners: OwnerMap::default(),
@@ -504,6 +508,14 @@ impl Sim {
     /// invoked before the next producer of a reused buffer, which is legal.
     pub fn set_late_consumer_check(&mut self, on: bool) {
         self.late_consumer_check = on;
+    }
+
+    /// Records the wall-clock timeline of the timing thread and the
+    /// functional worker into [`Stats::thread_timeline`]: when each one
+    /// works and when one waits for the other. Only for a backend with
+    /// data (a worker thread).
+    pub fn set_thread_timeline(&mut self, on: bool) {
+        self.thread_timeline = on;
     }
 
     /// Report every pending entry still open at the end with the last completed
@@ -1352,7 +1364,11 @@ impl Sim {
         }
         self.track_writers =
             backend.has_data() || self.late_consumer_check || self.open_pending_report;
-        self.plane = Some(FuncPlane::start(backend, FUNC_CAPACITY));
+        self.plane = Some(FuncPlane::start(
+            backend,
+            FUNC_CAPACITY,
+            self.thread_timeline,
+        ));
         let n = self.nus.len();
         self.ticket_stats = TicketStats {
             tickets: vec![0; n],
@@ -1437,7 +1453,9 @@ impl Sim {
             self.deadlock(NeutrinoId(0));
         }
         self.stats.stages = self.stage_stats();
-        let (joined, late, backend) = self.plane.take().expect("functional plane").finish();
+        let plane = self.plane.take().expect("functional plane");
+        let (joined, late, backend, timeline) = plane.finish(self.now);
+        self.stats.thread_timeline = timeline;
         // An op that failed after the last look at the worker (2026-10-21:
         // such an error was lost).
         if let Some(e) = late {
@@ -2166,7 +2184,7 @@ impl Sim {
         let seq_needed = self.writers.max_seq(&range);
         let emitted = self.func_seq;
         let plane = self.plane.as_mut().expect("functional plane");
-        match plane.load(seq_needed, addr, len) {
+        match plane.load(seq_needed, addr, len, self.now) {
             Ok(reply) => {
                 self.stats.loads.push(LoadRec {
                     time: self.now,

@@ -13,16 +13,23 @@
 //!
 //! A backend without data (`Null`) runs without a worker thread; a load is
 //! then an error.
+//!
+//! With the thread timeline on, both threads record their intervals in
+//! wall-clock time ([`ThreadRecord`]): the timing thread its waits for the
+//! worker, the worker each op and load and its waits for work. Each thread
+//! keeps its own list; [`FuncPlane::finish`] merges them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use nu_model::{Addr, NeutrinoId, Range};
 
 use crate::config::MemBlock;
-use crate::profile::Descriptor;
+use crate::profile::{Args, Descriptor};
+use crate::stats::ThreadRecord;
 use crate::time::Cycle;
 
 /// What one functional op does.
@@ -73,6 +80,12 @@ pub trait FunctionalBackend: Send {
     fn read(&mut self, addr: Addr, len: u64) -> Result<Vec<u8>, FuncError>;
     /// Host-side initialization before the run.
     fn write(&mut self, addr: Addr, bytes: &[u8]) -> Result<(), FuncError>;
+    /// The time a child process spent on the last applied op, in ns by its
+    /// own clock, for the thread timeline; `None` when the backend does
+    /// not report it.
+    fn child_ns(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Discards every op. A load is an error: the run declared no
@@ -141,14 +154,89 @@ pub(crate) struct Shared {
     failed: AtomicBool,
 }
 
+/// The wall-clock records of one thread.
+pub(crate) struct Timeline {
+    /// The zero of the clock, shared by both threads.
+    t0: Instant,
+    records: Vec<ThreadRecord>,
+}
+
+impl Timeline {
+    fn new(t0: Instant) -> Self {
+        Self {
+            t0,
+            records: Vec::new(),
+        }
+    }
+
+    /// Records `state` of `thread` from `from` to `to`, with the other
+    /// fields of `r`.
+    fn push(
+        &mut self,
+        thread: &'static str,
+        state: &'static str,
+        from: Instant,
+        to: Instant,
+        r: ThreadRecord,
+    ) {
+        let ns = |t: Instant| t.saturating_duration_since(self.t0).as_nanos() as u64;
+        self.records.push(ThreadRecord {
+            thread,
+            state,
+            start: ns(from),
+            end: ns(to),
+            ..r
+        });
+    }
+}
+
+/// The timing thread's timeline: its records, the start of its current
+/// `run` interval and the seq of the last emitted op.
+pub(crate) struct Control {
+    timeline: Timeline,
+    run_from: Instant,
+    seq: u64,
+}
+
+impl Control {
+    /// Ends the current `run` interval at `from` and records the wait
+    /// `state` from `from` to now; `cycle` is the simulated cycle, `r` the
+    /// other fields of the wait.
+    fn wait(&mut self, state: &'static str, from: Instant, cycle: Cycle, r: ThreadRecord) {
+        let to = Instant::now();
+        let at = ThreadRecord {
+            cycle: Some(cycle),
+            seq: Some(self.seq),
+            ..ThreadRecord::default()
+        };
+        let run_from = self.run_from;
+        self.timeline
+            .push("control", "run", run_from, from, at.clone());
+        self.timeline.push(
+            "control",
+            state,
+            from,
+            to,
+            ThreadRecord {
+                cycle: at.cycle,
+                seq: at.seq,
+                ..r
+            },
+        );
+        self.run_from = to;
+    }
+}
+
 /// The timing thread's handle on the functional plane.
 pub(crate) enum FuncPlane {
     /// A backend without data, on the timing thread.
     Inline(Box<dyn FunctionalBackend>),
     Worker {
         shared: Arc<Shared>,
-        handle: JoinHandle<Box<dyn FunctionalBackend>>,
+        handle: JoinHandle<(Box<dyn FunctionalBackend>, Option<Timeline>)>,
         capacity: usize,
+        /// The timing thread's timeline, when on.
+        control: Option<Control>,
     },
 }
 
@@ -161,10 +249,14 @@ pub(crate) enum PlaneError {
 }
 
 impl FuncPlane {
-    pub fn start(mut backend: Box<dyn FunctionalBackend>, capacity: usize) -> Self {
+    /// Starts the worker of a backend with data. `timeline`: both threads
+    /// record their intervals (not for a backend without data).
+    pub fn start(mut backend: Box<dyn FunctionalBackend>, capacity: usize, timeline: bool) -> Self {
         if !backend.has_data() {
             return FuncPlane::Inline(backend);
         }
+        let t0 = Instant::now();
+        let mut worker_timeline = timeline.then(|| Timeline::new(t0));
         let shared = Arc::new(Shared {
             chan: Mutex::new(Chan::default()),
             to_worker: Condvar::new(),
@@ -175,14 +267,19 @@ impl FuncPlane {
         let handle = std::thread::Builder::new()
             .name("r2-func".into())
             .spawn(move || {
-                worker(&mut *backend, &sh);
-                backend
+                worker(&mut *backend, &sh, worker_timeline.as_mut());
+                (backend, worker_timeline)
             })
             .expect("spawn the functional worker");
         FuncPlane::Worker {
             shared,
             handle,
             capacity,
+            control: timeline.then(|| Control {
+                timeline: Timeline::new(t0),
+                run_from: t0,
+                seq: 0,
+            }),
         }
     }
 
@@ -215,14 +312,25 @@ impl FuncPlane {
                 })
             }),
             FuncPlane::Worker {
-                shared, capacity, ..
+                shared,
+                capacity,
+                control,
+                ..
             } => {
                 let mut c = lock(shared);
+                let full = c.error.is_none() && c.ops.len() >= *capacity;
+                let from = (full && control.is_some()).then(Instant::now);
                 while c.error.is_none() && c.ops.len() >= *capacity {
                     c = shared.to_timing.wait(c).expect("functional plane lock");
                 }
                 if let Some(e) = &c.error {
                     return Err(PlaneError::Worker(e.clone()));
+                }
+                if let Some(ctl) = control.as_mut() {
+                    if let Some(from) = from {
+                        ctl.wait("emit_wait", from, op.time, ThreadRecord::default());
+                    }
+                    ctl.seq = op.seq;
                 }
                 c.ops.push_back(op);
                 shared.to_worker.notify_one();
@@ -232,14 +340,23 @@ impl FuncPlane {
     }
 
     /// A sync point: blocks until the worker has applied `seq_needed`, then
-    /// returns the bytes it read.
-    pub fn load(&mut self, seq_needed: u64, addr: Addr, len: u64) -> Result<LoadReply, PlaneError> {
+    /// returns the bytes it read. `cycle`: the simulated cycle of the load.
+    pub fn load(
+        &mut self,
+        seq_needed: u64,
+        addr: Addr,
+        len: u64,
+        cycle: Cycle,
+    ) -> Result<LoadReply, PlaneError> {
         match self {
             FuncPlane::Inline(b) => b
                 .read(addr, len)
                 .map(|bytes| LoadReply { bytes, applied: 0 })
                 .map_err(PlaneError::Load),
-            FuncPlane::Worker { shared, .. } => {
+            FuncPlane::Worker {
+                shared, control, ..
+            } => {
+                let from = Instant::now();
                 let mut c = lock(shared);
                 if let Some(e) = &c.error {
                     return Err(PlaneError::Worker(e.clone()));
@@ -250,15 +367,26 @@ impl FuncPlane {
                     len,
                 });
                 shared.to_worker.notify_one();
-                loop {
+                let reply = loop {
                     if let Some(e) = &c.error {
                         return Err(PlaneError::Worker(e.clone()));
                     }
                     if let Some(r) = c.reply.take() {
-                        return r.map_err(PlaneError::Load);
+                        break r;
                     }
                     c = shared.to_timing.wait(c).expect("functional plane lock");
+                };
+                drop(c);
+                if let Some(ctl) = control.as_mut() {
+                    let r = ThreadRecord {
+                        addr: Some(addr.0),
+                        len: Some(len),
+                        seq_needed: Some(seq_needed),
+                        ..ThreadRecord::default()
+                    };
+                    ctl.wait("load_wait", from, cycle, r);
                 }
+                reply.map_err(PlaneError::Load)
             }
         }
     }
@@ -267,30 +395,49 @@ impl FuncPlane {
     /// after an error) and returns the backend. `Err` carries a worker
     /// panic message; the second item is the error of an op that failed
     /// after the timing plane last looked (an op after the last load).
+    /// `cycle`: the simulated cycle at the end of the run. The last item
+    /// is the thread timeline (empty when off), ordered by start.
     #[allow(clippy::type_complexity)]
     pub fn finish(
         self,
+        cycle: Cycle,
     ) -> (
         Result<(), String>,
         Option<WorkerError>,
         Option<Box<dyn FunctionalBackend>>,
+        Vec<ThreadRecord>,
     ) {
         match self {
-            FuncPlane::Inline(b) => (Ok(()), None, Some(b)),
-            FuncPlane::Worker { shared, handle, .. } => {
+            FuncPlane::Inline(b) => (Ok(()), None, Some(b), Vec::new()),
+            FuncPlane::Worker {
+                shared,
+                handle,
+                control,
+                ..
+            } => {
+                let from = Instant::now();
                 lock(&shared).closed = true;
                 shared.to_worker.notify_one();
                 let joined = handle.join();
                 let error = lock(&shared).error.clone();
+                let mut records = Vec::new();
+                if let Some(mut ctl) = control {
+                    ctl.wait("finish_wait", from, cycle, ThreadRecord::default());
+                    records = ctl.timeline.records;
+                }
                 match joined {
-                    Ok(b) => (Ok(()), error, Some(b)),
+                    Ok((b, worker)) => {
+                        records.extend(worker.into_iter().flat_map(|w| w.records));
+                        records.sort_by_key(|r| (r.start, r.end));
+                        (Ok(()), error, Some(b), records)
+                    }
                     Err(p) => {
                         let msg = p
                             .downcast_ref::<String>()
                             .cloned()
                             .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
                             .unwrap_or_else(|| "unknown panic".into());
-                        (Err(msg), error, None)
+                        (Err(msg), error, None, records)
                     }
                 }
             }
@@ -309,7 +456,37 @@ enum Work {
     Serve(LoadReq),
 }
 
-fn worker(backend: &mut dyn FunctionalBackend, shared: &Shared) {
+/// The kind and size fields of `op` for the thread timeline.
+fn op_fields(op: &FuncOp) -> ThreadRecord {
+    let mut r = ThreadRecord {
+        seq: Some(op.seq),
+        nu: Some(op.nu.0),
+        ..ThreadRecord::default()
+    };
+    let (kind, bytes) = match &op.kind {
+        OpKind::Store { bytes, .. } => ("store", Some(bytes.len() as u64)),
+        OpKind::Task(d) => match &d.args {
+            Args::Dma { bytes, .. } => ("dma", Some(*bytes)),
+            Args::Matmul { m, n, k, .. } => {
+                (r.m, r.n, r.k) = (Some(*m), Some(*n), Some(*k));
+                ("matmul", None)
+            }
+            Args::Vector { .. } => ("vector", None),
+            Args::Join => ("join", None),
+            Args::Spawn { .. } => ("spawn", None),
+            Args::ImemCopy { bytes, .. } => ("imem_copy", Some(*bytes)),
+        },
+    };
+    r.op = Some(kind);
+    r.bytes = bytes;
+    r
+}
+
+fn worker(
+    backend: &mut dyn FunctionalBackend,
+    shared: &Shared,
+    mut timeline: Option<&mut Timeline>,
+) {
     // A panic in the backend must not leave the timing thread blocked.
     struct PanicGuard<'a>(&'a Shared);
     impl Drop for PanicGuard<'_> {
@@ -333,6 +510,7 @@ fn worker(backend: &mut dyn FunctionalBackend, shared: &Shared) {
     let _guard = PanicGuard(shared);
 
     loop {
+        let mut idle_from = None;
         let work = {
             let mut c = lock(shared);
             loop {
@@ -350,14 +528,43 @@ fn worker(backend: &mut dyn FunctionalBackend, shared: &Shared) {
                     break Work::Apply(op);
                 }
                 if c.closed && c.ops.is_empty() && c.load.is_none() {
+                    if let (Some(t), Some(from)) = (timeline.as_deref_mut(), idle_from) {
+                        t.push(
+                            "worker",
+                            "wait",
+                            from,
+                            Instant::now(),
+                            ThreadRecord::default(),
+                        );
+                    }
                     return;
+                }
+                if timeline.is_some() && idle_from.is_none() {
+                    idle_from = Some(Instant::now());
                 }
                 c = shared.to_worker.wait(c).expect("functional plane lock");
             }
         };
+        if let (Some(t), Some(from)) = (timeline.as_deref_mut(), idle_from) {
+            t.push(
+                "worker",
+                "wait",
+                from,
+                Instant::now(),
+                ThreadRecord::default(),
+            );
+        }
         match work {
             Work::Apply(op) => {
+                let from = Instant::now();
                 let r = backend.apply(&op);
+                if let Some(t) = timeline.as_deref_mut() {
+                    let fields = ThreadRecord {
+                        child_ns: backend.child_ns(),
+                        ..op_fields(&op)
+                    };
+                    t.push("worker", "apply", from, Instant::now(), fields);
+                }
                 let mut c = lock(shared);
                 match r {
                     Ok(()) => c.applied = op.seq,
@@ -375,6 +582,7 @@ fn worker(backend: &mut dyn FunctionalBackend, shared: &Shared) {
                 }
             }
             Work::Serve(l) => {
+                let from = Instant::now();
                 let failed = lock(shared).error.is_some();
                 let r = if failed {
                     Err(FuncError("functional worker failed".into()))
@@ -383,6 +591,15 @@ fn worker(backend: &mut dyn FunctionalBackend, shared: &Shared) {
                 };
                 let mut c = lock(shared);
                 let applied = c.applied;
+                if let Some(t) = timeline.as_deref_mut() {
+                    let fields = ThreadRecord {
+                        seq: Some(applied),
+                        addr: Some(l.addr.0),
+                        len: Some(l.len),
+                        ..ThreadRecord::default()
+                    };
+                    t.push("worker", "load", from, Instant::now(), fields);
+                }
                 c.reply = Some(r.map(|bytes| LoadReply { bytes, applied }));
                 shared.to_timing.notify_all();
             }

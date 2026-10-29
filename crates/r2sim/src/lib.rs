@@ -20,7 +20,7 @@ use sim_core::{build_config_file, Built, FatalError, ProfileRegistry, SimWarning
 
 /// The command line.
 pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
-[--functional trace|numeric|python|null [--functional-cmd CMD]] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--quantize tile|none] \
+[--functional trace|numeric|python|null [--functional-cmd CMD]] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--thread-timeline FILE.jsonl] [--quantize tile|none] \
 [--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]";
 
 /// A functional backend of the command line.
@@ -102,6 +102,9 @@ pub struct Options {
     pub stats: Option<PathBuf>,
     /// `--timeline`: per-task records in the stats.
     pub timeline: bool,
+    /// `--thread-timeline`: the wall-clock timeline of the timing thread
+    /// and the functional worker, as JSON lines.
+    pub thread_timeline: Option<PathBuf>,
     /// `--phase-stats`: statistics per interval between program marks.
     pub phase_stats: bool,
     /// `--trace-out DIR`: the tracer files ([`trace`]).
@@ -400,8 +403,13 @@ fn execute(
         Functional::Numeric => Box::new(func::Numeric::new()),
         // Spawned here, on the main thread: the child's parent-death
         // signal follows the thread that spawns it.
-        Functional::Python => Box::new(spawn_process(a.functional_cmd.as_deref())?),
+        Functional::Python => {
+            let mut p = spawn_process(a.functional_cmd.as_deref())?;
+            p.set_op_time(a.thread_timeline.is_some());
+            Box::new(p)
+        }
     };
+    b.sim.set_thread_timeline(a.thread_timeline.is_some());
     let image = match &a.image {
         Some(p) => {
             if !backend.has_data() {
@@ -623,6 +631,10 @@ fn execute(
         stats: &stats_out,
     };
     print_summary(&out, &stats, &nodes);
+    if let Some(p) = &a.thread_timeline {
+        write_thread_timeline(p, &stats.thread_timeline)
+            .map_err(|e| format!("--thread-timeline {}: {e}", p.display()))?;
+    }
     if let Some(p) = &a.stats {
         let json = serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?;
         std::fs::write(p, json).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -631,6 +643,20 @@ fn execute(
         return Err("the run stopped on a fatal error".into());
     }
     Ok(())
+}
+
+/// Writes the thread timeline as JSON lines, one record per line.
+fn write_thread_timeline(
+    path: &std::path::Path,
+    records: &[sim_core::ThreadRecord],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for r in records {
+        serde_json::to_writer(&mut w, r)?;
+        w.write_all(b"\n")?;
+    }
+    w.flush()
 }
 
 /// Per-resource totals of the run, with utilization and shares.

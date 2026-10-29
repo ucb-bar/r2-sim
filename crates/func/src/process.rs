@@ -20,7 +20,9 @@
 //! its descriptor), STORE (an op with its bytes), WRITE (a host write), READ
 //! (a load or the final readback), and FINISH. The child answers each frame
 //! with OK, DATA (the bytes of a READ) or ERROR `{"seq": .., "msg": ..}`; an
-//! error stops the run as a worker error does.
+//! error stops the run as a worker error does. With `"op_time": true` in
+//! CONFIGURE, the OK of a TASK or STORE carries `{"ns": ..}`, the child's
+//! time on the op (for the thread timeline); a child may ignore it.
 //!
 //! Lifecycle: the child dies with r2-sim. It exits at end of file on stdin;
 //! it starts with the parent-death signal set to SIGKILL (`prctl` in
@@ -62,6 +64,10 @@ pub struct Process {
     from: BufReader<ChildStdout>,
     /// An error from `configure`, returned by the next op.
     failed: Option<FuncError>,
+    /// Ask the child for the time of each op (`op_time` in CONFIGURE).
+    op_time: bool,
+    /// The child's time of the last op (`ns` in its OK), in ns.
+    last_ns: Option<u64>,
 }
 
 impl Process {
@@ -116,6 +122,8 @@ impl Process {
             to: Some(to),
             from,
             failed: None,
+            op_time: false,
+            last_ns: None,
         };
         let (_, hello, _) = p.call(frame::HELLO, &json!({ "protocol": PROTOCOL }), &[], 0)?;
         if hello.get("protocol").and_then(Value::as_u64) != Some(PROTOCOL) {
@@ -129,6 +137,12 @@ impl Process {
     /// The child's process id.
     pub fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    /// Asks the child (at CONFIGURE) to report the time it spends on each
+    /// TASK and STORE: the field `ns` of its OK, for the thread timeline.
+    pub fn set_op_time(&mut self, on: bool) {
+        self.op_time = on;
     }
 
     /// Sends one frame and reads the answer: (type, JSON, bytes). An ERROR
@@ -293,7 +307,10 @@ impl FunctionalBackend for Process {
             })
             .collect();
         let sync: Vec<Value> = sync_only.iter().map(range).collect();
-        let head = json!({ "memories": blocks, "sync_only": sync, "granule": granule });
+        let mut head = json!({ "memories": blocks, "sync_only": sync, "granule": granule });
+        if self.op_time {
+            head["op_time"] = json!(true);
+        }
         if let Err(e) = self.call(frame::CONFIGURE, &head, &[], 0) {
             self.failed = Some(e);
         }
@@ -308,19 +325,24 @@ impl FunctionalBackend for Process {
             return Err(e);
         }
         let base = json!({ "seq": op.seq, "time": op.time, "nu": op.nu.0, "gid": op.gid });
-        match &op.kind {
+        let (_, answer, _) = match &op.kind {
             OpKind::Task(d) => {
                 let mut head = base;
                 head["desc"] = descriptor(d);
-                self.call(frame::TASK, &head, &[], op.seq)?;
+                self.call(frame::TASK, &head, &[], op.seq)?
             }
             OpKind::Store { addr, bytes } => {
                 let mut head = base;
                 head["addr"] = json!(addr.0);
-                self.call(frame::STORE, &head, bytes, op.seq)?;
+                self.call(frame::STORE, &head, bytes, op.seq)?
             }
-        }
+        };
+        self.last_ns = answer.get("ns").and_then(Value::as_u64);
         Ok(())
+    }
+
+    fn child_ns(&self) -> Option<u64> {
+        self.last_ns
     }
 
     fn read(&mut self, addr: nu_model::Addr, len: u64) -> Result<Vec<u8>, FuncError> {

@@ -300,3 +300,25 @@ def test_the_loop_exits_at_end_of_file():
     out = io.BytesIO()
     assert serve(frames((p.HELLO, {"protocol": 1})), out) == 0
     assert len(answers(out)) == 1
+
+
+def test_with_op_time_the_ok_of_a_task_or_store_carries_the_child_time():
+    config = {"memories": [{"name": "m", "range": [MEM, NULL], "kind": "sram", "numeric": True}],
+              "sync_only": [], "granule": G}
+    for op_time in (False, True):
+        inp = frames(
+            (p.HELLO, {"protocol": 1}),
+            (p.CONFIGURE, dict(config, op_time=op_time)),
+            (p.TASK, {"seq": 1, "desc": dma(MEM, MEM + 0x100, 4)}),
+            (p.STORE, {"seq": 2, "addr": MEM}, b"\x01\x02"),
+            (p.FINISH, None),
+        )
+        out = io.BytesIO()
+        assert serve(inp, out) == 0
+        got = answers(out)
+        for kind, obj, _ in got[2:4]:
+            assert kind == p.OK
+            if op_time:
+                assert isinstance(obj["ns"], int) and obj["ns"] >= 0
+            else:
+                assert obj is None
