@@ -94,7 +94,7 @@ offset 0xd8 of the device image) and `sm_tile` (node type `sm`, a
 224-byte image at offset 0xf8 of the cluster image). Each record has
 entry 0x2a.
 
-`encoder.bin` (14,608 bytes) is a vision encoder kernel (27 layers of
+`encoder.bin` (14,912 bytes) is a vision encoder kernel (27 layers of
 width 1152, 16 heads of 72, an FFN of 4304, three images of 256 patches,
 and a projector to a width of 2048), built by the r2-toolchain
 (`r2-build --config configs/2p.yaml`). It models time only: the
@@ -103,8 +103,8 @@ the Atlas operands are in the tensor memory of each SM, and on
 configs/2p-smem.yaml the run stops with `Unowned`. The image holds every
 program of the kernel: the device program `encoder` (node type `root`,
 entry 0x2a) embeds the image of the cluster program `encoder_cluster`
-(node type `gpc`, entry 0x314, 14,288 bytes), which embeds the image of
-the SM program `encoder_step` (node type `sm`, entry 0x1e00, 10,496
+(node type `gpc`, entry 0x316, 14,592 bytes), which embeds the image of
+the SM program `encoder_step` (node type `sm`, entry 0x1ec2, 10,800
 bytes). The cluster image is at offset 248 of the device image, and the
 SM image at offset 3,704 of the cluster image (3,952 of the device
 image). The device starts `encoder_cluster` on each cluster. A cluster
