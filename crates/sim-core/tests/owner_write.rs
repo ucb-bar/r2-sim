@@ -33,6 +33,7 @@ fn dma(b: &Built, pe: &str, src: u64, dst: Range, tile: u64) -> Descriptor {
             dst: Addr(dst.base),
             bytes: dst.len(),
             tile_bytes: tile,
+            rows: None,
         },
     }
 }
@@ -66,27 +67,30 @@ fn a_write_into_hbm_is_a_pull_by_the_device() {
     let s = write_into_hbm(&[]);
     assert_eq!(s.fatal, None);
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
-    // invoke [0,8); the Invoke (52 B, 1 beat) is sent at 8 and moves hop
-    // by hop: sm0's up bridge 2 cycles + 10, the crossbar ports 1 cycle
-    // each, the cluster bridge 1 cycle + 20: arrives 43. The device enters
-    // and issues the task on its copy engine at 43.
+    // invoke [0,8); the Invoke (72 B: a 24-byte header and the 48 bytes of
+    // a DMA's arguments; 2 beats of 64 B) is sent at 8 and moves hop by
+    // hop: sm0's up bridge 4 cycles + 10, the crossbar ports 2 cycles
+    // each, the cluster bridge 2 cycles + 20: arrives 48. The device
+    // enters and issues the task on its copy engine at 48.
     let t = &s.tasks[0];
-    assert_eq!((t.invoke, t.ready, t.issue), (43, Some(43), Some(43)));
+    assert_eq!((t.invoke, t.ready, t.issue), (48, Some(48), Some(48)));
     // The request's trip from the device's engine to sm0's SMEM (gpc0's
     // bridge down 20 and sm0's bridge down 10: 30; 2026-10-21), sm0's SMEM
     // latency 10 (the pipeline fill) and the engine latency 100: the hops
-    // in route order from 183 at the engine's 64 B beat, narrowed by each
-    // hop (r2sim spec Section 5.6): sm0's SMEM port (one of its two slots) [183, 1207);
-    // sm0's bridge up (32 B/cycle) [183, 2231), latency 10; the crossbar
-    // ports and gpc0's bridge up narrowed to 32, [193, 2241), latency 20;
-    // the HBM port [213, 2261). The chunk runs from its first hop's start
-    // to its last hop's end; c_complete 4 at the device: 2265.
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (183, 2261));
-    assert_eq!(t.complete, Some(2265));
+    // in route order from 188 at the engine's 64 B beat, narrowed by each
+    // hop (r2sim spec Section 5.6): sm0's SMEM port (one of its two slots) [188, 1212);
+    // sm0's bridge up (32 B/cycle) [188, 2236), latency 10; the crossbar
+    // ports and gpc0's bridge up narrowed to 32, [198, 2246), latency 20;
+    // the HBM port [218, 2266). The chunk runs from its first hop's start
+    // to its last hop's end; c_complete 4 at the device: 2270.
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (188, 2266));
+    assert_eq!(t.complete, Some(2270));
     // sm0's wait: Await sent 10 in the dependency channel (independent of
-    // the invoke channel), registered at 45; Resolve sent 2265, arrives
-    // 2300. No other message kinds (no acknowledgement of invokes).
-    assert_eq!(s.end_time, 2300);
+    // the invoke channel), registered at 45; Resolve sent 2270, arrives
+    // 2304 (34 cycles: sm0's bridge moves half a 64 B beat per cycle, and
+    // from an even cycle its beat takes 2 cycles, from an odd one 3). No
+    // other message kinds (no acknowledgement of invokes).
+    assert_eq!(s.end_time, 2304);
     let kinds: Vec<&str> = s.messages_by_kind.keys().map(String::as_str).collect();
     assert_eq!(kinds, vec!["Await", "AwaitAck", "Invoke", "Resolve"]);
 }
@@ -119,9 +123,9 @@ fn a_consumer_of_a_write_registers_at_the_owner() {
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
     let (tw, tg) = (&s.tasks[0], &s.tasks[1]);
     assert_eq!(tg.nu, sm1);
-    // The write completes at 2265 as above; Resolve to sm1 takes 35 cycles.
-    assert_eq!(tw.complete, Some(2265));
-    assert_eq!(tg.ready, Some(2300));
+    // The write completes at 2270 as above; Resolve to sm1 takes 34 cycles.
+    assert_eq!(tw.complete, Some(2270));
+    assert_eq!(tg.ready, Some(2304));
     assert_eq!(s.warnings.len(), 0);
 }
 
@@ -147,8 +151,8 @@ fn a_task_on_a_pe_of_another_neutrino_is_fatal() {
 fn message_latency_adds_to_every_protocol_message() {
     // As a_write_into_hbm_is_a_pull_by_the_device with msg_latency 10:
     // Invoke and Resolve are on the critical path, 2 x 10 cycles:
-    // 2300 -> 2320.
+    // 2304 -> 2324.
     let s = write_into_hbm(&["global.msg_latency=10"]);
     assert_eq!(s.fatal, None);
-    assert_eq!(s.end_time, 2320);
+    assert_eq!(s.end_time, 2324);
 }

@@ -12,8 +12,9 @@
 //! `configure` calls `r2sim.func.backend.create` with the block table, the
 //! sync-only space, the granule, the PE names and the backend's entry of
 //! the configuration (JSON); `apply` calls the backend's `apply` with the
-//! task's fields and its descriptor bytes. Each call takes the interpreter
-//! lock (`PyGILState_Ensure`), so the worker thread can call it. The
+//! task's fields, its descriptor bytes and its argument block. Each call
+//! takes the interpreter lock (`PyGILState_Ensure`), so the worker thread
+//! can call it. The
 //! interpreter stays until the process ends.
 
 use std::ffi::{c_char, c_int, c_long, c_void, CStr, CString};
@@ -306,7 +307,12 @@ unsafe extern "C" fn apply(
     let api = api().expect("loaded at open");
     let t = &*task;
     let _gil = Gil::take(api);
-    let args = (api.tuple_new)(6);
+    let args = (api.tuple_new)(7);
+    let block = if t.args.is_null() {
+        c"".as_ptr().cast()
+    } else {
+        t.args.cast()
+    };
     let items = [
         (api.long_from_u64)(t.seq),
         (api.long_from_u64)(t.cycle),
@@ -314,6 +320,7 @@ unsafe extern "C" fn apply(
         (api.long_from_long)(t.neutrino as c_long),
         (api.long_from_u64)(t.pe as u64),
         (api.bytes_from)(t.desc.cast(), t.desc_bytes as isize),
+        (api.bytes_from)(block, t.args_bytes as isize),
     ];
     for (i, o) in items.into_iter().enumerate() {
         (api.tuple_set_item)(args, i as isize, o);

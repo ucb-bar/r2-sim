@@ -19,7 +19,7 @@ use nu_model::{NeutrinoId, Range};
 use crate::{Built, PeId};
 
 /// The ABI version of the descriptors and program records.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 /// The IMEM offset where a program starts; offset 0 holds a trap.
 pub const START_VECTOR: u64 = 4;
 /// Bytes of a program record in an IMEM: entry u64, abi_version u32,

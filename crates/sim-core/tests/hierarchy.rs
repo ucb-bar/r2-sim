@@ -80,6 +80,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     }
 }
@@ -383,6 +384,7 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
             dst: Addr(dst),
             bytes: 8192,
             tile_bytes: 8192,
+            rows: None,
         },
     };
     let mut sim = b.sim;

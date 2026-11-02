@@ -97,6 +97,7 @@ fn a_split_operand_reads_its_halves() {
                 accumulate: false,
                 keep: false,
                 tile: [2, 2],
+                transpose_b: false,
             },
         };
         let op = FuncOp {
@@ -229,4 +230,82 @@ fn the_accumulator_is_per_atlas() {
     nb.apply(&matmul(1, pa, pb, pc, (m, n, k), true, false), &mut mem)
         .unwrap();
     assert_eq!(get_bf16(&mut mem, pc, 64), vec![f32_to_bf16(8.0); 64]);
+}
+
+#[test]
+fn a_matmul_with_b_transposed() {
+    // B is stored as n x k (leading dimension k = 72) and the task uses
+    // its transpose. Integer data: the fp32 sums are exact.
+    let (m, n, k) = (16u64, 32u64, 72u64);
+    let (pa, pb, pc) = (0x10_0000, 0x11_0000, 0x12_0000);
+    let a: Vec<f32> = (0..m * k)
+        .map(|x| ((x / k * 3 + x % k) % 5) as f32)
+        .collect();
+    let bt: Vec<f32> = (0..n * k)
+        .map(|x| ((x / k * 7 + x % k * 2) % 7) as f32)
+        .collect();
+    let (mut nb, mut mem) = numeric();
+    put_bf16(&mut mem, pa, &a);
+    put_bf16(&mut mem, pb, &bt);
+    let mut op = matmul(0, pa, pb, pc, (m, n, k), false, false);
+    if let sim_core::OpKind::Task(d) = &mut op.kind {
+        if let sim_core::Args::Matmul {
+            transpose_b, ldb, ..
+        } = &mut d.args
+        {
+            (*transpose_b, *ldb) = (true, k);
+        }
+    }
+    nb.apply(&op, &mut mem).unwrap();
+    let want: Vec<u16> = (0..m * n)
+        .map(|x| {
+            let (i, j) = (x / n, x % n);
+            f32_to_bf16(
+                (0..k)
+                    .map(|p| a[(i * k + p) as usize] * bt[(j * k + p) as usize])
+                    .sum(),
+            )
+        })
+        .collect();
+    assert_eq!(get_bf16(&mut mem, pc, (m * n) as usize), want);
+}
+
+/// A Muon task with kernel `kernel` on `backend`.
+fn muon(
+    backend: &mut dyn FunctionalBackend,
+    mem: &mut Store,
+    kernel: u32,
+) -> Result<(), sim_core::FuncError> {
+    use sim_core::{Descriptor, FuncOp, OpKind, PeId};
+    let mut d = Descriptor::vector(PeId(0), Range::from_len(0x10_0000, 512), 1, 64, 64);
+    if let sim_core::Args::Vector {
+        kernel: k, block, ..
+    } = &mut d.args
+    {
+        (*k, *block) = (kernel, vec![1, 2, 3]);
+    }
+    let op = FuncOp {
+        seq: 1,
+        time: 0,
+        nu: nu_model::NeutrinoId(0),
+        gid: None,
+        backend: 0,
+        kind: OpKind::Task(d),
+    };
+    backend.apply(&op, mem)
+}
+
+#[test]
+fn a_muon_kernel_is_an_error_on_numeric_and_writes_nothing_on_trace() {
+    let (mut nb, mut mem) = numeric();
+    muon(&mut nb, &mut mem, 0).unwrap();
+    let e = muon(&mut nb, &mut mem, 7).unwrap_err();
+    assert_eq!(
+        e.0,
+        "Muon kernel 7: the numeric backend has no Muon kernels"
+    );
+    let mut t = func::Trace::new();
+    muon(&mut t, &mut mem, 0).unwrap();
+    muon(&mut t, &mut mem, 7).unwrap();
+    assert_eq!(mem.read(0x10_0000, 512).unwrap(), vec![0; 512]);
 }

@@ -213,6 +213,9 @@ pub enum PeParams {
         /// Clock ratio to the core clock (r2sim spec Section 2.1): the engine moves
         /// `beat x clock` bytes per core cycle.
         clock: Ratio,
+        /// Runs (rows or pieces of rows of a 2D copy) started per cycle: a
+        /// chunk of r runs lasts at least r / `runs_per_cycle` cycles.
+        runs_per_cycle: u64,
     },
     /// A tensor unit.
     Atlas {

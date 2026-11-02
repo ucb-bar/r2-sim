@@ -196,6 +196,11 @@ impl FunctionalBackend for Plugin {
                 op.gid.map_or("-".into(), |g| g.to_string())
             )));
         }
+        // The argument block of a Muon task.
+        let block: &[u8] = match &desc.args {
+            sim_core::Args::Vector { block, .. } => block,
+            _ => &[],
+        };
         let task = Task {
             seq: op.seq,
             cycle: op.time,
@@ -204,8 +209,12 @@ impl FunctionalBackend for Plugin {
             pe: desc.pe.map_or(NO_PE, |p| p.0),
             desc: desc.bytes.as_ptr(),
             desc_bytes: desc.bytes.len(),
-            args: std::ptr::null(),
-            args_bytes: 0,
+            args: if block.is_empty() {
+                std::ptr::null()
+            } else {
+                block.as_ptr()
+            },
+            args_bytes: block.len(),
         };
         let mut err = [0 as c_char; ERR_LEN];
         // SAFETY: the task's bytes live for the call.

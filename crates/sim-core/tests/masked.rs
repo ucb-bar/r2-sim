@@ -37,6 +37,7 @@ fn dma(b: &Built, src: u64, to: u64, bytes: u64, dst: Range, mask: u32) -> Descr
             dst: Addr(to),
             bytes,
             tile_bytes: bytes,
+            rows: None,
         },
     }
 }

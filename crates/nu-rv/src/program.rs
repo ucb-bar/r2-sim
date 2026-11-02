@@ -54,6 +54,8 @@ pub struct Record {
     pub at: u64,
     /// The IMEM offset of the entry function.
     pub entry: u64,
+    /// The ABI version of the program (r2-sim runs [`abi::VERSION`]).
+    pub abi_version: u32,
     pub args_bytes: u32,
     pub stack_bytes: u32,
     pub name: String,
@@ -77,8 +79,9 @@ pub fn find_record(imem: &[u8], node: &str) -> Vec<Record> {
 }
 
 /// The program records of `imem`, for any node type: 72 bytes at an
-/// 8-byte aligned offset, ABI version 1, reserved 0, an entry inside the
-/// image, and NUL-padded names.
+/// 8-byte aligned offset, an ABI version from 1 to [`abi::VERSION`] (so
+/// that the start of an older image can name its version), reserved 0,
+/// an entry inside the image, and NUL-padded names.
 pub fn records(imem: &[u8]) -> Vec<Record> {
     let n = abi::RECORD_BYTES as usize;
     let mut out = Vec::new();
@@ -87,11 +90,12 @@ pub fn records(imem: &[u8]) -> Vec<Record> {
         let r = &imem[at..at + n];
         let word = |o: usize| u32::from_le_bytes(r[o..o + 4].try_into().expect("4 bytes"));
         let entry = u64::from_le_bytes(r[..8].try_into().expect("8 bytes"));
-        if word(8) == abi::VERSION && word(20) == 0 && entry < imem.len() as u64 {
+        if (1..=abi::VERSION).contains(&word(8)) && word(20) == 0 && entry < imem.len() as u64 {
             if let (Some(name), Some(t)) = (padded(&r[24..56]), padded(&r[56..72])) {
                 out.push(Record {
                     at: at as u64,
                     entry,
+                    abi_version: word(8),
                     args_bytes: word(12),
                     stack_bytes: word(16),
                     name,
@@ -347,6 +351,15 @@ impl RvProgram {
                 let t = abi::node_type(&node.path);
                 let found = loaded_records(&mut core.mem.borrow_mut(), t);
                 match found.as_slice() {
+                    [r] if r.abi_version != abi::VERSION => {
+                        return fail(format!(
+                            "the program {} has ABI version {}; r2-sim runs ABI version {}",
+                            r.name,
+                            r.abi_version,
+                            abi::VERSION
+                        ))
+                        .await
+                    }
                     [r] => r.entry,
                     rs => {
                         return fail(format!(

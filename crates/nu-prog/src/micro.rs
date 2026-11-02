@@ -519,6 +519,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             dst: Addr(dst),
                             bytes: len,
                             tile_bytes: len,
+                            rows: None,
                         },
                     };
                     push(
@@ -601,6 +602,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                                 accumulate: false,
                                 keep: false,
                                 tile: p.tile,
+                                transpose_b: false,
                             },
                         });
                     }
@@ -623,6 +625,8 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             bytes_in: p.bytes,
                             bytes_out: p.bytes_out,
                             src: None,
+                            kernel: 0,
+                            block: Vec::new(),
                         },
                     });
                 }
@@ -790,6 +794,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             dst: Addr(dst),
                             bytes: len,
                             tile_bytes: len,
+                            rows: None,
                         },
                     };
                     items.push(Item {
@@ -940,6 +945,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                     dst: Addr(dst),
                     bytes,
                     tile_bytes: bytes,
+                    rows: None,
                 },
             };
             // Per stage: the matmul that last read it; per C buffer: the
@@ -1018,6 +1024,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             accumulate: x > 0,
                             keep: !last,
                             tile: [T, T],
+                            transpose_b: false,
                         },
                     };
                     push(&mut items, &mut metas, desc, 0, role(Role::Matmul));

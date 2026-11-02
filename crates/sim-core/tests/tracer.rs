@@ -53,6 +53,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     }
 }

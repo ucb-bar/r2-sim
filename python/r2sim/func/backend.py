@@ -33,10 +33,12 @@ class Backend:
         self.pes = pes
         self.config = config
 
-    def apply(self, seq: int, cycle: int, gid: int, neutrino: int, pe: int, desc: bytes) -> None:
-        """One task: its descriptor bytes, and its PE (an index of the PE
-        table; NO_PE for none)."""
+    def apply(self, seq: int, cycle: int, gid: int, neutrino: int, pe: int, desc: bytes,
+              block: bytes = b"") -> None:
+        """One task: its descriptor bytes, its PE (an index of the PE table;
+        NO_PE for none), and the argument block of a Muon task."""
         d = decode(desc, self.plane.memory.granule, None if pe == NO_PE else pe)
+        d["block"] = block
         ops.task(self.plane, d)
 
 

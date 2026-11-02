@@ -67,6 +67,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     }
 }
@@ -258,6 +259,7 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
             dst: Addr(dst),
             bytes: 8192,
             tile_bytes: 8192,
+            rows: None,
         },
     };
     let mut sim = b.sim;
@@ -268,19 +270,21 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let t = &s.tasks[0];
-    // The Invoke (52 B, 1 beat) arrives at sm1 at 34 and issues; the
-    // request's trip from sm1's engine to sm0's SMEM (sm1's bridge up and
-    // sm0's bridge down, 10 each; 2026-10-21), sm0's SMEM latency 10 (the
-    // pipeline fill) and the engine latency 100: the hops in route order
-    // from 164, at the engine's 64 B beat narrowed by each hop: sm0's SMEM
-    // port [164, 292); sm0's bridge up (32 B/cycle) [164, 420), latency
-    // 10; the crossbar ports and sm1's bridge down narrowed to 32,
-    // [174, 430), latency 10; sm1's SMEM port [184, 440). Complete 444;
-    // Resolve arrives at sm0 at 470.
-    assert_eq!(t.invoke, 34);
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (164, 440));
-    assert_eq!(t.complete, Some(444));
-    assert_eq!(s.end_time, 470);
+    // The Invoke (72 B: the header and the 48 bytes of a DMA's arguments;
+    // 2 beats of 64 B, each hop one cycle per beat more than for 1 beat)
+    // arrives at sm1 at 40 and issues; the request's trip from sm1's
+    // engine to sm0's SMEM (sm1's bridge up and sm0's bridge down, 10
+    // each; 2026-10-21), sm0's SMEM latency 10 (the pipeline fill) and the
+    // engine latency 100: the hops in route order from 170, at the
+    // engine's 64 B beat narrowed by each hop: sm0's SMEM port [170, 298);
+    // sm0's bridge up (32 B/cycle) [170, 426), latency 10; the crossbar
+    // ports and sm1's bridge down narrowed to 32, [180, 436), latency 10;
+    // sm1's SMEM port [190, 446). Complete 450; Resolve arrives at sm0 at
+    // 476.
+    assert_eq!(t.invoke, 40);
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (170, 446));
+    assert_eq!(t.complete, Some(450));
+    assert_eq!(s.end_time, 476);
 }
 
 #[test]
@@ -359,6 +363,7 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
             dst: Addr(h.base),
             bytes: MAT,
             tile_bytes: MAT,
+            rows: None,
         },
     };
     let p = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]).with_inferred_version(1);
@@ -374,10 +379,11 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
     let (tc, tp) = (&s.tasks[0], &s.tasks[1]);
     assert_eq!((tc.nu, tp.nu), (dev, sm1));
-    // C (60 B, 1 beat) is sent at 8 and enters the device at 43 (sm0's up
-    // bridge 2 + 10, two crossbar ports, the cluster bridge 1 + 20); its
-    // Await for (X, 1) reaches sm1 at 78 (the cluster bridge 1 + 20, two
-    // ports, sm1's down bridge 2 + 10) and waits on a pending entry. P
+    // C (80 B: the header, a key and the 48 bytes of a DMA's arguments; 2
+    // beats) is sent at 8 and enters the device at 48 (sm0's up bridge 4 +
+    // 10, two crossbar ports of 2, the cluster bridge 2 + 20); its Await
+    // for (X, 1) reaches sm1 at 83 (the cluster bridge 1 + 20, two ports,
+    // sm1's down bridge 2 + 10) and waits on a pending entry. P
     // (72 B, 2 beats) is invoked at [208, 216) and enters sm1 at 248,
     // adopting the entry; it runs [248, 440) and completes at 444. Resolve
     // reaches the device at 479: C is ready. C's DMA: the request's trip
@@ -388,7 +394,7 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
     // then the crossbar ports and the cluster bridge narrowed to 32 from
     // 629 and the HBM port from 649, to 905; complete 909; Resolve reaches
     // sm0's wait at 944.
-    assert_eq!((tc.invoke, tp.invoke), (43, 248));
+    assert_eq!((tc.invoke, tp.invoke), (48, 248));
     assert_eq!((tp.complete, tc.ready), (Some(444), Some(479)));
     assert_eq!(
         (tc.chunks[0].start, tc.chunks[0].end, tc.complete),

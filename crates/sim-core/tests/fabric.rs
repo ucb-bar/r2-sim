@@ -102,6 +102,7 @@ fn gemm_array_cycles(sets: &[&str], d: Dtype) -> u64 {
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     };
     let mut sim = b.sim;
@@ -394,6 +395,8 @@ device:
             bytes_in: 1024,
             bytes_out: 1024,
             src,
+            kernel: 0,
+            block: Vec::new(),
         },
     };
     let (v1, v2) = (v(0, None), v(1, Some(Addr(hbm.base))));
@@ -403,6 +406,8 @@ device:
         bytes_in: 0,
         bytes_out: 1024,
         src: None,
+        kernel: 0,
+        block: Vec::new(),
     };
     let mut v4 = v(3, Some(Addr(smem.base)));
     v4.dst = Range::from_len(hbm.base, 4096);
@@ -463,6 +468,7 @@ fn demands_record_reads_and_writes() {
             dst: Addr(dst.base),
             bytes: 8192,
             tile_bytes: 8192,
+            rows: None,
         },
     };
     let c = Range::from_len(s1.base, MAT);
@@ -496,6 +502,7 @@ fn demands_record_reads_and_writes() {
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     };
     let mut sim = b.sim;
@@ -601,6 +608,7 @@ fn two_transfers(dma: &str) -> (u64, u64) {
             dst: Addr(smem.base + i * 4096),
             bytes: 4096,
             tile_bytes: 4096,
+            rows: None,
         },
     };
     let (d0, d1) = (d(0), d(1));

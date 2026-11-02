@@ -1,7 +1,8 @@
 //! A functional backend plug-in for the tests of the loader. Its entry of
 //! the configuration (JSON) has:
 //! * `log`: a file; each task appends one line `seq cycle gid neutrino pe
-//!   desc`, the descriptor bytes in hex;
+//!   desc`, the descriptor bytes in hex, and ` args <hex>` for a task with
+//!   an argument block;
 //! * `fail`: `configure` or `apply` makes that call fail with a message;
 //! * `close_read`: `close` reads the first byte of the first block with
 //!   data and logs it (`close <byte>`): the blocks are still mapped then.
@@ -117,15 +118,30 @@ unsafe extern "C" fn apply(
     }
     let desc = std::slice::from_raw_parts(t.desc, t.desc_bytes);
     if let Some(f) = &mut s.log {
-        let hex: String = desc.iter().map(|b| format!("{b:02x}")).collect();
-        let _ = writeln!(
+        let hex = |b: &[u8]| -> String { b.iter().map(|b| format!("{b:02x}")).collect() };
+        let args = if t.args.is_null() {
+            &[][..]
+        } else {
+            std::slice::from_raw_parts(t.args, t.args_bytes)
+        };
+        let _ = write!(
             f,
-            "{} {} {} {} {} {hex}",
-            t.seq, t.cycle, t.gid, t.neutrino, t.pe
+            "{} {} {} {} {} {}",
+            t.seq,
+            t.cycle,
+            t.gid,
+            t.neutrino,
+            t.pe,
+            hex(desc)
         );
+        let _ = if args.is_empty() {
+            writeln!(f)
+        } else {
+            writeln!(f, " args {}", hex(args))
+        };
     }
     // A DMA: the header is 24 bytes and 8 per key; the arguments are src,
-    // dst, bytes.
+    // dst, bytes (a contiguous copy).
     if desc.len() >= 24 && u16::from_le_bytes([desc[0], desc[1]]) == 2 {
         let keys = u16::from_le_bytes([desc[6], desc[7]]) as usize;
         let a = &desc[24 + 8 * keys..];

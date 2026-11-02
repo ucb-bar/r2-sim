@@ -546,3 +546,66 @@ fn a_message_on_a_hop_below_one_slot_moves_in_its_slot_cycles() {
     let g = r.reserve_message(hop(h, 64, 0), 64, 47);
     assert_eq!((g.start, g.end), (48, 64));
 }
+
+/// The beats that a chunk of a 2D copy charges on a read hop and a write
+/// hop of one 64 B slot each (64 B/cycle): the windows, in cycles, of the
+/// two hops for `runs`, sides strided or contiguous.
+fn run_windows(runs: &[sim_core::Run], src_contiguous: bool, dst_contiguous: bool) -> (u64, u64) {
+    let mut r = Resources::new();
+    let (rd, wr) = (data(&mut r, "rd", 64, 64), data(&mut r, "wr", 64, 64));
+    let bytes: u64 = runs.iter().map(|x| x.bytes).sum();
+    let mut w = hop(wr, bytes, 0);
+    w.dir = Dir::Write;
+    let runs = sim_core::Runs {
+        list: runs.into(),
+        src_contiguous,
+        dst_contiguous,
+        min_cycles: 0,
+    };
+    r.reserve_path_at(
+        &[hop(rd, bytes, 0), w],
+        64,
+        Ratio::int(64),
+        0,
+        sim_core::resource::Admit::default(),
+        Some((&runs, 1)),
+    )
+    .unwrap();
+    let s = r.stats();
+    (s[rd.0 as usize].busy_cycles, s[wr.0 as usize].busy_cycles)
+}
+
+/// `n` runs of `bytes` at the source pitch `ss` and destination pitch `ds`.
+fn runs(n: u64, bytes: u64, ss: u64, ds: u64) -> Vec<sim_core::Run> {
+    (0..n)
+        .map(|i| sim_core::Run {
+            src: 0x1000 + i * ss,
+            dst: 0x8000 + i * ds,
+            bytes,
+        })
+        .collect()
+}
+
+#[test]
+fn each_run_of_a_strided_side_charges_the_beats_it_touches() {
+    // 4 runs of 144 B at a pitch of 256 B, 64 B beats: each run starts on
+    // a beat and touches ceil(144 / 64) = 3 beats, 12 in all on both
+    // sides (both strided), against 9 beats for the 576 B as one run.
+    assert_eq!(run_windows(&runs(4, 144, 256, 256), false, false), (12, 12));
+    // Aligned runs of 192 B touch exactly 3 beats each.
+    assert_eq!(run_windows(&runs(4, 192, 256, 256), false, false), (12, 12));
+    // A run of 144 B that starts 32 B into a beat touches
+    // ceil((32 + 144) / 64) = 3 beats; one that starts 56 B in, 4.
+    let mut r = runs(2, 144, 256, 256);
+    r[0].src += 32;
+    r[1].src += 56;
+    assert_eq!(run_windows(&r, false, false).0, 7);
+}
+
+#[test]
+fn a_contiguous_side_charges_the_chunk_as_one_run() {
+    // A strided source (144 B rows at a pitch of 256 B) into a contiguous
+    // destination (pitch 144): the read hop charges 3 beats per run (12),
+    // the write hop the 576 B as one run from the first row (9 beats).
+    assert_eq!(run_windows(&runs(4, 144, 256, 144), false, true), (12, 9));
+}

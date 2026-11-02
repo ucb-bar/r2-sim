@@ -95,17 +95,17 @@ fn the_three_level_dump() {
     let want = [
         (
             832,
-            "0a287302d8def7759a80cc7ffbe833f450df0aa248ae5641fbc68e1a2298afa6",
+            "d589e2925d3816b350948b7906248764b9e2c4e66ca16d9aaca6590ae3f6e928",
             true,
         ),
         (
             544,
-            "2a8c4b7c3dead947feb1d884684fecfb350b98d84ed79fe6886dd6650fecd73a",
+            "fc02dae9073e7fbfd593e54d0ab1b459d53630817fb42723e715a728b4d73a4b",
             false,
         ),
         (
             224,
-            "f320189323c4045ff0b98e25d8d80d4d50ed196e56f4adf15a40afa84d4361f5",
+            "aa7d49214e4e997949313589b152edd8b9b225acac78e8a5fbe2f6074e9fb711",
             false,
         ),
     ];

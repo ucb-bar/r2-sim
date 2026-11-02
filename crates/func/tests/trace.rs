@@ -46,6 +46,8 @@ fn task(label: Option<u64>, dst: Range) -> Descriptor {
             bytes_in: 0,
             bytes_out: 0,
             src: None,
+            kernel: 0,
+            block: Vec::new(),
         },
     }
 }
@@ -82,6 +84,7 @@ fn dma_copies_bytes() {
             dst: nu_model::Addr(0x8000),
             bytes: 3,
             tile_bytes: 3,
+            rows: None,
         },
     };
     t.apply(&op(d), &mut m).unwrap();

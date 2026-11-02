@@ -369,12 +369,19 @@ fn check(m: &mut NullMarks, g: u64, op: &FuncOp, addr: u64, len: u64) {
     }
 }
 
-/// The byte ranges that a task reads: the source of a DMA; A, B, and C
-/// when it accumulates, of a matmul (row by row). A Muon task reads
-/// nothing that the plane tracks yet.
+/// The byte ranges that a task reads: the source rows of a DMA; A, B (by
+/// its stored shape), and C when it accumulates, of a matmul (row by
+/// row). A Muon task reads nothing that the plane tracks yet.
 fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
     match desc.args {
-        Args::Dma { src, bytes, .. } => vec![(src.0, bytes)],
+        Args::Dma {
+            src, bytes, rows, ..
+        } => match rows {
+            None => vec![(src.0, bytes)],
+            Some(r) => (0..r.count)
+                .map(|i| (src.0 + i * r.src_stride, r.bytes))
+                .collect(),
+        },
         Args::Matmul {
             a,
             b,
@@ -391,6 +398,7 @@ fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
             out_dtype,
             accumulate,
             tile,
+            transpose_b,
             ..
         } => {
             let row = |dt: Dtype, n: u64| dt.bytes_for(n);
@@ -405,8 +413,10 @@ fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
             }
             // B: k rows; with b2, each half has the columns that
             // `split_row` gives it.
+            // With transpose_b, B is stored as n rows of k elements.
+            let (b_rows, b_cols) = if transpose_b { (n, k) } else { (k, n) };
             let halves: Vec<(u64, u64)> = match b2 {
-                None => vec![(b.0, n)],
+                None => vec![(b.0, b_cols)],
                 Some(b2) => {
                     let width = |hi: bool| {
                         (0..n)
@@ -419,7 +429,7 @@ fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
                 }
             };
             for (base, cols) in halves {
-                for p in 0..k {
+                for p in 0..b_rows {
                     out.push((base + row(b_dtype, p * ldb), row(b_dtype, cols)));
                 }
             }

@@ -128,6 +128,7 @@ pub fn node(k: Knobs) -> Node {
                 // Wide enough not to narrow the paths.
                 beat: 1024,
                 clock: sim_core::Ratio::ONE,
+                runs_per_cycle: 1,
             },
         },
     );
@@ -189,6 +190,7 @@ impl Node {
                 dst: Addr(SMEM + dst),
                 bytes,
                 tile_bytes,
+                rows: None,
             },
         }
     }
@@ -228,6 +230,7 @@ impl Node {
                 accumulate: false,
                 keep: false,
                 tile: [tile, tile],
+                transpose_b: false,
             },
         }
     }

@@ -108,6 +108,7 @@ fn dma(b: Built, nu: &str, src: u64, dst: u64, bytes: u64) -> Stats {
             dst: Addr(dst),
             bytes,
             tile_bytes: bytes,
+            rows: None,
         },
     };
     let mut sim = b.sim;
@@ -336,6 +337,7 @@ fn atlas_mm(b: Built, a: u64, a2: Option<u64>, bb: u64, b2: Option<u64>, c: u64)
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     };
     let mut sim = b.sim;
@@ -414,6 +416,7 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     };
     let mut sim = b.sim;
@@ -447,6 +450,8 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
             bytes_in: 1024,
             bytes_out: 1024,
             src: Some(Addr(0x10_1000)),
+            kernel: 0,
+            block: Vec::new(),
         },
     };
     let mut sim = b.sim;
@@ -490,6 +495,8 @@ fn a_muon_task_spreads_over_the_banks_of_its_range() {
             bytes_in: 8192,
             bytes_out: 1024,
             src: Some(Addr(smem + 0x3000)),
+            kernel: 0,
+            block: Vec::new(),
         },
     };
     let mut sim = b.sim;

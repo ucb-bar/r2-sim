@@ -1760,11 +1760,12 @@ impl Sim {
         admit: crate::resource::Admit,
         who: Who,
     ) -> Reserved {
-        self.reserve_path_at(path, beat, Ratio::int(beat), earliest, admit, who)
+        self.reserve_path_at(path, beat, Ratio::int(beat), earliest, admit, None, who)
     }
 
     /// [`Sim::reserve_path`] for a master that moves `rate` bytes per core
     /// cycle in beats of `beat` bytes.
+    #[allow(clippy::too_many_arguments)]
     fn reserve_path_at(
         &mut self,
         path: &[PathHop],
@@ -1772,12 +1773,15 @@ impl Sim {
         rate: Ratio,
         earliest: Cycle,
         admit: crate::resource::Admit,
+        runs: Option<(&crate::profile::Runs, usize)>,
         who: Who,
     ) -> Reserved {
         if self.zero_time {
             return Reserved::at(self.now);
         }
-        let g = self.res.reserve_path_at(path, beat, rate, earliest, admit);
+        let g = self
+            .res
+            .reserve_path_at(path, beat, rate, earliest, admit, runs);
         self.granted(g, earliest, who)
     }
 
@@ -3070,11 +3074,18 @@ impl Sim {
         let r = &p.running[running_pos(p, nu, t)];
         let chunk = &r.profile.chunks[r.next];
         let bytes = chunk.transfer.as_ref().map_or(0, |c| c.bytes);
+        // A chunk of a 2D copy: the engine starts its runs at its runs per
+        // cycle.
+        let min = chunk
+            .transfer
+            .as_ref()
+            .and_then(|c| c.runs.as_ref())
+            .map_or(0, |r| r.min_cycles);
         let rate = chunk.rate;
         let issue = if self.zero_time {
             0
         } else {
-            (bytes as u128 * rate.den as u128).div_ceil(rate.num as u128) as u64
+            ((bytes as u128 * rate.den as u128).div_ceil(rate.num as u128) as u64).max(min)
         };
         let end = self.reserve_chunk(pe, nu, t, capped);
         let p = &mut self.pes[pe.0 as usize];
@@ -3137,8 +3148,22 @@ impl Sim {
                     src_latency,
                     tail: None,
                 };
-                let g = self.reserve_path_at(&hops, tc.beat, rate, earliest, admit, Who::Task(gid));
+                let runs = tc.runs.as_ref().map(|r| (r, tc.read.hops.len()));
+                let min = tc.runs.as_ref().map_or(0, |r| r.min_cycles);
+                let mut g = self.reserve_path_at(
+                    &hops,
+                    tc.beat,
+                    rate,
+                    earliest,
+                    admit,
+                    runs,
+                    Who::Task(gid),
+                );
                 self.hop_buf = hops;
+                // The engine starts the chunk's runs at its runs per cycle.
+                if !self.zero_time {
+                    g.end = g.end.max(g.start + min);
+                }
                 g
             }
         };

@@ -64,6 +64,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>, label: u64) -> Descript
             accumulate: false,
             keep: false,
             tile: [64, 64],
+            transpose_b: false,
         },
     }
 }

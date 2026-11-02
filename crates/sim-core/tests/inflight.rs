@@ -67,6 +67,7 @@ fn copies(b: Built, nu: &str, pe: &str, src: u64, dst: u64, bytes: u64, n: u64) 
                 dst: Addr(dst + i * bytes),
                 bytes,
                 tile_bytes: bytes,
+                rows: None,
             },
         })
         .collect();

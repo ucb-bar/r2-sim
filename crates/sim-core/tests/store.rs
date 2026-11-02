@@ -95,17 +95,18 @@ fn a_null_block_has_no_data() {
         mask: FULL_MASK,
     };
     let into = Range::from_len(0x10_1000, 512);
-    s.dma(&dst(into), 0x20_0000, 0x10_1000, 16).unwrap();
+    s.dma(&dst(into), 0x20_0000, 0x10_1000, 16, None).unwrap();
     assert_eq!(s.read(0x10_1000, 16).unwrap(), vec![0; 16]);
     s.dma(
         &dst(Range::from_len(0x20_0000, 512)),
         0x10_0000,
         0x20_0000,
         16,
+        None,
     )
     .unwrap();
     // A DMA between blocks with data copies.
-    s.dma(&dst(into), 0x10_0000, 0x10_1000, 16).unwrap();
+    s.dma(&dst(into), 0x10_0000, 0x10_1000, 16, None).unwrap();
     assert_eq!(s.read(0x10_1000, 16).unwrap(), vec![7; 16]);
 }
 
@@ -116,7 +117,7 @@ fn a_dma_outside_its_dst_is_an_error() {
         span: Range::from_len(0x10_1000, 512),
         mask: FULL_MASK,
     };
-    let e = s.dma(&dst, 0x10_0000, 0x10_1200, 16).unwrap_err();
+    let e = s.dma(&dst, 0x10_0000, 0x10_1200, 16, None).unwrap_err();
     assert!(e.0.contains("outside its dst"), "{}", e.0);
 }
 
@@ -135,6 +136,7 @@ fn a_dma_whose_source_and_destination_overlap_is_a_memmove() {
         0x10_0000,
         0x10_0010,
         64,
+        None,
     )
     .unwrap();
     assert_eq!(s.read(0x10_0010, 64).unwrap(), data);
@@ -147,6 +149,7 @@ fn a_dma_whose_source_and_destination_overlap_is_a_memmove() {
         0x10_0010,
         0x10_0000,
         64,
+        None,
     )
     .unwrap();
     assert_eq!(s.read(0x10_0000, 64).unwrap(), data);

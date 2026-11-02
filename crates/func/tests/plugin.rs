@@ -167,6 +167,7 @@ fn dma_op(seq: u64, src: u64, dst: u64, n: u64, bytes: Vec<u8>) -> FuncOp {
                 dst: Addr(dst),
                 bytes: n,
                 tile_bytes: n,
+                rows: None,
             },
         }),
     }
@@ -271,4 +272,50 @@ fn a_missing_library_or_symbol_is_an_error() {
     };
     let e = Plugin::open("c", &libc_path, "{}", vec![]).err().unwrap();
     assert!(e.contains("no symbol r2_backend_open"), "{e}");
+}
+
+#[test]
+fn the_argument_block_of_a_muon_task_reaches_the_plugin() {
+    let log = temp("block");
+    let mut p = plugin(&format!("{{\"log\": {log:?}}}")).unwrap();
+    let mut m = store();
+    p.configure(&m).unwrap();
+    // A vector descriptor (ABI version 2) with kernel 7 and a 24-byte block.
+    let block: Vec<u8> = (0..24).map(|i| 0xa0 + i).collect();
+    let mut desc_bytes = vec![4, 0, 0, 0, 1, 0, 0, 0];
+    desc_bytes.extend((0x10_0000u64 / 512).to_le_bytes());
+    desc_bytes.extend(1u32.to_le_bytes());
+    desc_bytes.extend(u32::MAX.to_le_bytes());
+    for w in [1u64, 64, 64, 0] {
+        desc_bytes.extend(w.to_le_bytes());
+    }
+    desc_bytes.extend(7u32.to_le_bytes());
+    desc_bytes.extend(24u32.to_le_bytes());
+    desc_bytes.extend(0x200u64.to_le_bytes());
+    let mut d = Descriptor::vector(PeId(2), Range::from_len(0x10_0000, 512), 1, 64, 64);
+    if let Args::Vector {
+        kernel, block: b, ..
+    } = &mut d.args
+    {
+        (*kernel, *b) = (7, block.clone());
+    }
+    d.bytes = desc_bytes.clone();
+    let op = FuncOp {
+        seq: 9,
+        time: 50,
+        nu: NeutrinoId(1),
+        gid: Some(77),
+        backend: 0,
+        kind: OpKind::Task(d),
+    };
+    p.apply(&op, &mut m).unwrap();
+    drop(p);
+    let text = std::fs::read_to_string(&log).unwrap();
+    std::fs::remove_file(log).unwrap();
+    let hex = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    let line = text.lines().nth(1).unwrap();
+    assert_eq!(
+        line,
+        format!("9 50 77 1 2 {} args {}", hex(&desc_bytes), hex(&block))
+    );
 }

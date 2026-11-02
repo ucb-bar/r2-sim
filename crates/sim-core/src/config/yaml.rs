@@ -76,7 +76,9 @@
 //!   requested ahead, default 1), `burst_bytes` (dma: the chunk size of
 //!   every transfer; default the descriptor's tile; with `outstanding`
 //!   set, a warning in [`Built::warnings`] when `(outstanding - 1) x
-//!   burst_bytes` does not cover latency x rate of the engine's paths).
+//!   burst_bytes` does not cover latency x rate of the engine's paths),
+//!   `runs_per_cycle` (dma: the runs of a 2D copy, rows or pieces of rows,
+//!   that the engine starts per cycle; default 1).
 //! * memories (scratch and dram): `wr_bytes` (a separate write port
 //!   `<mem>.wport` charged by write demands; without it `<mem>.port`
 //!   serves both directions); `banks: N` (Radiance 2 spec Section 3.1): N
@@ -764,6 +766,9 @@ struct CompSec {
     /// DMA: the chunk size of every transfer (default: the descriptor's
     /// tile).
     burst_bytes: Option<Num>,
+    /// DMA: the runs (rows or pieces of rows of a 2D copy) the engine
+    /// starts per cycle (default 1).
+    runs_per_cycle: Option<u64>,
     /// Data width as a master (default 64): a DMA engine moves at most
     /// one beat per cycle, an Atlas or a Muon reads its local memory in
     /// beats of this size (or of the port's, if smaller).
@@ -2052,6 +2057,9 @@ impl Builder {
             if c.burst_bytes.is_some() && c.kind != "dma" {
                 return err(format!("{name}: burst_bytes is a dma key"));
             }
+            if c.runs_per_cycle.is_some() && c.kind != "dma" {
+                return err(format!("{name}: runs_per_cycle is a dma key"));
+            }
             let params = match c.kind.as_str() {
                 "tensor" => {
                     let mut rates = Vec::new();
@@ -2143,6 +2151,10 @@ impl Builder {
                             0 => return err(format!("{name}: burst_bytes 0")),
                             b => Some(b),
                         },
+                    },
+                    runs_per_cycle: match c.runs_per_cycle.unwrap_or(1) {
+                        0 => return err(format!("{name}: runs_per_cycle 0")),
+                        n => n,
                     },
                 },
                 k => return err(format!("{name}: unknown compute type {k:?}")),

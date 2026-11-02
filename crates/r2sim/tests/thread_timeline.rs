@@ -70,7 +70,7 @@ fn check(records: &[Value]) {
     assert_eq!(field(last, "state"), "finish_wait");
     assert_eq!(
         (last["cycle"].clone(), last["seq"].clone()),
-        (1837.into(), 4.into())
+        (1905.into(), 4.into())
     );
 }
 

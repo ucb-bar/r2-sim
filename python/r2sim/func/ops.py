@@ -30,14 +30,19 @@ def dtype_of(name: str) -> type:
 
 
 def dma(plane: Plane, desc: dict) -> None:
-    """Copies `bytes` from `src` to `to`; the bytes written must be inside
-    the task's masked destination. A copy from a null-fidelity block copies
-    nothing."""
-    src, to, n = desc["src"], desc["to"], desc["bytes"]
-    check_in_dst(plane, desc, to, n)
-    if plane.memory.is_null(src, n):
-        return
-    plane.memory.write(to, plane.memory.view(src, n).copy())
+    """Copies `bytes` from `src` to `to`, or `rows` rows of `row_bytes`: row
+    r from `src + r * src_stride` to `to + r * dst_stride`. Each written row
+    must be inside the task's masked destination. A row from a
+    null-fidelity block copies nothing."""
+    src, to = desc["src"], desc["to"]
+    rows = desc.get("rows", 1)
+    n = desc["row_bytes"] if rows > 1 else desc["bytes"]
+    for r in range(rows):
+        s, d = src + r * desc.get("src_stride", 0), to + r * desc.get("dst_stride", 0)
+        check_in_dst(plane, desc, d, n)
+        if plane.memory.is_null(s, n):
+            continue
+        plane.memory.write(d, plane.memory.view(s, n).copy())
 
 
 def check_in_dst(plane: Plane, desc: dict, addr: int, length: int) -> None:
@@ -93,7 +98,12 @@ def matmul_operands(plane: Plane, desc: dict) -> tuple[np.ndarray, np.ndarray]:
             hi, i = split_row(r, tile[0])
             base = desc["a2"] if hi else desc["a"]
             a[r] = read_matrix(plane, base + i * desc["lda"] * es, 1, k, desc["lda"], at)[0]
-    if desc["b2"] is None:
+    if desc.get("transpose_b"):
+        if desc["b2"] is not None:
+            raise FuncError("a matmul with transpose_b and b2")
+        # B stored as n x k: its transpose.
+        b = read_matrix(plane, desc["b"], n, k, desc["ldb"], bt).T
+    elif desc["b2"] is None:
         b = read_matrix(plane, desc["b"], k, n, desc["ldb"], bt)
     else:
         es = np.dtype(bt).itemsize
@@ -134,7 +144,11 @@ def matmul(plane: Plane, desc: dict) -> None:
 
 
 def vector(plane: Plane, desc: dict) -> None:
-    """A Muon task: no effect yet (the descriptor does not name the kernel)."""
+    """A Muon task: the opaque kernel 0 writes nothing; the kernels of the
+    registry come later."""
+    kernel = desc.get("kernel", 0)
+    if kernel != 0:
+        raise FuncError(f"unknown kernel {kernel}")
 
 
 def nothing(plane: Plane, desc: dict) -> None:

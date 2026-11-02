@@ -39,7 +39,7 @@ pub use func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
 pub use plane::{Backends, FuKind, Functional, NullRead, SelectFn, Units};
 pub use profile::{
     split_row, Args, Chunk, Descriptor, Dtype, NodeConfig, Occupancy, OpcodeId, PeId, Profile,
-    ProfileFn, ProfileRegistry,
+    ProfileFn, ProfileRegistry, Rows, Run, Runs,
 };
 pub use program::{Core, CoreMem, ImemImage, NeutrinoProgram, NuCtx, ProgramName, TaskHandle};
 pub use resource::{

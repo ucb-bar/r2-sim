@@ -36,10 +36,15 @@ impl Numeric {
     fn task(&mut self, desc: &Descriptor, mem: &mut Store) -> Result<(), FuncError> {
         match &desc.args {
             // An IMEM_COPY moves bytes of the control plane: no data here.
-            Args::Join | Args::Spawn { .. } | Args::Vector { .. } | Args::ImemCopy { .. } => Ok(()),
+            Args::Join | Args::Spawn { .. } | Args::ImemCopy { .. } => Ok(()),
+            Args::Vector { kernel, .. } => opaque(*kernel),
             &Args::Dma {
-                src, dst, bytes, ..
-            } => mem.dma(&desc.held(), src.0, dst.0, bytes),
+                src,
+                dst,
+                bytes,
+                rows,
+                ..
+            } => mem.dma(&desc.held(), src.0, dst.0, bytes, rows.as_ref()),
             &Args::Matmul {
                 a,
                 b,
@@ -57,6 +62,7 @@ impl Numeric {
                 a2,
                 b2,
                 tile,
+                transpose_b,
             } => {
                 for dt in [in_dtype, b_dtype, out_dtype] {
                     if !matches!(dt, Dtype::Bf16 | Dtype::F32) {
@@ -91,6 +97,18 @@ impl Numeric {
                     }
                 };
                 let bv = match b2 {
+                    // B stored as n x k: its transpose.
+                    None if transpose_b => {
+                        let t = read_matrix(mem, b.0, n, k, ldb, b_dtype)?;
+                        let (n, k) = (n as usize, k as usize);
+                        let mut v = vec![0.0; k * n];
+                        for j in 0..n {
+                            for p in 0..k {
+                                v[p * n + j] = t[j * k + p];
+                            }
+                        }
+                        v
+                    }
                     None => read_matrix(mem, b.0, k, n, ldb, b_dtype)?,
                     Some(b2) => {
                         let es_b = b_dtype.bytes();
@@ -134,6 +152,17 @@ impl Numeric {
                 }
             }
         }
+    }
+}
+
+/// A Muon task: the opaque kernel 0 writes nothing; any other kernel is
+/// an error.
+fn opaque(kernel: u32) -> Result<(), FuncError> {
+    match kernel {
+        0 => Ok(()),
+        k => err(format!(
+            "Muon kernel {k}: the numeric backend has no Muon kernels"
+        )),
     }
 }
 

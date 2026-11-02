@@ -47,16 +47,20 @@ pub struct PeId(pub u32);
 /// demand; it carries shapes, never data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Args {
-    /// Copy `bytes` from `src` to `dst` in chunks of `tile_bytes`.
+    /// Copy `bytes` from `src` to `dst` in chunks of `tile_bytes`; with
+    /// `rows`, a 2D copy of rows at strides.
     Dma {
-        /// Source address.
+        /// Source address (of row 0).
         src: Addr,
-        /// Destination address.
+        /// Destination address (of row 0).
         dst: Addr,
-        /// Bytes to copy.
+        /// Bytes to copy (`rows.count x rows.bytes` for a 2D copy).
         bytes: u64,
         /// Bytes per chunk (greater than 0).
         tile_bytes: u64,
+        /// A 2D copy: row r goes from `src + r x src_stride` to `dst + r x
+        /// dst_stride`. `None`: one contiguous row of `bytes`.
+        rows: Option<Rows>,
     },
     /// `C[m, n] (+)= A[m, k] * B[k, n]`, row-major with leading dimensions
     /// in elements; C is at `dst.base`. One chunk per `tile[0] x tile[1]`
@@ -103,6 +107,10 @@ pub enum Args {
         keep: bool,
         /// Output tile shape `[rows, columns]`: one chunk per tile.
         tile: [u64; 2],
+        /// B is stored as an `n x k` matrix (row-major, leading dimension
+        /// `ldb`) and the task uses its transpose: element (p, j) of B is
+        /// at element `j x ldb + p` from `b`. Not with `b2`. No time cost.
+        transpose_b: bool,
     },
     /// No request data (`join`).
     Join,
@@ -117,6 +125,12 @@ pub enum Args {
         bytes_out: u64,
         /// The address the task reads; `None`: the block of `dst`.
         src: Option<Addr>,
+        /// The kernel the task runs: an id of the kernel registry; 0 is
+        /// the opaque task (a time, no data).
+        kernel: u32,
+        /// The kernel's argument block, read from the invoking program's
+        /// data scratch at the invoke (empty: none).
+        block: Vec<u8>,
     },
     /// Start a program on the child Neutrino.
     Spawn {
@@ -132,6 +146,19 @@ pub enum Args {
         offset: u64,
         bytes: u64,
     },
+}
+
+/// The rows of a 2D DMA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rows {
+    /// Rows, 2 or more.
+    pub count: u64,
+    /// Bytes per row.
+    pub bytes: u64,
+    /// Bytes from the start of one source row to the next.
+    pub src_stride: u64,
+    /// Bytes from the start of one destination row to the next.
+    pub dst_stride: u64,
 }
 
 /// Element types of the numeric operands.
@@ -255,6 +282,7 @@ impl Descriptor {
                 dst: Addr(dst.base),
                 bytes,
                 tile_bytes: bytes,
+                rows: None,
             },
         )
     }
@@ -295,6 +323,7 @@ impl Descriptor {
                 accumulate: false,
                 keep: false,
                 tile: [m.min(128), n.min(128)],
+                transpose_b: false,
             },
         )
     }
@@ -312,6 +341,8 @@ impl Descriptor {
                 bytes_in,
                 bytes_out,
                 src: None,
+                kernel: 0,
+                block: Vec::new(),
             },
         )
     }
@@ -443,15 +474,18 @@ impl Descriptor {
     }
 
     /// Bytes of the descriptor in an `Invoke` message: its size in the
-    /// Neutrino ABI (2026-10-26), a 24-byte header (opcode, PE, flags,
+    /// Neutrino ABI (version 2), a 24-byte header (opcode, PE, flags,
     /// dependency count, `dst` base, bound and mask), 8 per dependency, and
-    /// the arguments (DMA 32, matmul 72, vector 32, spawn 16, IMEM copy 24,
-    /// join 0). The label is not sent.
+    /// the arguments (DMA 48, matmul 72, vector 32 or 40 with `src`, plus
+    /// its argument block, spawn 16, IMEM copy 24, join 0). The label is
+    /// not sent.
     pub fn wire_bytes(&self) -> u64 {
-        let args = match self.args {
-            Args::Dma { .. } => 32,
+        let args = match &self.args {
+            Args::Dma { .. } => 48,
             Args::Matmul { .. } => 72,
-            Args::Vector { .. } => 32,
+            Args::Vector { src, block, .. } => {
+                32 + if src.is_some() { 8 } else { 0 } + block.len() as u64
+            }
             Args::Join => 0,
             Args::Spawn { .. } => 16,
             Args::ImemCopy { .. } => 24,
@@ -531,6 +565,32 @@ pub struct TransferChunk {
     /// The engine's beat in bytes (the start of the beat chain, Section
     /// 5.4); the chunk's `rate` is the engine's bytes per core cycle.
     pub beat: u64,
+    /// The runs of a chunk of a 2D copy (rows or pieces of rows): each hop
+    /// of a strided side charges the beats that each run touches there.
+    /// `None`: one run, charged by its bytes.
+    pub runs: Option<Runs>,
+}
+
+/// The runs of a chunk of a 2D copy, and which side is contiguous (its
+/// stride equals the row bytes): the hops of a contiguous side charge the
+/// chunk as one run from the first run's address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runs {
+    pub list: Rc<[Run]>,
+    pub src_contiguous: bool,
+    pub dst_contiguous: bool,
+    /// The engine starts `runs_per_cycle` runs per cycle: the chunk lasts
+    /// at least `ceil(runs / runs_per_cycle)` cycles, and the next chunk
+    /// issues no earlier.
+    pub min_cycles: u64,
+}
+
+/// One run of a 2D copy: `bytes` from `src` to `dst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Run {
+    pub src: u64,
+    pub dst: u64,
+    pub bytes: u64,
 }
 
 impl TransferChunk {
@@ -896,6 +956,7 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         dst,
         bytes,
         tile_bytes,
+        rows,
     } = desc.args
     else {
         panic!("dma with args {:?}", desc.args);
@@ -905,6 +966,7 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         burst,
         beat,
         clock,
+        runs_per_cycle,
         ..
     } = &node.pe.params
     else {
@@ -931,9 +993,53 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         let half = half.unwrap_or_else(|| panic!("{}: no route {what}", node.pe.name));
         (half.clone(), run)
     };
+    // A 2D copy whose two sides are contiguous is one row.
+    let rows = rows.filter(|r| r.src_stride != r.bytes || r.dst_stride != r.bytes);
+    let mut chunks = match rows {
+        Some(rows) => {
+            let runs = runs_2d(src.0, dst.0, &rows, tile_bytes, |a| {
+                r.locate(a)
+                    .unwrap_or_else(|| panic!("address {a:#x} is in no memory block"))
+            });
+            runs.into_iter()
+                .map(|runs| {
+                    let (rh, _) = side(runs[0].src, true);
+                    let (wh, _) = side(runs[0].dst, false);
+                    let n: u64 = runs.iter().map(|x| x.bytes).sum();
+                    let use_of = |p: Option<(AttachId, AttachId)>, dir| {
+                        p.map(|(from, to)| RouteUse {
+                            from,
+                            to,
+                            bytes: n,
+                            dir,
+                        })
+                    };
+                    Chunk {
+                        demand: Vec::new(),
+                        routes: [use_of(rh.pair, Dir::Read), use_of(wh.pair, Dir::Write)],
+                        transfer: Some(TransferChunk {
+                            read: rh,
+                            write: wh,
+                            bytes: n,
+                            beat: *beat,
+                            runs: Some(Runs {
+                                min_cycles: (runs.len() as u64).div_ceil(*runs_per_cycle),
+                                list: runs.into(),
+                                src_contiguous: rows.src_stride == rows.bytes,
+                                dst_contiguous: rows.dst_stride == rows.bytes,
+                            }),
+                        }),
+                        rate: Ratio::new(*beat * clock.num, clock.den),
+                        latency: *latency,
+                    }
+                })
+                .collect()
+        }
+        None => Vec::with_capacity(bytes.div_ceil(tile_bytes) as usize),
+    };
+    let bytes = if rows.is_some() { 0 } else { bytes };
     let (mut rh, mut src_run) = side(src.0, true);
     let (mut wh, mut dst_run) = side(dst.0, false);
-    let mut chunks = Vec::with_capacity(bytes.div_ceil(tile_bytes) as usize);
     let mut done = 0u64;
     while done < bytes {
         let (sa, da) = (src.0 + done, dst.0 + done);
@@ -968,6 +1074,7 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
                 write: wh.clone(),
                 bytes: n,
                 beat: *beat,
+                runs: None,
             }),
             rate: Ratio::new(*beat * clock.num, clock.den),
             latency: *latency,
@@ -986,6 +1093,67 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         fill,
         request,
     }
+}
+
+/// The chunks of a 2D copy, each a list of runs (r2sim spec Section 6,
+/// DMA engine): a chunk has whole rows, `tile / row_bytes` of them (at
+/// least one); a row longer than the tile is split into pieces of the tile,
+/// one piece per chunk. A run is also cut where either side leaves its
+/// memory block (`locate`: the block and the bytes left in it), and a
+/// chunk ends where a run's blocks differ from the chunk's.
+fn runs_2d(
+    src: u64,
+    dst: u64,
+    rows: &Rows,
+    tile: u64,
+    locate: impl Fn(u64) -> (usize, u64),
+) -> Vec<Vec<Run>> {
+    let per_chunk = (tile / rows.bytes).max(1);
+    // The pieces of a row, as (offset, bytes): the whole row, or pieces of
+    // the tile when the row is longer.
+    let piece = if rows.bytes > tile { tile } else { rows.bytes };
+    let mut chunks: Vec<Vec<Run>> = Vec::new();
+    let mut cur: Vec<Run> = Vec::new();
+    let mut cur_rows = 0;
+    let mut cur_blocks = None;
+    for r in 0..rows.count {
+        let (s0, d0) = (src + r * rows.src_stride, dst + r * rows.dst_stride);
+        let mut off = 0;
+        while off < rows.bytes {
+            // A new chunk: at a piece of a long row, or after the rows of
+            // a chunk.
+            let new_row = off == 0;
+            if (rows.bytes > tile || (new_row && cur_rows == per_chunk)) && !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+                cur_rows = 0;
+            }
+            if new_row {
+                cur_rows += 1;
+            }
+            let end = (off + piece).min(rows.bytes);
+            // The piece, cut where a side leaves its block.
+            while off < end {
+                let (sb, s_left) = locate(s0 + off);
+                let (db, d_left) = locate(d0 + off);
+                let n = (end - off).min(s_left).min(d_left);
+                if cur_blocks.is_some_and(|b| b != (sb, db)) && !cur.is_empty() {
+                    chunks.push(std::mem::take(&mut cur));
+                    cur_rows = 1;
+                }
+                cur_blocks = Some((sb, db));
+                cur.push(Run {
+                    src: s0 + off,
+                    dst: d0 + off,
+                    bytes: n,
+                });
+                off += n;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
 }
 
 /// Atlas matmul: one chunk per output tile; tensor ops on the array and
@@ -1349,6 +1517,7 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         bytes_in,
         bytes_out,
         src,
+        ..
     } = desc.args
     else {
         panic!("vector op with args {:?}", desc.args);
@@ -1617,6 +1786,7 @@ device:
                     dst: Addr(dst),
                     bytes,
                     tile_bytes: tile,
+                    rows: None,
                 },
             };
             let p = dma_profile(&desc, &node);

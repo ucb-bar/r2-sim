@@ -77,6 +77,7 @@ fn run(steps: &[Step]) -> Stats {
                     dst: Addr(dst),
                     bytes,
                     tile_bytes: bytes,
+                    rows: None,
                 },
             };
             let h = ctx.invoke(d).await;

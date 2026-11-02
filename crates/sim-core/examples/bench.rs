@@ -97,6 +97,7 @@ fn main() {
                     // Wide enough not to narrow the paths.
                     beat: 1024,
                     clock: sim_core::Ratio::ONE,
+                    runs_per_cycle: 1,
                 },
             },
         );
@@ -156,6 +157,7 @@ fn main() {
                             dst: Addr(a.base),
                             bytes: 8192,
                             tile_bytes: 2048,
+                            rows: None,
                         },
                     })
                     .await;
@@ -190,6 +192,7 @@ fn main() {
                             accumulate: false,
                             keep: false,
                             tile: [64, 64],
+                            transpose_b: false,
                         },
                     })
                     .await;

@@ -109,13 +109,13 @@ pub fn image(code: &[u32], consts: &[u64]) -> Vec<u8> {
     }
     let r = 0x700;
     m[r..r + 8].copy_from_slice(&4u64.to_le_bytes());
-    m[r + 8..r + 12].copy_from_slice(&1u32.to_le_bytes());
+    m[r + 8..r + 12].copy_from_slice(&sim_core::abi::VERSION.to_le_bytes());
     m[r + 24..r + 28].copy_from_slice(b"test");
     m[r + 56..r + 60].copy_from_slice(b"root");
     m
 }
 
-/// A descriptor of ABI version 1.
+/// A descriptor of ABI version 2.
 pub struct Desc {
     pub opcode: u16,
     pub pe: u16,
@@ -150,8 +150,8 @@ pub fn words(w: &[u64]) -> Vec<u8> {
     w.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-/// A DMA descriptor (versioned) of `bytes` from `src` to `to` on PE `pe`
-/// of the owner of `to`, granule 512.
+/// A DMA descriptor (versioned, one row) of `bytes` from `src` to `to` on
+/// PE `pe` of the owner of `to`, granule 512.
 pub fn dma(pe: u16, src: u64, to: u64, bytes: u64, deps: Vec<u64>) -> Desc {
     Desc {
         opcode: 2,
@@ -161,8 +161,26 @@ pub fn dma(pe: u16, src: u64, to: u64, bytes: u64, deps: Vec<u64>) -> Desc {
         bound: (bytes >> 9) as u32,
         mask: u32::MAX,
         deps,
-        args: words(&[src, to, bytes, bytes]),
+        args: dma_args(src, to, bytes, 1, bytes as u32, 0, 0),
     }
+}
+
+/// The arguments of a DMA (ABI version 2): src, dst, bytes, tile (=
+/// bytes), rows, row bytes and the two strides.
+pub fn dma_args(
+    src: u64,
+    to: u64,
+    bytes: u64,
+    rows: u32,
+    row_bytes: u32,
+    ss: u32,
+    ds: u32,
+) -> Vec<u8> {
+    let mut a = words(&[src, to, bytes, bytes]);
+    for w in [rows, row_bytes, ss, ds] {
+        a.extend(w.to_le_bytes());
+    }
+    a
 }
 
 /// The descriptors of the invoked tasks, in invoke order.

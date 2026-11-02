@@ -1301,13 +1301,20 @@ impl Resources {
             issue: earliest,
             ..Admit::default()
         };
-        self.place(hops, beat, Ratio::int(beat), earliest, false, admit)
+        self.place(hops, beat, Ratio::int(beat), earliest, false, admit, None)
     }
 
     /// [`Resources::reserve_path`] for a master of `beat` bytes that moves
     /// `rate` bytes per core cycle (a clocked engine, r2sim spec Section 2.1); the
     /// in-flight pools of the hops take the chunk by `admit` (r2sim spec
     /// Section 5.6, Rule S5.11).
+    /// `runs`: the runs of a chunk of a 2D copy and the number of hops of
+    /// its read half; each hop of a strided side then charges, for each run
+    /// of n bytes at address a, the `ceil(((a mod b) + n) / b)` beats that
+    /// the run touches there (b the hop's beat in the chain; a the source
+    /// address on the read half, the destination address on the write
+    /// half); a hop of a contiguous side charges the chunk as one run from
+    /// the first run's address.
     pub fn reserve_path_at(
         &mut self,
         hops: &[PathHop],
@@ -1315,8 +1322,9 @@ impl Resources {
         rate: Ratio,
         earliest: Cycle,
         admit: Admit,
+        runs: Option<(&crate::profile::Runs, usize)>,
     ) -> Option<Grant> {
-        self.place(hops, beat, rate, earliest, false, admit)
+        self.place(hops, beat, rate, earliest, false, admit, runs)
     }
 
     /// Adds an in-flight pool of `bytes` named `name` (r2sim spec
@@ -1346,12 +1354,13 @@ impl Resources {
             issue: earliest,
             ..Admit::default()
         };
-        self.place(&[hop], beat, Ratio::int(beat), earliest, true, admit)
+        self.place(&[hop], beat, Ratio::int(beat), earliest, true, admit, None)
             .expect("one hop")
     }
 
     /// Books the hops of a transfer chunk from `earliest` in route order
     /// (rules 1 to 3) into `plan`.
+    #[allow(clippy::too_many_arguments)]
     fn book(
         &mut self,
         hops: &[PathHop],
@@ -1359,6 +1368,7 @@ impl Resources {
         rate: Ratio,
         earliest: Cycle,
         message: bool,
+        runs: Option<(&crate::profile::Runs, usize)>,
         plan: &mut Vec<Placed>,
     ) {
         plan.clear();
@@ -1367,10 +1377,31 @@ impl Resources {
         let mut r = rate.num as u128 * SCALE as u128 / rate.den as u128;
         let mut b_prev = beat;
         let mut want = earliest;
-        for h in hops {
+        for (i, h) in hops.iter().enumerate() {
             let f = self.flow(h.resource);
             let b = b_prev.min(f.data_beat());
-            let beats = h.amount.div_ceil(b);
+            let beats = match runs {
+                None => h.amount.div_ceil(b),
+                Some((runs, split)) => {
+                    let read = i < split;
+                    let addr = |r: &crate::profile::Run| if read { r.src } else { r.dst };
+                    let contiguous = if read {
+                        runs.src_contiguous
+                    } else {
+                        runs.dst_contiguous
+                    };
+                    if contiguous {
+                        // The chunk's rows are one run on this side.
+                        let a = addr(&runs.list[0]);
+                        ((a % b) + h.amount).div_ceil(b)
+                    } else {
+                        runs.list
+                            .iter()
+                            .map(|r| ((addr(r) % b) + r.bytes).div_ceil(b))
+                            .sum()
+                    }
+                }
+            };
             let need = if message {
                 SCALE.min(f.cap)
             } else {
@@ -1421,6 +1452,7 @@ impl Resources {
         earliest: Cycle,
         message: bool,
         admit: Admit,
+        runs: Option<(&crate::profile::Runs, usize)>,
     ) -> Option<Grant> {
         if hops.is_empty() {
             return None;
@@ -1431,7 +1463,7 @@ impl Resources {
         // The pool whose room set the final e.
         let mut waited_on: Option<u32> = None;
         loop {
-            self.book(hops, beat, rate, e, message, &mut plan);
+            self.book(hops, beat, rate, e, message, runs, &mut plan);
             if !pooled {
                 break;
             }

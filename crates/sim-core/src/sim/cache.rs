@@ -253,9 +253,14 @@ impl super::Sim {
     /// its slice, and adds a write-back chunk after each chunk that evicts
     /// a dirty line.
     pub(super) fn cache_chunks(&mut self, pe: PeId, desc: &Descriptor, prof: &mut Profile) {
-        let Args::Dma { src, dst, .. } = desc.args else {
+        let Args::Dma { src, dst, rows, .. } = desc.args else {
             return;
         };
+        let cached = |a: u64| self.cached(a).is_some();
+        assert!(
+            rows.is_none() || !(cached(src.0) || cached(dst.0)),
+            "a 2D copy through a cache is not modeled"
+        );
         if !prof.chunks.iter().any(|c| c.transfer.is_some()) {
             return;
         }
@@ -377,6 +382,7 @@ impl super::Sim {
                 write: Rc::clone(write),
                 bytes: cfg.line,
                 beat,
+                runs: None,
             }),
             rate,
             latency: 0,

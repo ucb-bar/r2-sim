@@ -76,6 +76,7 @@ fn run_some(b: Built, dma: bool, store: bool) -> (u64, Stats) {
             dst: Addr(smem),
             bytes: 4096,
             tile_bytes: 4096,
+            rows: None,
         },
     };
     let mut sim = b.sim;

@@ -18,6 +18,7 @@ use nu_model::{Dst, Range};
 
 use crate::config::MemBlock;
 use crate::func::FuncError;
+use crate::profile::Rows;
 
 /// One memory block of the store.
 #[derive(Debug)]
@@ -195,21 +196,36 @@ impl Store {
     }
 
     /// The DMA of a task with dst `task_dst`: `bytes` from `src` to `dst`,
-    /// as a memmove (the two ranges may overlap). A copy from a block of a
-    /// null subtree copies nothing; a copy into the sync-only space or a
-    /// block of a null subtree writes nothing.
-    pub fn dma(&mut self, task_dst: &Dst, src: u64, dst: u64, bytes: u64) -> Result<(), FuncError> {
-        check_in_dst(task_dst, self.granule(), &Range::from_len(dst, bytes))?;
-        let from = self.raw(src, bytes)?;
-        if from.is_null() || self.is_sync_only(dst, bytes) {
-            return Ok(());
-        }
-        let to = self.raw(dst, bytes)?;
-        if !to.is_null() {
-            // SAFETY: both ranges lie in mappings of the store (`raw`), and
-            // no reference to their bytes exists; `copy` allows them to
-            // overlap.
-            unsafe { std::ptr::copy(from, to, bytes as usize) };
+    /// or with `rows` the rows of a 2D copy, each as a memmove (a row's
+    /// ranges may overlap). Each written row must lie in `task_dst`. A row
+    /// from a block of a null subtree copies nothing; a row into the
+    /// sync-only space or a block of a null subtree writes nothing.
+    pub fn dma(
+        &mut self,
+        task_dst: &Dst,
+        src: u64,
+        dst: u64,
+        bytes: u64,
+        rows: Option<&Rows>,
+    ) -> Result<(), FuncError> {
+        let (count, len, ss, ds) = match rows {
+            None => (1, bytes, 0, 0),
+            Some(r) => (r.count, r.bytes, r.src_stride, r.dst_stride),
+        };
+        for r in 0..count {
+            let (s, d) = (src + r * ss, dst + r * ds);
+            check_in_dst(task_dst, self.granule(), &Range::from_len(d, len))?;
+            let from = self.raw(s, len)?;
+            if from.is_null() || self.is_sync_only(d, len) {
+                continue;
+            }
+            let to = self.raw(d, len)?;
+            if !to.is_null() {
+                // SAFETY: both ranges lie in mappings of the store (`raw`),
+                // and no reference to their bytes exists; `copy` allows
+                // them to overlap.
+                unsafe { std::ptr::copy(from, to, len as usize) };
+            }
         }
         Ok(())
     }

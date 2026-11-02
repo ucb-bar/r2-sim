@@ -42,6 +42,7 @@ fn dma(b: &Built, pe: &str, src: u64, dst: u64, bytes: u64, label: u64) -> Descr
             dst: Addr(dst),
             bytes,
             tile_bytes: bytes,
+            rows: None,
         },
     }
 }

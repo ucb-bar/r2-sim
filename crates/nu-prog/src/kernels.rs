@@ -730,6 +730,7 @@ impl Builder {
                     dst: Addr(dst),
                     bytes: len,
                     tile_bytes: len,
+                    rows: None,
                 },
             },
         }
@@ -837,6 +838,7 @@ impl Builder {
                     accumulate,
                     keep,
                     tile: [m, n],
+                    transpose_b: false,
                 },
             },
         })
@@ -882,6 +884,8 @@ impl Builder {
                     bytes_in,
                     bytes_out,
                     src: Some(Addr(src)),
+                    kernel: 0,
+                    block: Vec::new(),
                 },
             },
         })
