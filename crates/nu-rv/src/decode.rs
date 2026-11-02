@@ -228,6 +228,25 @@ pub fn decode(
             // The argument block, read with the descriptor from the data
             // scratch.
             let (kernel, len, at_block) = (u32_at(a, 32), u32_at(a, 36) as u64, u64_at(a, 40));
+            // The kernel is 0 (opaque, no block) or one of the registry,
+            // with a block of the registry's size.
+            let want = match kernel {
+                0 => 0,
+                k => match sim_core::kernels::by_id(k) {
+                    Some(r) => r.bytes,
+                    None => {
+                        return Err(format!(
+                            "descriptor at {addr:#x}: kernel {kernel} is not in the kernel registry"
+                        ))
+                    }
+                },
+            };
+            if len != want {
+                return Err(format!(
+                    "descriptor at {addr:#x}: kernel {kernel} ({}) has an argument block of {len} bytes, not {want}",
+                    sim_core::kernels::name(kernel).expect("a known kernel")
+                ));
+            }
             let block = if len == 0 {
                 Vec::new()
             } else if fits_at(at_block, len) {

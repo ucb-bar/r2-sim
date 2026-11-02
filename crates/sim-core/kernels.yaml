@@ -1,0 +1,89 @@
+# The Muon kernel registry (functional plane per FU kind, 2026-10-30).
+#
+# One entry per kernel. Kernel 0 is the opaque task (a time, no data) and
+# is not listed. The fields of an argument block are in order, in C layout
+# with no implicit padding (each field starts where the one before it
+# ends, at a multiple of its size), and the block is a multiple of 8
+# bytes. Addresses are global byte addresses; `ld` values are in
+# elements. Element types: bf16 storage, fp32 arithmetic, round to nearest
+# even at each bf16 store, unless the semantics say otherwise. The time of
+# a task comes from its descriptor (ops, bytes_in, bytes_out, src), not
+# from this file.
+
+- id: 1
+  name: row_stats
+  summary: LayerNorm statistics of one chunk of the columns of each row
+  semantics: |
+    Per row, in fp32: the chunk's mean_c and M2_c (the mean, then the sum
+    of squared differences from it). If count = 0: (mean, M2) = (mean_c,
+    M2_c). Else the merge of Chan et al.: n = count + cols, d = mean_c -
+    mean, mean += d * cols / n, M2 += M2_c + d * d * count * cols / n.
+  fields:
+    - [src, u64, "read: bf16 [rows][cols], leading dimension ld"]
+    - [stats, u64, "read and write: fp32 [rows][2] (mean, M2)"]
+    - [rows, u32, "the rows"]
+    - [cols, u32, "the columns of the chunk"]
+    - [ld, u32, "the leading dimension of src"]
+    - [count, u32, "the elements per row merged before this chunk; 0 for the first chunk"]
+
+- id: 2
+  name: epilogue
+  summary: one out tile of a GEMM, from C to the bf16 output
+  semantics: |
+    Per element, in fp32: y = c. With NORM: y = rstd * (y - mean * u[j]),
+    rstd = 1 / sqrt(M2 / k + eps). With BIAS: y += bias[j]. With
+    GELU_TANH: y = 0.5 * y * (1 + tanh(sqrt(2 / pi) * (y + 0.044715 *
+    y^3))). With RES: y += res. Then out = bf16(y). An address that a flag
+    needs and that is 0 is an error. NORM is a LayerNorm folded into the
+    GEMM: W' = diag(gamma) W, u = the column sums of the stored W', and
+    bias = beta W + b.
+  flags:
+    NORM: 1
+    BIAS: 2
+    RES: 4
+    GELU_TANH: 8
+    C_F32: 16
+  fields:
+    - [c, u64, "read: C [rows][cols], ld_c: bf16, or fp32 with C_F32"]
+    - [out, u64, "write: bf16 [rows][cols], ld_out"]
+    - [res, u64, "read: bf16 [rows][cols], ld_res; with RES"]
+    - [bias, u64, "read: fp32 [cols]; with BIAS"]
+    - [u, u64, "read: fp32 [cols], the column sums of W'; with NORM"]
+    - [stats, u64, "read: fp32 [rows][2] (mean, M2); with NORM"]
+    - [rows, u32, "the rows"]
+    - [cols, u32, "the columns"]
+    - [ld_c, u32, "the leading dimension of c"]
+    - [ld_out, u32, "the leading dimension of out"]
+    - [ld_res, u32, "the leading dimension of res"]
+    - [k, u32, "the elements per row of the LayerNorm input; with NORM"]
+    - [eps, f32, "the LayerNorm epsilon; with NORM"]
+    - [flags, u32, "NORM, BIAS, RES, GELU_TANH, C_F32"]
+
+- id: 3
+  name: softmax_stats
+  summary: the row maximum and sum of the attention scores over both halves
+  semantics: |
+    Per row, over both halves, in fp32: m = max(scale * s) and l = sum of
+    exp(scale * s - m).
+  fields:
+    - [s0, u64, "read: bf16 [rows][cols], ld (half 0)"]
+    - [s1, u64, "read: bf16 [rows][cols], ld (half 1)"]
+    - [stats, u64, "write: fp32 [rows][2] (m, l)"]
+    - [rows, u32, "the rows"]
+    - [cols, u32, "the columns of one half"]
+    - [ld, u32, "the leading dimension of s0 and s1"]
+    - [scale, f32, "the attention scale"]
+
+- id: 4
+  name: softmax_apply
+  summary: the probabilities of one half of the attention scores
+  semantics: |
+    Per element, in fp32: p = exp(scale * s - m) / l. Then dst = bf16(p).
+  fields:
+    - [src, u64, "read: bf16 [rows][cols], ld"]
+    - [dst, u64, "write: bf16 [rows][cols], ld (may be src)"]
+    - [stats, u64, "read: fp32 [rows][2] (m, l)"]
+    - [rows, u32, "the rows"]
+    - [cols, u32, "the columns"]
+    - [ld, u32, "the leading dimension of src and dst"]
+    - [scale, f32, "the same scale as softmax_stats"]

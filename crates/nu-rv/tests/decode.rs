@@ -419,7 +419,8 @@ fn a_muon_task_carries_its_kernel_and_argument_block() {
     let abi = Abi::new(&b);
     let (sm, pe) = sm0(&b, &abi, "muon");
     let at = abi.node(NeutrinoId(0)).scratch.clone().unwrap();
-    let block: Vec<u8> = (0..24).collect();
+    // softmax_apply (id 4): a block of 40 bytes.
+    let block: Vec<u8> = (0..40).collect();
     let mut d = Desc {
         opcode: 4,
         pe,
@@ -428,7 +429,7 @@ fn a_muon_task_carries_its_kernel_and_argument_block() {
         bound: 64,
         mask: u32::MAX,
         deps: vec![],
-        args: vector_args(100, 512, 256, 0, 7, 24, at.base + BLOCK as u64),
+        args: vector_args(100, 512, 256, 0, 4, 40, at.base + BLOCK as u64),
     };
     let t = task(dec_with(&abi, &d, &block));
     let Args::Vector {
@@ -437,15 +438,47 @@ fn a_muon_task_carries_its_kernel_and_argument_block() {
     else {
         panic!("{:?}", t.args);
     };
-    assert_eq!((*kernel, got), (7, &block));
+    assert_eq!((*kernel, got), (4, &block));
     // The block travels with a forwarded invoke: 32 bytes of arguments
     // plus the block.
-    assert_eq!(t.wire_bytes(), 24 + 32 + 24);
+    assert_eq!(t.wire_bytes(), 24 + 32 + 40);
     // A block outside the data scratch.
-    d.args = vector_args(100, 512, 256, 0, 7, 24, at.bound - 8);
+    d.args = vector_args(100, 512, 256, 0, 4, 40, at.bound - 8);
     let e = dec_with(&abi, &d, &block).unwrap_err();
     assert!(
         e.contains("the argument block") && e.contains("outside the own data scratch"),
         "{e}"
     );
+}
+
+#[test]
+fn a_muon_kernel_must_be_in_the_registry_with_its_block_size() {
+    let b = two_p();
+    let abi = Abi::new(&b);
+    let (sm, pe) = sm0(&b, &abi, "muon");
+    let at = abi.node(NeutrinoId(0)).scratch.clone().unwrap();
+    let block = vec![0u8; 80];
+    let desc = |kernel, bytes| Desc {
+        opcode: 4,
+        pe,
+        flags: 1,
+        base: sm >> 9,
+        bound: 64,
+        mask: u32::MAX,
+        deps: vec![],
+        args: vector_args(100, 512, 256, 0, kernel, bytes, at.base + BLOCK as u64),
+    };
+    let e = dec_with(&abi, &desc(7, 24), &block).unwrap_err();
+    assert!(e.ends_with("kernel 7 is not in the kernel registry"), "{e}");
+    let e = dec_with(&abi, &desc(2, 72), &block).unwrap_err();
+    assert!(
+        e.ends_with("kernel 2 (epilogue) has an argument block of 72 bytes, not 80"),
+        "{e}"
+    );
+    let e = dec_with(&abi, &desc(0, 8), &block).unwrap_err();
+    assert!(
+        e.ends_with("kernel 0 (opaque) has an argument block of 8 bytes, not 0"),
+        "{e}"
+    );
+    task(dec_with(&abi, &desc(2, 80), &block));
 }

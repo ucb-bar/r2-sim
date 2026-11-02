@@ -7,6 +7,7 @@
 //! * [`config`]: static configuration of Neutrinos, PEs and memories.
 //! * [`program`]: Neutrino programs as coroutines over [`NuCtx`].
 //! * [`abi`]: the numbers of the Neutrino ABI that a configuration fixes.
+//! * [`kernels`]: the Muon kernel registry.
 //! * [`func`]: the functional plane interface, `Null`, and the worker protocol.
 //! * [`topology`]: the node tree, links and data paths.
 //! * [`sim`]: the timing plane and the run loop.
@@ -17,6 +18,7 @@ pub mod abi;
 pub mod config;
 pub(crate) mod event;
 pub mod func;
+pub mod kernels;
 pub mod plane;
 pub mod profile;
 pub mod program;

@@ -236,3 +236,78 @@ fn a_rust_program_has_no_pc_image_or_images() {
         .any(|p| p["type"] == "idma"));
     ids_resolve(&d, &m);
 }
+
+#[test]
+fn a_muon_task_of_an_rv_run_is_labelled_with_its_kernel_and_flags() {
+    // probe2: a 2D copy, a matmul and the kernel epilogue with BIAS.
+    let d = dir("probe2");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    std::fs::copy(
+        root.join("../nu-rv/tests/fixtures/rv/probe2.bin"),
+        d.join("probe2.bin"),
+    )
+    .unwrap();
+    let image = d.join("image.toml");
+    std::fs::write(&image, "[[entry]]\nimem = \"root\"\nbin = \"probe2.bin\"\n").unwrap();
+    let m = run(&d, &["--program", "rv", "--image", image.to_str().unwrap()]);
+    let ops: Vec<&str> = m["opcodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_str().unwrap())
+        .collect();
+    let labels: Vec<(&str, u64)> = records(&d, "tasks", 120)
+        .iter()
+        .map(|t| {
+            let label = u64::from_le_bytes(t[16..24].try_into().unwrap());
+            (ops[u16_at(t, 10) as usize], label)
+        })
+        .collect();
+    // epilogue (2) with BIAS (2) in the flags word; the others none.
+    const BIAS: u64 = 2;
+    assert_eq!(
+        labels
+            .iter()
+            .filter(|l| l.0 == "muon.vector")
+            .collect::<Vec<_>>(),
+        [&("muon.vector", 2 | BIAS << 32)]
+    );
+    assert!(labels
+        .iter()
+        .all(|l| l.0 == "muon.vector" || l.1 == u64::MAX));
+    // The schema names the kernel and the flags: "epilogue+bias".
+    let s = &m["label"];
+    let f = |name: &str| {
+        s["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        f("kernel"),
+        serde_json::json!({"name": "kernel", "shift": 0, "bits": 16, "enum":
+            ["opaque", "row_stats", "epilogue", "softmax_stats", "softmax_apply"]})
+    );
+    assert_eq!(
+        f("bias"),
+        serde_json::json!({"name": "bias", "shift": 33, "bits": 1, "enum": ["", "+bias"]})
+    );
+    assert_eq!(
+        f("gelu_tanh"),
+        serde_json::json!({"name": "gelu_tanh", "shift": 35, "bits": 1, "enum": ["", "+gelu_tanh"]})
+    );
+    assert_eq!(s["format"], "{kernel}{norm}{bias}{res}{gelu_tanh}{c_f32}");
+    // The format applied to the label.
+    let label = 2 | BIAS << 32;
+    let mut text = s["format"].as_str().unwrap().to_string();
+    for field in s["fields"].as_array().unwrap() {
+        let v = (label >> field["shift"].as_u64().unwrap())
+            & ((1 << field["bits"].as_u64().unwrap()) - 1);
+        let name = field["enum"][v as usize].as_str().unwrap();
+        text = text.replace(&format!("{{{}}}", field["name"].as_str().unwrap()), name);
+    }
+    assert_eq!(text, "epilogue+bias");
+}

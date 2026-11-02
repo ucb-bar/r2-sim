@@ -50,9 +50,9 @@ use nu_model::{Dep, NeutrinoId};
 use serde_json::{json, Value};
 use sim_core::tracer as tr;
 use sim_core::{
-    AttachId, Built, BusTopology, Charge, ChunkGrant, Component, Cycle, Dir, Link, OpcodeId, Owner,
-    PeParams, ResourceId, Role, RouteUse, Sim, Stats, Table, TableEntry, TaskEntered, Topology,
-    Tracer, Who, MESSAGE_KINDS,
+    Args, AttachId, Built, BusTopology, Charge, ChunkGrant, Component, Cycle, Dir, Link, OpcodeId,
+    Owner, PeParams, ResourceId, Role, RouteUse, Sim, Stats, Table, TableEntry, TaskEntered,
+    Topology, Tracer, Who, MESSAGE_KINDS,
 };
 
 const BUF: usize = 1 << 20;
@@ -629,6 +629,9 @@ pub struct RawTracer {
     charges: bool,
     messages: bool,
     deps_on: bool,
+    /// A run of RV programs: the label of a Muon task is its kernel and
+    /// flags ([`sim_core::kernels::label`]).
+    kernel_labels: bool,
 }
 
 /// A running program: (name string id, spawn gid, start, index of its
@@ -799,6 +802,7 @@ impl RawTracer {
             charges,
             messages,
             deps_on: f.keeps("deps"),
+            kernel_labels: run.program == "rv",
         };
         Ok((t, out))
     }
@@ -1258,7 +1262,12 @@ impl Tracer for RawTracer {
             pe,
             opcode: d.opcode.0,
             version: e.version.map(|v| v as u32),
-            label: d.label,
+            label: match &d.args {
+                Args::Vector { kernel, block, .. } if self.kernel_labels => {
+                    Some(sim_core::kernels::label(*kernel, block))
+                }
+                _ => d.label,
+            },
             dst_base: d.dst.base,
             dst_len: d.dst.len(),
             call: e.call.call,
@@ -2182,9 +2191,6 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
             (stem.to_string(), Value::Array(l))
         })
         .collect();
-    let kinds: Vec<&str> = (0..nu_prog::label::KINDS)
-        .map(nu_prog::label::kind_name)
-        .collect();
     json!({
         "format": "r2raw",
         "version": [1, 11],
@@ -2201,17 +2207,47 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         "links": link_rows, "memories": mem_rows, "resources": res_rows,
         "opcodes": sim.profiles().names().collect::<Vec<_>>(),
         "message_kinds": MESSAGE_KINDS,
-        "label": {
-            "fields": [
-                {"name": "kind", "shift": 56, "bits": 8, "enum": kinds},
-                {"name": "step", "shift": 48, "bits": 8},
-                {"name": "layer", "shift": 40, "bits": 8},
-                {"name": "unit", "shift": 32, "bits": 8},
-                {"name": "idx", "shift": 0, "bits": 32},
-            ],
-            "format": "{kind} s{step} l{layer} u{unit} #{idx}",
-        },
+        "label": if run.program == "rv" { kernel_label_schema() } else { program_label_schema() },
     })
+}
+
+/// The label schema of the Rust programs (`nu_prog::label`).
+fn program_label_schema() -> Value {
+    let kinds: Vec<&str> = (0..nu_prog::label::KINDS)
+        .map(nu_prog::label::kind_name)
+        .collect();
+    json!({
+        "fields": [
+            {"name": "kind", "shift": 56, "bits": 8, "enum": kinds},
+            {"name": "step", "shift": 48, "bits": 8},
+            {"name": "layer", "shift": 40, "bits": 8},
+            {"name": "unit", "shift": 32, "bits": 8},
+            {"name": "idx", "shift": 0, "bits": 32},
+        ],
+        "format": "{kind} s{step} l{layer} u{unit} #{idx}",
+    })
+}
+
+/// The label schema of an RV run, from the kernel registry: the kernel of
+/// a Muon task by name (0: `opaque`), and one bit per flag of the
+/// registry, shown as `+name` when set. The other tasks have no label.
+fn kernel_label_schema() -> Value {
+    use sim_core::kernels;
+    let top = kernels::registry().iter().map(|k| k.id).max().unwrap_or(0);
+    let names: Vec<&str> = (0..=top)
+        .map(|id| kernels::name(id).unwrap_or(""))
+        .collect();
+    let mut fields = vec![json!({"name": "kernel", "shift": 0, "bits": 16, "enum": names})];
+    let mut format = "{kernel}".to_string();
+    for (flag, bit) in kernels::flags() {
+        let name = flag.to_lowercase();
+        fields.push(json!({
+            "name": name, "shift": 32 + bit.trailing_zeros(), "bits": 1,
+            "enum": ["", format!("+{name}")],
+        }));
+        format.push_str(&format!("{{{name}}}"));
+    }
+    json!({"fields": fields, "format": format})
 }
 
 /// The `filters` object of the manifest: `records` lists the files

@@ -21,7 +21,8 @@ use sim_core::{build_config_file, Built, FatalError, ProfileRegistry, SimWarning
 /// The command line.
 pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
 [--functional trace|numeric|python|null] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--thread-timeline FILE.jsonl] [--quantize tile|none] \
-[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]";
+[--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]
+       r2sim kernels: prints the Muon kernel registry as JSON (the key kernels of a plug-in's configuration)";
 
 /// A functional backend of the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

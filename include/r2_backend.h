@@ -73,8 +73,10 @@ typedef struct {
     uint32_t abi;         /* R2_BACKEND_ABI */
     void *self;
     /* Before the run. pes: the PE names by index. config: the backend's
-       entry of the configuration, as JSON. Returns 0, or a value that is
-       not 0 and a message in err. */
+       entry of the configuration, as JSON, with the key kernels: the Muon
+       kernel registry (per kernel id, name, bytes, flags, and fields with
+       name, type and offset). Returns 0, or a value that is not 0 and a
+       message in err. */
     int (*configure)(void *self, const r2_memory *memory,
                      const char *const *pes, size_t pe_count,
                      const char *config, char *err, size_t err_len);

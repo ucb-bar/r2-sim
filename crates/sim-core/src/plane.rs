@@ -371,7 +371,8 @@ fn check(m: &mut NullMarks, g: u64, op: &FuncOp, addr: u64, len: u64) {
 
 /// The byte ranges that a task reads: the source rows of a DMA; A, B (by
 /// its stored shape), and C when it accumulates, of a matmul (row by
-/// row). A Muon task reads nothing that the plane tracks yet.
+/// row); [`src`, `src` + `bytes_in`) of a Muon task (`src` is the base of
+/// `dst` when the task has none).
 fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
     match desc.args {
         Args::Dma {
@@ -439,6 +440,9 @@ fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
                 }
             }
             out
+        }
+        Args::Vector { src, bytes_in, .. } => {
+            vec![(src.map_or(desc.dst.base, |s| s.0), bytes_in)]
         }
         _ => Vec::new(),
     }

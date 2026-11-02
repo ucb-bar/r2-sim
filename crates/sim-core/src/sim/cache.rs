@@ -251,18 +251,29 @@ impl super::Sim {
     /// The cache bookkeeping of DMA `desc` on engine `pe` (module doc):
     /// redirects the chunks of `prof` that hit or write a cached line to
     /// its slice, and adds a write-back chunk after each chunk that evicts
-    /// a dirty line.
-    pub(super) fn cache_chunks(&mut self, pe: PeId, desc: &Descriptor, prof: &mut Profile) {
+    /// a dirty line. A 2D copy with a side in a cached DRAM is an error:
+    /// the cache does not model rows.
+    pub(super) fn cache_chunks(
+        &mut self,
+        pe: PeId,
+        desc: &Descriptor,
+        prof: &mut Profile,
+    ) -> Result<(), String> {
         let Args::Dma { src, dst, rows, .. } = desc.args else {
-            return;
+            return Ok(());
         };
-        let cached = |a: u64| self.cached(a).is_some();
-        assert!(
-            rows.is_none() || !(cached(src.0) || cached(dst.0)),
-            "a 2D copy through a cache is not modeled"
-        );
+        if rows.is_some() {
+            let side = [("src", src.0), ("dst", dst.0)]
+                .into_iter()
+                .find(|&(_, a)| self.cached(a).is_some());
+            if let Some((name, a)) = side {
+                return Err(format!(
+                    "a 2D copy through a cache is not modeled: the {name} {a:#x} is in a cached DRAM"
+                ));
+            }
+        }
         if !prof.chunks.iter().any(|c| c.transfer.is_some()) {
-            return;
+            return Ok(());
         }
         // A chunk with a side in a cached DRAM is cut at that side's line
         // boundaries: one line per chunk.
@@ -341,6 +352,7 @@ impl super::Sim {
             out.extend(wbs);
         }
         prof.chunks = out;
+        Ok(())
     }
 
     /// The write-back chunk of a dirty `victim` (line, dirty) of slice

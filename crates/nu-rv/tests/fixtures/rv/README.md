@@ -2,7 +2,7 @@
 
 Each image `NAME.bin` has an image file `NAME.toml` that loads it into
 the IMEM of the root node, for `r2sim run --config CONFIG --program rv
---image NAME.toml`. `hello.bin`, `three-level.bin` and `probe.bin` run on
+--image NAME.toml`. `hello.bin`, `three-level.bin` and `probe2.bin` run on
 configs/2p-smem.yaml, and `encoder.bin` runs on configs/2p.yaml. The
 golden check (`tools/golden.sh`) runs hello, three-level and the encoder.
 The images have ABI version 2: they were built by the r2-toolchain at its
@@ -118,55 +118,54 @@ reads the keys and values of the other half of each image from the HBM
 of the other cluster. A step program returns without waiting for its
 tasks, and the programs of the next step name the keys of those tasks.
 
-`probe.bin` (376 bytes) has one task of each new descriptor form of ABI
+`probe2.bin` (392 bytes) has one task of each new descriptor form of ABI
 version 2 on root.gpc0.sm0: a 2D copy, a matmul with B transposed, and a
-Muon task that runs kernel 7 with a 24-byte argument block. Its record is
-at offset 0x130 (entry 0x2a, name `probe`, node type `root`). Kernel 7 is
-not in a backend yet: `trace` and `null` write nothing for it (the
-short form `--functional numeric` puts the Muon on `null`), and the run
-stops with an error when the Muon's backend is `numeric`
-(`--set functional.units.muon=[numeric]`) or `python`.
+Muon task that runs the registry kernel `epilogue` (id 2, an 80-byte
+argument block) with the flag `BIAS`: out = bf16(C + bias). Its record is
+at offset 0x140 (entry 0x2a, name `probe2`, node type `root`). The
+argument block is the struct that the toolchain generates from the
+kernel registry (crates/sim-core/kernels.yaml). `trace` and `null` write
+nothing for a Muon kernel (the short form `--functional numeric` puts the
+Muon on `null`), the run stops with an error when the Muon's backend is
+`numeric` (`--set functional.units.muon=[numeric]`), and `python`
+computes the epilogue. Load A (128 rows of 128 bf16) at the HBM of gpc0,
+B ([128][72] bf16) at offset 0x8000 of the SMEM of root.gpc0.sm0, and the
+bias (128 fp32) at offset 0x100000 of the HBM; C is at SMEM offset
+0x10000 and out at 0x18000.
 
 ```rust
-/// A kernel's argument block, as the registry will generate it.
-#[repr(C)]
-pub struct ScaleArgs {
-    pub src: u64,
-    pub dst: u64,
-    pub elems: u32,
-    pub scale: f32,
-}
-
-impl desc::Kernel for ScaleArgs {
-    const ID: u32 = 7;
-}
-
 const N: u32 = 128;
 const BYTES: u64 = (N * N * 2) as u64;
 
 #[nu_program(node = root, stack = 4096)]
-fn probe(_: &Args) {
+fn probe2(_: &Args) {
     let dram = gpc::prefix(0) | gpc::HBM;
     let smem = sm::prefix(0, 0) | sm::SMEM;
-    let (a, b, c) = (smem, smem + BYTES, smem + 2 * BYTES);
+    let (a, b, c, out) = (smem, smem + BYTES, smem + 2 * BYTES, smem + 3 * BYTES);
+    let bias = dram + 0x10_0000;
     // A 2D copy: 128 rows of 144 B at a pitch of 256 B
     let load = desc::dma2d(sm::PE_DMA, dst(a, BYTES), dram, a, 128, 144, 256, 144);
     unsafe { insn::invoke(load.addr()) };
-    // A matmul with B transposed
+    // A matmul with B transposed (k = 72)
     let mm = desc::matmul(sm::PE_ATLAS, dst(c, BYTES), a, b, N, N, 72, desc::DT_BF16)
         .transpose_b()
         .with_deps([key(a, 1)]);
     unsafe { insn::invoke(mm.addr()) };
-    // A Muon kernel task with its argument block
-    let args = ScaleArgs {
-        src: c,
-        dst: c,
-        elems: N * N,
-        scale: 0.5,
+    // The epilogue of C: out = bf16(C + bias)
+    let ep = kernels::EpilogueArgs {
+        c,
+        out,
+        bias,
+        rows: N,
+        cols: N,
+        ld_c: N,
+        ld_out: N,
+        flags: kernels::epilogue::BIAS,
+        ..Default::default()
     };
-    let k = desc::muon(sm::PE_MUON, dst(c, BYTES), &args, (N * N) as u64, BYTES, BYTES)
+    let e = desc::muon(sm::PE_MUON, dst(out, BYTES), &ep, (N * N) as u64, BYTES, BYTES)
         .with_deps([key(c, 1)]);
-    unsafe { insn::invoke(k.addr()) };
-    insn::wait(key(c, 2));
+    unsafe { insn::invoke(e.addr()) };
+    insn::wait(key(out, 1));
 }
 ```

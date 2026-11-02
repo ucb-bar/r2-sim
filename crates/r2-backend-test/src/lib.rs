@@ -5,7 +5,9 @@
 //!   an argument block;
 //! * `fail`: `configure` or `apply` makes that call fail with a message;
 //! * `close_read`: `close` reads the first byte of the first block with
-//!   data and logs it (`close <byte>`): the blocks are still mapped then.
+//!   data and logs it (`close <byte>`): the blocks are still mapped then;
+//! * `config_out`: a file; `configure` writes the configuration it got
+//!   there.
 //!
 //! A DMA task (opcode 2) copies its bytes on the store through the block
 //! table, so a test can see the data move. `r2_test_set_abi` changes the
@@ -81,6 +83,12 @@ unsafe extern "C" fn configure(
         _ => {}
     }
     s.close_read = cfg["close_read"].as_bool() == Some(true);
+    if let Some(p) = cfg["config_out"].as_str() {
+        if let Err(e) = std::fs::write(p, text.as_bytes()) {
+            set_err(err, err_len, &format!("{p}: {e}"));
+            return 1;
+        }
+    }
     if let Some(p) = cfg["log"].as_str() {
         match std::fs::File::create(p) {
             Ok(mut f) => {

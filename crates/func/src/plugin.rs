@@ -3,7 +3,9 @@
 //! [`Plugin::open`] opens the library with `dlopen`, finds
 //! `r2_backend_open` and checks the ABI version. `configure` passes the
 //! block table of the store, the sync-only space, the PE names by index
-//! and the backend's entry of the configuration as JSON. `apply` passes
+//! and the backend's entry of the configuration as JSON, with the key
+//! `kernels`: the Muon kernel registry (id, name, bytes, flags, and the
+//! fields with name, type and offset). `apply` passes
 //! each task with its descriptor bytes (a task of an RV program); a task
 //! without bytes (a task of a Rust program) is an error. `close` runs when
 //! the backend is dropped, at the end of the run. The library stays
@@ -100,7 +102,8 @@ impl Plugin {
             name: Box::leak(name.to_string().into_boxed_str()),
             lib: lib.to_string(),
             backend,
-            config: CString::new(config).map_err(|e| at(e.to_string()))?,
+            config: CString::new(with_kernels(config).map_err(at)?)
+                .map_err(|e| at(e.to_string()))?,
             pes: pes
                 .into_iter()
                 .map(|p| CString::new(p).expect("a PE name without NUL"))
@@ -115,6 +118,21 @@ impl Plugin {
     fn error(&self, msg: String) -> FuncError {
         FuncError(format!("backend {} ({}): {msg}", self.name, self.lib))
     }
+}
+
+/// The backend's entry `config` (a JSON object) with the key `kernels`.
+fn with_kernels(config: &str) -> Result<String, String> {
+    let mut v: serde_json::Value =
+        serde_json::from_str(config).map_err(|e| format!("the configuration: {e}"))?;
+    let Some(entry) = v.as_object_mut() else {
+        return Err("the configuration is not a JSON object".into());
+    };
+    if entry.contains_key("kernels") {
+        return Err("the configuration has the key kernels, which r2-sim sets".into());
+    }
+    let kernels = serde_json::to_value(sim_core::kernels::registry()).expect("JSON");
+    entry.insert("kernels".into(), kernels);
+    Ok(v.to_string())
 }
 
 /// The NUL-terminated message in an error buffer.

@@ -222,6 +222,33 @@ fn bad_descriptors_stop_the_run() {
 }
 
 #[test]
+fn a_muon_kernel_outside_the_registry_names_the_pc_and_the_kernel() {
+    let code = [k(rv::A0, 0), rv::invoke(rv::A0, rv::A0)];
+    let consts = [SCRATCH + 0x100];
+    let mut args = common::words(&[100, 512, 256, 0]);
+    args.extend(7u32.to_le_bytes());
+    args.extend(24u32.to_le_bytes());
+    args.extend((SCRATCH + 0x300).to_le_bytes());
+    let d = Desc {
+        opcode: 4,
+        pe: 0,
+        flags: 1,
+        base: SMEM >> 9,
+        bound: 1,
+        mask: u32::MAX,
+        deps: vec![],
+        args,
+    };
+    let e = error(&code, &consts, &[(0x100, d.bytes())]);
+    assert!(
+        e.contains(
+            "root: pc 0x8: descriptor at 0x1f1000100: kernel 7 is not in the kernel registry"
+        ),
+        "{e}"
+    );
+}
+
+#[test]
 fn the_instruction_limit_stops_the_run() {
     let r = run_on(two_p(), &image(&[rv::jal(0, 0)], &[]), &[], 1000);
     let e = fatal(&r);

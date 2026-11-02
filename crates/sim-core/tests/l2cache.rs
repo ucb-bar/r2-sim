@@ -156,3 +156,35 @@ fn a_flush_empties_the_cache_without_traffic() {
     assert_eq!(c.flushes[0].counts.peak_lines, 8);
     assert_eq!(bytes(&s, "root.hbm.b0.port"), 8 * LINE);
 }
+
+#[test]
+fn a_2d_copy_through_the_cache_stops_the_run() {
+    // 4 rows of 128 B from the buffer at a pitch of 256 B into the cached
+    // DRAM.
+    let b = built();
+    let root = b.nu("root");
+    let (hbm, buf) = (b.memory("root.hbm").base, b.memory("root.buf").base);
+    let mut d = Descriptor::dma(b.pe("root.dma"), buf, Range::from_len(hbm, 512), 512);
+    if let Args::Dma { rows, .. } = &mut d.args {
+        *rows = Some(sim_core::Rows {
+            count: 4,
+            bytes: 128,
+            src_stride: 256,
+            dst_stride: 128,
+        });
+    }
+    let mut sim = b.sim;
+    sim.spawn(root, move |ctx: NuCtx| async move {
+        let h = ctx.invoke(d).await;
+        ctx.wait(h.addr, h.version).await;
+    });
+    let s = sim.run();
+    let f = s.fatal.expect("an error");
+    assert_eq!(
+        f.error,
+        sim_core::FatalError::Invalid(format!(
+            "a 2D copy through a cache is not modeled: the dst {hbm:#x} is in a cached DRAM"
+        ))
+    );
+    assert_eq!(f.gid, Some(0));
+}

@@ -144,11 +144,10 @@ def matmul(plane: Plane, desc: dict) -> None:
 
 
 def vector(plane: Plane, desc: dict) -> None:
-    """A Muon task: the opaque kernel 0 writes nothing; the kernels of the
-    registry come later."""
-    kernel = desc.get("kernel", 0)
-    if kernel != 0:
-        raise FuncError(f"unknown kernel {kernel}")
+    """A Muon task: the opaque kernel 0 writes nothing; a kernel of the
+    registry runs on the plane (`kernels`)."""
+    if desc.get("kernel", 0) != 0:
+        plane.kernels.run(plane, desc)
 
 
 def nothing(plane: Plane, desc: dict) -> None:

@@ -8,27 +8,16 @@ equality: the plane accumulates in fp32 as numpy does, and the hello
 matmul is one task)."""
 
 import json
-import os
 import subprocess
-from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
-REPO = Path(__file__).resolve().parents[2]
+from binary import REPO, r2sim
+
 BF16 = ml_dtypes.bfloat16
 HELLO_BIN = REPO / "crates/nu-rv/tests/fixtures/rv/hello.bin"
-
-
-def r2sim() -> Path:
-    """The release binary: $R2SIM, else the cargo target directory's."""
-    if "R2SIM" in os.environ:
-        return Path(os.environ["R2SIM"])
-    target = Path(os.environ.get("CARGO_TARGET_DIR", REPO / "target"))
-    exe = target / "release" / "r2sim"
-    assert exe.exists(), f"no {exe}: build with cargo build --release, or set R2SIM"
-    return exe
 
 
 def test_hello_with_the_python_plane(tmp_path):

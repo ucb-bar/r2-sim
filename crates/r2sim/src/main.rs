@@ -1,4 +1,5 @@
 //! `r2sim run --config C --program P [options]` (see `USAGE`).
+//! `r2sim kernels` prints the Muon kernel registry as JSON.
 //!
 //! Runs program P on configuration C in timing mode with the Trace backend
 //! (`--functional` selects another; `--image` loads a memory image).
@@ -11,6 +12,11 @@ use r2sim::{Options, USAGE};
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv == ["kernels"] {
+        let k = sim_core::kernels::registry();
+        println!("{}", serde_json::to_string_pretty(k).expect("JSON"));
+        return;
+    }
     if let Err(e) = parse(&argv).and_then(|o| r2sim::run(&o)) {
         eprintln!("r2sim: {e}");
         std::process::exit(2);

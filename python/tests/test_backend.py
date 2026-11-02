@@ -9,6 +9,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
+from binary import registry
 from r2sim.func.backend import NO_PE, create
 from r2sim.func.descriptor import decode
 from r2sim.func.memory import FuncError
@@ -69,12 +70,13 @@ def test_the_decoder_gives_the_fields_of_the_ops():
 class Run:
     """A backend over one 1 MiB block at BASE (a NumPy array)."""
 
-    def __init__(self, provider="numpy"):
+    def __init__(self, provider="numpy", kernels=None):
         self.mem = np.zeros(1 << 20, np.uint8)
+        kernels = registry() if kernels is None else kernels
         cfg = {"blocks": [{"base": BASE, "size": len(self.mem), "ptr": self.mem.ctypes.data,
                            "name": "root.mem"}],
                "sync_only": [], "granule": G, "pes": ["root.atlas"],
-               "config": {"lib": "libr2_python.so", "provider": provider}}
+               "config": {"lib": "libr2_python.so", "provider": provider, "kernels": kernels}}
         self.backend = create(json.dumps(cfg))
         self.seq = 0
 
@@ -157,8 +159,17 @@ def test_a_matmul_with_b_transposed():
     assert np.array_equal(r.get(pc, (m, n), BF16), (a @ bt.T).astype(BF16))
 
 
-def test_a_muon_kernel_is_unknown_until_the_registry():
+def test_the_opaque_kernel_writes_nothing_and_an_unknown_kernel_is_an_error():
     r = Run()
     r.apply(vector_desc(BASE, 0))
+    assert not r.mem.any()
     with pytest.raises(FuncError, match="unknown kernel 7"):
         r.apply(vector_desc(BASE, 7, 24, 0x40), block=bytes(range(24)))
+
+
+def test_configure_names_each_registry_kernel_without_an_implementation():
+    extra = {"id": 9, "name": "layer_norm", "bytes": 8, "flags": {},
+             "fields": [{"name": "x", "type": "u64", "offset": 0}]}
+    with pytest.raises(FuncError, match=r"no implementation of the registry kernels "
+                                        r"layer_norm \(id 9\)$"):
+        Run(kernels=registry() + [extra])

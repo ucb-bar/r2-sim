@@ -177,3 +177,51 @@ fn a_write_by_a_computing_backend_removes_the_mark() {
     assert_eq!(s.fatal, None);
     assert!(null_reads(&s).is_empty(), "{:?}", s.warnings);
 }
+
+#[test]
+fn a_muon_task_that_reads_null_output_warns() {
+    // Atlas list [null], Muon list [trace]: the matmul writes C on null; a
+    // Muon task reads [src, src + bytes_in) = C (one warning), another
+    // reads its own dst when it has no src (none: nothing wrote it).
+    let mut n = node(Knobs::default());
+    let vector = n.sim.resources_mut().add_flow(
+        "muon.vector",
+        sim_core::resource::Kind::VectorOps,
+        sim_core::Ratio::int(1024),
+    );
+    let muon = n.sim.add_pe(
+        n.nu,
+        sim_core::PeConfig {
+            name: "muon0".into(),
+            max_inflight: 1,
+            max_outstanding: 1,
+            params: sim_core::PeParams::Muon {
+                vector,
+                beat: 1024,
+                masters: Vec::new(),
+                utilization: sim_core::Ratio::ONE,
+                overhead: 0,
+            },
+        },
+    );
+    let c = smem(4 * MAT, MAT);
+    let out = smem(8 * MAT, MAT);
+    let reader = Descriptor::vector(muon, out, 1024, MAT, MAT)
+        .with_src(c.base)
+        .with_deps(vec![ver(c, 1)]);
+    let own = Descriptor::vector(muon, smem(10 * MAT, MAT), 1024, MAT, MAT);
+    let tasks = vec![matmul(&n, c, 1, (false, false), vec![]), reader, own];
+    let b = lists(&["numeric"], &["null"], &["trace"]).unwrap();
+    let s = run(n, b, 0, tasks);
+    assert_eq!(s.fatal, None);
+    let reads = null_reads(&s);
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert_eq!(reads[0].gid, Some(1), "the Muon task with src C");
+    assert_eq!(
+        reads[0].warning,
+        SimWarning::NullRead {
+            range: c,
+            writer: Some(0)
+        }
+    );
+}

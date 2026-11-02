@@ -210,6 +210,34 @@ fn a_task_reaches_the_plugin_with_its_bytes_and_the_store() {
 }
 
 #[test]
+fn configure_passes_the_kernel_registry() {
+    let out = temp("config");
+    let mut p = plugin(&format!("{{\"config_out\": {out:?}}}")).unwrap();
+    p.configure(&store()).unwrap();
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    std::fs::remove_file(out).unwrap();
+    let k = &cfg["kernels"];
+    assert_eq!(k.as_array().unwrap().len(), 4);
+    let e = &k[1];
+    assert_eq!(
+        (&e["id"], &e["name"], &e["bytes"]),
+        (&2.into(), &"epilogue".into(), &80.into())
+    );
+    assert_eq!(e["flags"]["GELU_TANH"], 8);
+    assert_eq!(
+        e["fields"][12],
+        serde_json::json!({"name": "eps", "type": "f32", "offset": 72})
+    );
+    // The key is r2-sim's.
+    let e = plugin(r#"{"kernels": []}"#).err().unwrap();
+    assert!(
+        e.ends_with("the configuration has the key kernels, which r2-sim sets"),
+        "{e}"
+    );
+}
+
+#[test]
 fn a_task_without_bytes_is_an_error() {
     let mut p = plugin("{}").unwrap();
     let mut m = store();

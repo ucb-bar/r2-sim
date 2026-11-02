@@ -2991,7 +2991,10 @@ impl Sim {
                 let mut prof = self.profiles.profile(&n.rec(t).desc, &node);
                 if !self.caches.is_empty() {
                     let desc = self.nus[nu.0 as usize].rec(t).desc.clone();
-                    self.cache_chunks(pe, &desc, &mut prof);
+                    if let Err(msg) = self.cache_chunks(pe, &desc, &mut prof) {
+                        let gid = self.nus[nu.0 as usize].rec(t).gid;
+                        return self.fatal(nu, Some(gid), FatalError::Invalid(msg));
+                    }
                 }
                 self.nus[nu.0 as usize].rec_mut(t).profile = Some(prof);
             }
