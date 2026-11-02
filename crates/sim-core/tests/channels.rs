@@ -68,6 +68,7 @@ fn run_some(b: Built, dma: bool, store: bool) -> (u64, Stats) {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: Some(0),
         args: Args::Dma {

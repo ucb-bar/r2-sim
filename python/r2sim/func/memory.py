@@ -1,33 +1,20 @@
-"""Sparse byte memory of the functional plane.
-
-It behaves as the Rust memory of the Numeric and Trace backends: 64 KiB pages
-per memory block, allocated on the first write and zero where never written;
-an access lies inside one block; writes into the sync-only space have no
-effect; a block of null fidelity drops writes and rejects reads.
-"""
+"""The memory of the functional plane, as a backend plug-in sees it: the
+blocks of r2-sim's store, each a NumPy array of bytes over the block's
+memory (no copy), sorted by base. An access lies inside one block; a write
+into the sync-only space has no effect; a block of a null subtree has no
+array: a read from it is an error and a write to it has no effect."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import bisect
+import ctypes
+from dataclasses import dataclass
 
-PAGE = 1 << 16
+import numpy as np
 
 
 class FuncError(Exception):
     """An error of the functional plane; it stops the run."""
-
-
-@dataclass
-class Block:
-    """One memory block: a global byte range and its pages."""
-
-    base: int
-    bound: int
-    numeric: bool
-    pages: dict[int, bytearray] = field(default_factory=dict)
-
-    def covers(self, addr: int, length: int) -> bool:
-        return self.base <= addr and addr + length <= self.bound
 
 
 @dataclass
@@ -59,62 +46,77 @@ class Dst:
         return all(self.holds(granule, a) for a in range(first, addr + length, granule))
 
 
+@dataclass
+class Block:
+    """One memory block: its global base, its size, its bytes (None for a
+    block of a null subtree) and its name."""
+
+    base: int
+    size: int
+    data: np.ndarray | None
+    name: str
+
+
+def over(ptr: int, size: int) -> np.ndarray:
+    """A uint8 array over `size` bytes at address `ptr` of this process."""
+    return np.ctypeslib.as_array((ctypes.c_uint8 * size).from_address(ptr))
+
+
 class Memory:
-    """The memory blocks of a run, with the sync-only ranges."""
+    """The blocks of a run, with the sync-only ranges and the granule."""
 
-    def __init__(self) -> None:
-        self.blocks: list[Block] = []
-        self.sync_only: list[tuple[int, int]] = []
-        self.granule = 1
-
-    def configure(self, memories: list[dict], sync_only: list[list[int]], granule: int) -> None:
-        self.blocks = []
-        for m in memories:
-            base, bound = m["range"]
-            if not any(b.base == base and b.bound == bound for b in self.blocks):
-                self.blocks.append(Block(base, bound, bool(m["numeric"])))
-        self.sync_only = [(a, b) for a, b in sync_only]
+    def __init__(self, blocks: list[Block], sync_only: list[tuple[int, int]], granule: int):
+        self.blocks = sorted(blocks, key=lambda b: b.base)
+        self.bases = [b.base for b in self.blocks]
+        self.sync_only = list(sync_only)
         self.granule = max(int(granule), 1)
 
+    @classmethod
+    def owned(cls, blocks: list[tuple[int, int, bool]], sync_only: list[tuple[int, int]],
+              granule: int) -> Memory:
+        """A memory with arrays of its own (for tests): (base, size, data)
+        per block, data False for a block of a null subtree."""
+        return cls([Block(base, size, np.zeros(size, np.uint8) if data else None, f"b{i}")
+                    for i, (base, size, data) in enumerate(blocks)], sync_only, granule)
+
     def block(self, addr: int, length: int) -> Block:
-        for b in self.blocks:
-            if b.covers(addr, length):
+        i = bisect.bisect_right(self.bases, addr)
+        if i > 0:
+            b = self.blocks[i - 1]
+            off = addr - b.base
+            if off <= b.size and length <= b.size - off:
                 return b
         raise FuncError(f"[{addr:#x}, {addr + length:#x}) is not inside one memory block")
 
     def is_null(self, addr: int, length: int) -> bool:
-        """True when the range lies in a block of null fidelity."""
-        return any(not b.numeric and b.covers(addr, length) for b in self.blocks)
+        """True when the range lies in a block of a null subtree."""
+        try:
+            return self.block(addr, length).data is None
+        except FuncError:
+            return False
 
     def _is_sync_only(self, addr: int, length: int) -> bool:
         return any(addr < hi and lo < addr + length for lo, hi in self.sync_only)
 
-    def read(self, addr: int, length: int) -> bytes:
+    def view(self, addr: int, length: int) -> np.ndarray:
+        """The bytes [addr, addr + length), as a view of the block."""
         b = self.block(addr, length)
-        if not b.numeric:
+        if b.data is None:
             raise FuncError(f"read of [{addr:#x}, +{length}) in a null-fidelity block")
-        out = bytearray(length)
-        off = 0
-        while off < length:
-            page, in_page = divmod(addr + off, PAGE)
-            n = min(PAGE - in_page, length - off)
-            p = b.pages.get(page)
-            if p is not None:
-                out[off:off + n] = p[in_page:in_page + n]
-            off += n
-        return bytes(out)
+        off = addr - b.base
+        return b.data[off:off + length]
 
-    def write(self, addr: int, data: bytes) -> None:
-        length = len(data)
+    def read(self, addr: int, length: int) -> bytes:
+        return self.view(addr, length).tobytes()
+
+    def write(self, addr: int, data) -> None:
+        """Writes `data` (bytes or a uint8 array) at `addr`."""
+        src = np.frombuffer(data, np.uint8) if isinstance(data, (bytes, bytearray)) else data
+        length = len(src)
         if self._is_sync_only(addr, length):
             return
         b = self.block(addr, length)
-        if not b.numeric:
+        if b.data is None:
             return
-        off = 0
-        while off < length:
-            page, in_page = divmod(addr + off, PAGE)
-            n = min(PAGE - in_page, length - off)
-            p = b.pages.setdefault(page, bytearray(PAGE))
-            p[in_page:in_page + n] = data[off:off + n]
-            off += n
+        off = addr - b.base
+        b.data[off:off + length] = src

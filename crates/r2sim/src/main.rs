@@ -44,7 +44,6 @@ fn parse(argv: &[String]) -> Result<Options, String> {
             "--params" => a.params = Some(val()?.into()),
             "--param" => a.overrides.push(val()?),
             "--functional" => a.functional = Some(val()?.parse()?),
-            "--functional-cmd" => a.functional_cmd = Some(val()?),
             "--image" => a.image = Some(val()?.into()),
             "--image-out" => a.image_out = Some(val()?.into()),
             "--stats" => a.stats = Some(val()?.into()),
@@ -111,9 +110,6 @@ fn parse(argv: &[String]) -> Result<Options, String> {
         && (a.trace_zstd || a.trace_config.is_some() || !a.trace_sets.is_empty())
     {
         return Err("--trace-zstd, --trace-config and --set trace.* need --trace-raw".into());
-    }
-    if a.functional_cmd.is_some() && a.functional != Some(r2sim::Functional::Python) {
-        return Err("--functional-cmd needs --functional python".into());
     }
     Ok(a)
 }

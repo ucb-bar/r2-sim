@@ -21,7 +21,10 @@ PYTHONPATH = "$PIXI_PROJECT_ROOT/python"
 
 [tasks]
 build = "cargo build --release"
-test = "cargo test --release && python -m pytest -q python/tests"
+# The Python plug-in (libr2_python.so, next to r2sim): not in the default
+# build, it runs the Python of this environment.
+build-python = "cargo build --release -p r2-python"
+test = { cmd = "cargo test --release && python -m pytest -q python/tests", depends-on = ["build", "build-python"] }
 check = "cargo clippy --release --all-targets -- -D warnings"
 fmt = "cargo fmt --all"
 golden = { cmd = "tools/golden.sh", depends-on = ["build"] }

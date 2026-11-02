@@ -1,15 +1,11 @@
 """The Python functional plane, op by op, on descriptors without the
-simulator; and the protocol loop on in-memory streams."""
-
-import io
+simulator, over a memory with arrays of its own."""
 
 import ml_dtypes
 import numpy as np
 import pytest
 
-from r2sim.func import protocol as p
-from r2sim.func.__main__ import serve
-from r2sim.func.memory import FuncError
+from r2sim.func.memory import FuncError, Memory
 from r2sim.func.ops import split_row
 from r2sim.func.plane import Plane
 
@@ -23,16 +19,8 @@ SYNC = (0x1F0000, 0x200000)  # the sync-only top of the numeric block
 
 @pytest.fixture
 def plane() -> Plane:
-    pl = Plane()
-    pl.configure(
-        [
-            {"name": "m", "range": [MEM, NULL], "kind": "sram", "numeric": True},
-            {"name": "n", "range": [NULL, NULL + MEM], "kind": "sram", "numeric": False},
-        ],
-        [list(SYNC)],
-        G,
-    )
-    return pl
+    # The null block first: the memory sorts the blocks by base.
+    return Plane(Memory.owned([(NULL, MEM, False), (MEM, MEM, True)], [SYNC], G))
 
 
 def dma(src, to, n, dst=None, mask=FULL):
@@ -68,10 +56,20 @@ def test_memory_is_zero_where_never_written(plane):
     assert plane.memory.read(MEM + 0x12345, 100) == bytes(100)
 
 
-def test_a_write_across_a_page_boundary_reads_back(plane):
+def test_a_write_reads_back(plane):
     data = bytes(range(256)) * 4
     plane.memory.write(MEM + 0x10000 - 300, data)
     assert plane.memory.read(MEM + 0x10000 - 300, len(data)) == data
+    # The last bytes before the sync-only top of the block.
+    plane.memory.write(SYNC[0] - 4, b"wxyz")
+    assert plane.memory.read(SYNC[0] - 4, 4) == b"wxyz"
+
+
+def test_an_access_outside_all_blocks_is_an_error(plane):
+    with pytest.raises(FuncError, match="not inside one memory block"):
+        plane.memory.read(MEM - 4, 4)
+    with pytest.raises(FuncError, match="not inside one memory block"):
+        plane.memory.write(NULL + MEM, b"x")
 
 
 def test_sync_only_writes_are_ignored(plane):
@@ -219,11 +217,6 @@ def test_matmul_must_write_inside_its_dst(plane):
         plane.task(d)
 
 
-def test_store_writes_its_bytes(plane):
-    plane.store(MEM + 8, b"\x07" * 8)
-    assert plane.memory.read(MEM + 8, 8) == b"\x07" * 8
-
-
 def test_a_muon_task_has_no_effect(plane):
     plane.task({"kind": "vector", "pe": 0, "dst": [MEM, MEM + 64], "mask": FULL,
                 "ops": 1, "bytes_in": 64, "bytes_out": 64, "src": None})
@@ -235,90 +228,3 @@ def test_an_imem_copy_has_no_effect_on_data(plane):
     plane.task({"kind": "imem_copy", "pe": None, "dst": [MEM, MEM + G], "mask": FULL,
                 "child": 1, "src": 0x100, "offset": 0, "bytes": 64})
     assert plane.memory.read(MEM, 64) == bytes(64)
-
-
-def frames(*fs) -> io.BytesIO:
-    buf = io.BytesIO()
-    for f in fs:
-        p.write_frame(buf, *f)
-    buf.seek(0)
-    return buf
-
-
-def answers(out: io.BytesIO) -> list:
-    out.seek(0)
-    got = []
-    while (f := p.read_frame(out)) is not None:
-        got.append(f)
-    return got
-
-
-def test_the_protocol_loop():
-    config = {"memories": [{"name": "m", "range": [MEM, NULL], "kind": "sram", "numeric": True}],
-              "sync_only": [], "granule": G}
-    inp = frames(
-        (p.HELLO, {"protocol": 1}),
-        (p.CONFIGURE, config),
-        (p.WRITE, {"addr": MEM}, b"\x01\x02\x03\x04"),
-        (p.TASK, {"seq": 7, "desc": dma(MEM, MEM + 0x100, 4)}),
-        (p.READ, {"addr": MEM + 0x100, "len": 4}),
-        (p.TASK, {"seq": 8, "desc": dma(MEM, MEM + 0x100, 4, [MEM, MEM + 4])}),
-        (p.FINISH, None),
-    )
-    out = io.BytesIO()
-    assert serve(inp, out) == 0
-    got = answers(out)
-    assert got[0][0] == p.OK and got[0][1]["protocol"] == 1
-    assert [g[0] for g in got[1:4]] == [p.OK, p.OK, p.OK]
-    assert got[4] == (p.DATA, None, b"\x01\x02\x03\x04")
-    assert got[5][0] == p.ERROR and got[5][1]["seq"] == 8
-    assert "outside its dst" in got[5][1]["msg"]
-
-
-def test_an_unexpected_exception_is_an_error_frame_and_the_loop_goes_on():
-    # A matmul descriptor without its operand fields raises a KeyError,
-    # not a FuncError: the answer is ERROR with its seq, and the next
-    # frame is served.
-    config = {"memories": [{"name": "m", "range": [MEM, NULL], "kind": "sram", "numeric": True}],
-              "sync_only": [], "granule": G}
-    inp = frames(
-        (p.HELLO, {"protocol": 1}),
-        (p.CONFIGURE, config),
-        (p.TASK, {"seq": 5, "desc": {"kind": "matmul", "pe": 0, "dst": [MEM, MEM + 64],
-                                     "mask": FULL}}),
-        (p.READ, {"addr": MEM, "len": 4}),
-    )
-    out = io.BytesIO()
-    assert serve(inp, out) == 0
-    got = answers(out)
-    assert got[2][0] == p.ERROR and got[2][1]["seq"] == 5
-    assert got[2][1]["msg"].startswith("KeyError: ")
-    assert got[3] == (p.DATA, None, bytes(4))
-
-
-def test_the_loop_exits_at_end_of_file():
-    out = io.BytesIO()
-    assert serve(frames((p.HELLO, {"protocol": 1})), out) == 0
-    assert len(answers(out)) == 1
-
-
-def test_with_op_time_the_ok_of_a_task_or_store_carries_the_child_time():
-    config = {"memories": [{"name": "m", "range": [MEM, NULL], "kind": "sram", "numeric": True}],
-              "sync_only": [], "granule": G}
-    for op_time in (False, True):
-        inp = frames(
-            (p.HELLO, {"protocol": 1}),
-            (p.CONFIGURE, dict(config, op_time=op_time)),
-            (p.TASK, {"seq": 1, "desc": dma(MEM, MEM + 0x100, 4)}),
-            (p.STORE, {"seq": 2, "addr": MEM}, b"\x01\x02"),
-            (p.FINISH, None),
-        )
-        out = io.BytesIO()
-        assert serve(inp, out) == 0
-        got = answers(out)
-        for kind, obj, _ in got[2:4]:
-            assert kind == p.OK
-            if op_time:
-                assert isinstance(obj["ns"], int) and obj["ns"] >= 0
-            else:
-                assert obj is None

@@ -93,12 +93,6 @@ pub trait FunctionalBackend: Send {
     /// Applies one task op on the store; ops arrive in `seq` order. A
     /// Neutrino store does not reach a backend.
     fn apply(&mut self, op: &FuncOp, store: &mut Store) -> Result<(), FuncError>;
-    /// The time a child process spent on the last applied op, in ns by its
-    /// own clock, for the thread timeline; `None` when the backend does
-    /// not report it.
-    fn child_ns(&self) -> Option<u64> {
-        None
-    }
 }
 
 /// Writes nothing.
@@ -562,7 +556,6 @@ fn worker(backend: &mut Functional, shared: &Shared, mut timeline: Option<&mut T
                 let r = backend.apply(&op);
                 if let Some(t) = timeline.as_deref_mut() {
                     let fields = ThreadRecord {
-                        child_ns: backend.child_ns(&op),
                         backend: Some(backend.backend_name(&op)),
                         ..op_fields(&op)
                     };

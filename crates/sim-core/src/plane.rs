@@ -15,15 +15,11 @@
 //! * a task on a backend that is not `null` that reads a range that a
 //!   `null` task wrote last gets a warning ([`NullRead`]), once per range
 //!   of a `null` task; a later write by such a task removes the mark.
-//!
-//! The child-process Python plane keeps its own memory: it is an
-//! [`ExternalPlane`] for the whole run, without a store.
 
 use std::collections::{BTreeMap, HashMap};
 
 use nu_model::{Addr, NeutrinoId, Range};
 
-use crate::config::MemBlock;
 use crate::func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
 use crate::profile::{split_row, Args, Descriptor, Dtype, PeId};
 use crate::store::Store;
@@ -155,25 +151,6 @@ impl Backends {
     }
 }
 
-/// A functional plane that keeps its own memory (the child-process Python
-/// plane): every op of the run goes to it, and loads read its memory.
-pub trait ExternalPlane: Send {
-    /// Called once before the run with the memory blocks, the sync-only
-    /// ranges and the Neutrino granule.
-    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64);
-    /// Applies one op; ops arrive in `seq` order.
-    fn apply(&mut self, op: &FuncOp) -> Result<(), FuncError>;
-    /// Reads `len` bytes starting at `addr`.
-    fn read(&mut self, addr: Addr, len: u64) -> Result<Vec<u8>, FuncError>;
-    /// Host-side initialization before the run.
-    fn write(&mut self, addr: Addr, bytes: &[u8]) -> Result<(), FuncError>;
-    /// The time the plane spent on the last applied op, in ns by its own
-    /// clock, for the thread timeline; `None` when it does not report it.
-    fn child_ns(&self) -> Option<u64> {
-        None
-    }
-}
-
 /// A read by a task on a computing backend of a range that a `null` task
 /// wrote last (its values are not computed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +182,6 @@ enum Memory {
     /// No backend of the run keeps data (every list is `null`).
     None,
     Store(Store),
-    External(Box<dyn ExternalPlane>),
 }
 
 /// The worker side of the functional plane: the memory, the backends, and
@@ -217,6 +193,14 @@ pub struct Functional {
     names: Vec<&'static str>,
     null: usize,
     marks: NullMarks,
+}
+
+impl Drop for Functional {
+    /// Drops the backends before the store: a plug-in's `close` may read
+    /// or write the store's blocks, which the store unmaps when it drops.
+    fn drop(&mut self) {
+        self.backends.clear();
+    }
 }
 
 impl Functional {
@@ -233,17 +217,6 @@ impl Functional {
             backends,
             names,
             null,
-            marks: NullMarks::default(),
-        }
-    }
-
-    /// The plane `p`, which keeps its own memory.
-    pub(crate) fn external(p: Box<dyn ExternalPlane>) -> Self {
-        Self {
-            memory: Memory::External(p),
-            backends: Vec::new(),
-            names: Vec::new(),
-            null: 0,
             marks: NullMarks::default(),
         }
     }
@@ -266,7 +239,6 @@ impl Functional {
         match &mut self.memory {
             Memory::None => Err(FuncError("the Null backend has no data".into())),
             Memory::Store(s) => s.read(addr.0, len),
-            Memory::External(p) => p.read(addr, len),
         }
     }
 
@@ -275,22 +247,12 @@ impl Functional {
         match &mut self.memory {
             Memory::None => Err(FuncError("the Null backend has no data".into())),
             Memory::Store(s) => s.write(addr.0, bytes),
-            Memory::External(p) => p.write(addr, bytes),
         }
     }
 
-    /// Configures the backends (or the external plane) before the run.
-    pub(crate) fn configure(
-        &mut self,
-        memories: &[MemBlock],
-        sync_only: &[Range],
-        granule: u64,
-    ) -> Result<(), FuncError> {
+    /// Configures the backends before the run.
+    pub(crate) fn configure(&mut self) -> Result<(), FuncError> {
         match &mut self.memory {
-            Memory::External(p) => {
-                p.configure(memories, sync_only, granule);
-                Ok(())
-            }
             Memory::Store(s) => {
                 for b in &mut self.backends {
                     b.configure(s)?;
@@ -302,21 +264,11 @@ impl Functional {
     }
 
     /// The name of the backend that applies `op` (`store` for a Neutrino
-    /// store; the plane's name for an external plane).
+    /// store).
     pub(crate) fn backend_name(&self, op: &FuncOp) -> &'static str {
-        match (&self.memory, &op.kind) {
-            (Memory::External(_), _) => "external",
-            (_, OpKind::Store { .. }) => "store",
-            _ => self.names.get(op.backend).copied().unwrap_or("null"),
-        }
-    }
-
-    /// The time a child process spent on the last applied op.
-    pub(crate) fn child_ns(&self, op: &FuncOp) -> Option<u64> {
-        match (&self.memory, &op.kind) {
-            (Memory::External(p), _) => p.child_ns(),
-            (_, OpKind::Store { .. }) => None,
-            _ => self.backends.get(op.backend).and_then(|b| b.child_ns()),
+        match &op.kind {
+            OpKind::Store { .. } => "store",
+            OpKind::Task(_) => self.names.get(op.backend).copied().unwrap_or("null"),
         }
     }
 
@@ -329,7 +281,6 @@ impl Functional {
     pub(crate) fn apply(&mut self, op: &FuncOp) -> Result<(), FuncError> {
         let store = match &mut self.memory {
             Memory::None => return Ok(()),
-            Memory::External(p) => return p.apply(op),
             Memory::Store(s) => s,
         };
         let desc = match &op.kind {
@@ -516,17 +467,6 @@ impl Dispatch {
             select,
         };
         (d, backends.list, null)
-    }
-
-    /// A dispatch for an external plane: every op goes to it.
-    pub(crate) fn external() -> Self {
-        Self {
-            units: Units::default(),
-            null: 0,
-            names: Vec::new(),
-            chains: HashMap::new(),
-            select: None,
-        }
     }
 
     /// The backend of a task of a Neutrino whose subtree is `numeric`. An

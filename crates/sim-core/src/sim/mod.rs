@@ -28,7 +28,7 @@ use nu_model::{
 use crate::config::{MemBlock, NeutrinoConfig, PeConfig, RaceCheck};
 use crate::event::{Event, EventQueue};
 use crate::func::{FuncOp, FuncPlane, FunctionalBackend, NullBackend, OpKind, PlaneError};
-use crate::plane::{Backends, Dispatch, ExternalPlane, Functional, SelectFn};
+use crate::plane::{Backends, Dispatch, Functional, SelectFn};
 use crate::profile::{
     Args, Descriptor, NodeConfig, Occupancy, OpcodeId, PeId, Profile, ProfileRegistry,
 };
@@ -276,8 +276,6 @@ impl Neutrino {
 enum Setup {
     /// Backends per FU kind over one store.
     Backends(Backends),
-    /// A plane that keeps its own memory.
-    External(Box<dyn ExternalPlane>),
 }
 
 /// The address rewrite of a hash link.
@@ -579,12 +577,6 @@ impl Sim {
     /// Sets the backends of the FU kinds.
     pub fn set_backends(&mut self, backends: Backends) {
         self.setup = Some(Setup::Backends(backends));
-    }
-
-    /// Sends every op of the run to `plane`, which keeps its own memory
-    /// (the child-process Python plane).
-    pub fn set_external(&mut self, plane: Box<dyn ExternalPlane>) {
-        self.setup = Some(Setup::External(plane));
     }
 
     /// Replaces the fixed selection rule of the backends: `f` gets the task
@@ -1416,12 +1408,8 @@ impl Sim {
                     .unwrap_or_else(|e| panic!("functional plane: {}", e.0));
                 Functional::new(list, null, store)
             }
-            Setup::External(p) => {
-                self.dispatch = Some(Dispatch::external());
-                Functional::external(p)
-            }
         };
-        if let Err(e) = backend.configure(&stores, &self.sync_only, granule) {
+        if let Err(e) = backend.configure() {
             panic!("functional plane: {}", e.0);
         }
         for (addr, bytes) in std::mem::take(&mut self.init) {
@@ -2002,6 +1990,8 @@ impl Sim {
                     inferred_version: None,
                     pc,
                     call_path,
+                    // A spawn writes no data: no plug-in receives it.
+                    bytes: Vec::new(),
                     deps,
                     label: None,
                     args: Args::Spawn { child },

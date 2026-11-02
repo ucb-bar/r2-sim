@@ -163,9 +163,23 @@ fn a_bad_functional_section_is_an_error_that_names_the_key() {
         e.contains("functional.units.atlas: unknown backend \"foo\""),
         "{e}"
     );
-    let e = err(&["--set", "functional.backends.py={lib: libr2_python.so}"]);
+    let missing = [
+        "--set",
+        "functional.backends.py={lib: /nonexistent/libpy.so}",
+        "--set",
+        "functional.units.atlas=[py]",
+    ];
+    let e = err(&missing);
     assert!(
-        e.contains("functional.backends.py") && e.contains("later"),
+        e.contains("functional.units.atlas: backend py (/nonexistent/libpy.so): "),
         "{e}"
     );
+    let no_lib = [
+        "--set",
+        "functional.backends.py={provider: numpy}",
+        "--set",
+        "functional.units.atlas=[py]",
+    ];
+    let e = err(&no_lib);
+    assert!(e.contains("backend \"py\" has no lib"), "{e}");
 }

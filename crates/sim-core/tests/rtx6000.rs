@@ -200,6 +200,7 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
                 inferred_version: None,
                 pc: None,
                 call_path: Vec::new(),
+                bytes: Vec::new(),
                 deps: vec![],
                 label: Some(i),
                 args: Args::Dma {
@@ -272,6 +273,7 @@ fn two_matmuls(units: [&str; 2]) -> [u64; 2] {
             inferred_version: None,
             pc: None,
             call_path: Vec::new(),
+            bytes: Vec::new(),
             deps: vec![],
             label: Some(i as u64),
             args: Args::Matmul {

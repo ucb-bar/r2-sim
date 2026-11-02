@@ -214,6 +214,10 @@ pub struct Descriptor {
     /// task, outermost first (raw trace 1.11). Empty for a task made in
     /// the program function, and for the Rust programs.
     pub call_path: Vec<u32>,
+    /// The descriptor bytes as the Neutrino reads them from its data
+    /// scratch (header, keys, arguments; ABI version 1 of the RV programs),
+    /// for a plug-in backend. Empty for the tasks of the Rust programs.
+    pub bytes: Vec<u8>,
 }
 
 impl Descriptor {
@@ -230,6 +234,7 @@ impl Descriptor {
             inferred_version: None,
             pc: None,
             call_path: Vec::new(),
+            bytes: Vec::new(),
             deps: Vec::new(),
             label: None,
             args,
@@ -396,6 +401,7 @@ impl Descriptor {
             inferred_version: None,
             pc: None,
             call_path: Vec::new(),
+            bytes: Vec::new(),
             deps,
             label: None,
             args: Args::Join,
@@ -1603,6 +1609,7 @@ device:
                 inferred_version: None,
                 pc: None,
                 call_path: Vec::new(),
+                bytes: Vec::new(),
                 deps: vec![],
                 label: None,
                 args: Args::Dma {

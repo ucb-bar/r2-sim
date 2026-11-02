@@ -148,6 +148,7 @@ fn main() {
                         inferred_version: None,
                         pc: None,
                         call_path: Vec::new(),
+                        bytes: Vec::new(),
                         deps: war,
                         label: None,
                         args: Args::Dma {
@@ -169,6 +170,7 @@ fn main() {
                         inferred_version: None,
                         pc: None,
                         call_path: Vec::new(),
+                        bytes: Vec::new(),
                         deps: vec![ha.key()],
                         label: None,
                         args: Args::Matmul {

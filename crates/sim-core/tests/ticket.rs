@@ -44,6 +44,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>, label: u64) -> Descript
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps,
         label: Some(label),
         args: Args::Matmul {

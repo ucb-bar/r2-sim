@@ -47,6 +47,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: deps.clone(),
         label: None,
         args: Args::Matmul {
@@ -249,6 +250,7 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
         inferred_version: Some(1),
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Dma {
@@ -349,6 +351,7 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
         inferred_version: Some(1),
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![v1(x)],
         label: None,
         args: Args::Dma {

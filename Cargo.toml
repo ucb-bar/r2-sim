@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "plugins/python"]
+# The Python plug-in is not in the default build: `cargo build -p r2-python`
+# (the pixi task build-python) builds it into the same target directory.
+default-members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"

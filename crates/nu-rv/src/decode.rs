@@ -28,6 +28,8 @@ const HEADER: u64 = 24;
 pub const ARGS_BYTES: [u64; 6] = [0, 16, 32, 72, 32, 24];
 
 /// A decoded descriptor.
+// A transient value of the interpreter: the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decoded {
     /// A task: JOIN, DMA, MATMUL or VECTOR.
@@ -130,6 +132,7 @@ pub fn decode(
             args,
             pc: Some(pc),
             call_path: Vec::new(),
+            bytes: h[..len as usize].to_vec(),
         })
     };
     // The PE: an index into the PEs of the node it runs on.

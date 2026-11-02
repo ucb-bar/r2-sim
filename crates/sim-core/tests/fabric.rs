@@ -82,6 +82,7 @@ fn gemm_array_cycles(sets: &[&str], d: Dtype) -> u64 {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Matmul {
@@ -385,6 +386,7 @@ device:
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: Some(i),
         args: Args::Vector {
@@ -453,6 +455,7 @@ fn demands_record_reads_and_writes() {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Dma {
@@ -473,6 +476,7 @@ fn demands_record_reads_and_writes() {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Matmul {
@@ -589,6 +593,7 @@ fn two_transfers(dma: &str) -> (u64, u64) {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: Some(i),
         args: Args::Dma {

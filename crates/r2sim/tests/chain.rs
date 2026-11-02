@@ -1,11 +1,13 @@
-//! A chained matmul end to end on the Numeric backend and on the Python
-//! plane: C (128 x 128) = A (128 x 1152) B (1152 x 128) in bf16 as 9 tasks
-//! of k = 128 on the Atlas of root.gpc0.sm0 (configs/2p-smem.yaml; A in
-//! SMEM bank 0, B and C in bank 1), the first without `accumulate`, all
-//! but the last with `keep`. The data are small positive integers whose
+//! A chained matmul end to end on the Numeric backend: C (128 x 128) =
+//! A (128 x 1152) B (1152 x 128) in bf16 as 9 tasks of k = 128 on the
+//! Atlas of root.gpc0.sm0 (configs/2p-smem.yaml; A in SMEM bank 0, B and
+//! C in bank 1), the first without `accumulate`, all but the last with
+//! `keep`. The data are small positive integers whose
 //! partial sums exceed 256: every fp32 sum is exact, and a rounding of a
-//! partial to bf16 would change C. Both backends must give the exact
-//! product rounded to bf16 once.
+//! partial to bf16 would change C. The backend must give the exact product
+//! rounded to bf16 once. (The Python plug-in has the same test in
+//! python/tests/test_backend.py: a plug-in takes no tasks of a Rust
+//! program.)
 
 use std::path::Path;
 
@@ -101,13 +103,11 @@ fn expected() -> (Vec<u16>, Vec<u16>) {
 }
 
 #[test]
-fn a_chain_rounds_c_to_bf16_once_on_both_backends() {
+fn a_chain_rounds_c_to_bf16_once() {
     let (once, each) = expected();
     // 2,814 of the 16,384 elements of C differ.
     let differ = once.iter().zip(&each).filter(|(x, y)| x != y).count();
     assert!(differ > 1000, "the data tell a per-task rounding: {differ}");
     let numeric = |s: &mut Sim| s.set_functional(Box::new(func::Numeric::new()));
-    assert_eq!(chain(numeric), once, "numeric");
-    let python = r2sim::spawn_process(None).expect("the Python plane");
-    assert_eq!(chain(|s| s.set_external(Box::new(python))), once, "python");
+    assert_eq!(chain(numeric), once);
 }

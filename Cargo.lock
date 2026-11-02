@@ -63,6 +63,8 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "nu-model",
+ "r2-backend",
+ "r2-backend-test",
  "serde_json",
  "sim-core",
 ]
@@ -214,6 +216,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "r2-backend"
+version = "0.1.0"
+
+[[package]]
+name = "r2-backend-test"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "r2-backend",
+ "serde_json",
+]
+
+[[package]]
+name = "r2-python"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "r2-backend",
+ "serde_json",
+]
+
+[[package]]
 name = "r2sim"
 version = "0.1.0"
 dependencies = [
@@ -222,6 +246,7 @@ dependencies = [
  "nu-model",
  "nu-prog",
  "nu-rv",
+ "r2-backend-test",
  "serde",
  "serde_json",
  "serde_yaml",

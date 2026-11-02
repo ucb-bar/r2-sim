@@ -69,6 +69,7 @@ fn run(steps: &[Step]) -> Stats {
                 inferred_version: None,
                 pc: None,
                 call_path: Vec::new(),
+                bytes: Vec::new(),
                 deps: vec![],
                 label: Some(i as u64),
                 args: Args::Dma {

@@ -181,6 +181,7 @@ impl Node {
             inferred_version: None,
             pc: None,
             call_path: Vec::new(),
+            bytes: Vec::new(),
             deps: vec![],
             label: None,
             args: Args::Dma {
@@ -207,6 +208,7 @@ impl Node {
             inferred_version: None,
             pc: None,
             call_path: Vec::new(),
+            bytes: Vec::new(),
             deps,
             label: None,
             args: Args::Matmul {

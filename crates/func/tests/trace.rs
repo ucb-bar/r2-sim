@@ -40,6 +40,7 @@ fn task(label: Option<u64>, dst: Range) -> Descriptor {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         args: Args::Vector {
             ops: 1,
             bytes_in: 0,
@@ -75,6 +76,7 @@ fn dma_copies_bytes() {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         args: Args::Dma {
             src: nu_model::Addr(0x100),
             dst: nu_model::Addr(0x8000),

@@ -1,5 +1,6 @@
-"""One function per op kind: the input is the descriptor (as the protocol
-sends it) and the plane's state; each function changes the state."""
+"""One function per task kind: the input is the descriptor (the fields of
+`descriptor.decode`) and the plane's state; each function changes the
+state."""
 
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ def dma(plane: Plane, desc: dict) -> None:
     check_in_dst(plane, desc, to, n)
     if plane.memory.is_null(src, n):
         return
-    plane.memory.write(to, plane.memory.read(src, n))
+    plane.memory.write(to, plane.memory.view(src, n).copy())
 
 
 def check_in_dst(plane: Plane, desc: dict, addr: int, length: int) -> None:
@@ -63,7 +64,7 @@ def read_matrix(plane: Plane, base: int, rows: int, cols: int, ld: int, dt: type
     if rows == 0 or cols == 0:
         return np.zeros((rows, cols), dtype=np.float32)
     span = ((rows - 1) * ld + cols) * es
-    flat = np.frombuffer(plane.memory.read(base, span), dtype=dt)
+    flat = plane.memory.view(base, span).view(dt)
     rows_view = np.lib.stride_tricks.as_strided(
         flat, shape=(rows, cols), strides=(ld * es, es), writeable=False
     )
@@ -72,8 +73,9 @@ def read_matrix(plane: Plane, base: int, rows: int, cols: int, ld: int, dt: type
 
 def write_matrix(plane: Plane, base: int, ld: int, dt: type, v: np.ndarray) -> None:
     es = np.dtype(dt).itemsize
+    out = v.astype(dt)
     for r in range(v.shape[0]):
-        plane.memory.write(base + r * ld * es, v[r].astype(dt).tobytes())
+        plane.memory.write(base + r * ld * es, out[r].view(np.uint8))
 
 
 def matmul_operands(plane: Plane, desc: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -157,7 +159,3 @@ def task(plane: Plane, desc: dict) -> None:
         raise FuncError(f"unknown task kind {desc['kind']!r}")
     fn(plane, desc)
 
-
-def store(plane: Plane, addr: int, data: bytes) -> None:
-    """A Neutrino store: writes its bytes."""
-    plane.memory.write(addr, data)

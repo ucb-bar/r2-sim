@@ -41,6 +41,7 @@ fn matmul(b: &Built, pe: &str, c: Range, label: u64) -> Descriptor {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: Some(label),
         args: Args::Matmul {

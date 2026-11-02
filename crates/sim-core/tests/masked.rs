@@ -29,6 +29,7 @@ fn dma(b: &Built, src: u64, to: u64, bytes: u64, dst: Range, mask: u32) -> Descr
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Dma {

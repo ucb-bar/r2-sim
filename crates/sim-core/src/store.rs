@@ -101,6 +101,11 @@ impl Store {
         &self.blocks
     }
 
+    /// The sync-only space.
+    pub fn sync_only(&self) -> &[Range] {
+        &self.sync_only
+    }
+
     /// The Neutrino granule.
     pub fn granule(&self) -> u64 {
         self.granule.max(1)

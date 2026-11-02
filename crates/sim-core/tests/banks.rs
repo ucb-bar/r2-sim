@@ -100,6 +100,7 @@ fn dma(b: Built, nu: &str, src: u64, dst: u64, bytes: u64) -> Stats {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: Some(0),
         args: Args::Dma {
@@ -315,6 +316,7 @@ fn atlas_mm(b: Built, a: u64, a2: Option<u64>, bb: u64, b2: Option<u64>, c: u64)
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Matmul {
@@ -392,6 +394,7 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Matmul {
@@ -436,6 +439,7 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Vector {
@@ -478,6 +482,7 @@ fn a_muon_task_spreads_over_the_banks_of_its_range() {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Vector {

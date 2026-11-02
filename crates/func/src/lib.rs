@@ -3,18 +3,18 @@
 //! * [`Numeric`]: executes tasks on the store of the functional plane
 //!   (DMA copy, GEMM).
 //! * [`Trace`]: DMA copies only.
-//! * [`Process`]: a plane in a child process that keeps its own memory
-//!   (for example the Python plane, `python -m r2sim.func`), over a framed
-//!   binary protocol: an external plane for the whole run.
+//! * [`Plugin`]: a backend in a plug-in library with the C interface of
+//!   `include/r2_backend.h` (for example the Python backend,
+//!   `libr2_python.so`).
 //!
 //! The store and `Null` live in `sim-core`.
 
 mod dtype;
 mod numeric;
-pub mod process;
+pub mod plugin;
 mod trace;
 
 pub use dtype::{bf16_to_f32, f32_to_bf16};
 pub use numeric::Numeric;
-pub use process::Process;
+pub use plugin::Plugin;
 pub use trace::Trace;

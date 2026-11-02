@@ -77,6 +77,7 @@ fn a_split_operand_reads_its_halves() {
             inferred_version: None,
             pc: None,
             call_path: Vec::new(),
+            bytes: Vec::new(),
             deps: vec![],
             label: None,
             args: Args::Matmul {

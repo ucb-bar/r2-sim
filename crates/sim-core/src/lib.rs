@@ -36,7 +36,7 @@ pub use config::{
     UnitsConfig,
 };
 pub use func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
-pub use plane::{Backends, ExternalPlane, FuKind, Functional, NullRead, SelectFn, Units};
+pub use plane::{Backends, FuKind, Functional, NullRead, SelectFn, Units};
 pub use profile::{
     split_row, Args, Chunk, Descriptor, Dtype, NodeConfig, Occupancy, OpcodeId, PeId, Profile,
     ProfileFn, ProfileRegistry,

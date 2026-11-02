@@ -1,0 +1,51 @@
+"""The Python backend of the functional plane: the module that the plug-in
+libr2_python.so calls inside the r2-sim process. `create` gets the
+configuration (the block table of the store, the sync-only space, the
+granule, the PE names and the backend's entry of the configuration) and
+returns a backend; r2-sim calls its `apply` once per task, in order.
+
+Each block of the store becomes a NumPy array over the block's memory, so
+the ops write r2-sim's memory directly. Provider `numpy`: the ops of
+`ops` (DMA; matmul with the accumulator per Atlas and C base; a Muon task
+writes nothing)."""
+
+from __future__ import annotations
+
+import json
+
+from r2sim.func import ops
+from r2sim.func.descriptor import decode
+from r2sim.func.memory import Block, FuncError, Memory, over
+from r2sim.func.plane import Plane
+
+PROVIDERS = ("numpy",)
+NO_PE = 0xFFFFFFFF
+
+
+class Backend:
+    """One backend of a run."""
+
+    def __init__(self, memory: Memory, pes: list[str], config: dict) -> None:
+        provider = config.get("provider", "numpy")
+        if provider not in PROVIDERS:
+            raise FuncError(f"provider {provider!r}: this version has {', '.join(PROVIDERS)}")
+        self.plane = Plane(memory)
+        self.pes = pes
+        self.config = config
+
+    def apply(self, seq: int, cycle: int, gid: int, neutrino: int, pe: int, desc: bytes) -> None:
+        """One task: its descriptor bytes, and its PE (an index of the PE
+        table; NO_PE for none)."""
+        d = decode(desc, self.plane.memory.granule, None if pe == NO_PE else pe)
+        ops.task(self.plane, d)
+
+
+def create(text: str) -> Backend:
+    """The backend of the configuration `text` (JSON): `blocks` (base, size,
+    ptr, name; ptr 0 for a block of a null subtree), `sync_only`,
+    `granule`, `pes` and `config`."""
+    c = json.loads(text)
+    blocks = [Block(b["base"], b["size"], over(b["ptr"], b["size"]) if b["ptr"] else None,
+                    b["name"]) for b in c["blocks"]]
+    memory = Memory(blocks, [tuple(r) for r in c["sync_only"]], c["granule"])
+    return Backend(memory, c["pes"], c["config"])

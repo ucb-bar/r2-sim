@@ -60,6 +60,7 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps,
         label: None,
         args: Args::Matmul {
@@ -374,6 +375,7 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Dma {

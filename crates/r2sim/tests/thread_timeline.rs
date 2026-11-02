@@ -1,6 +1,5 @@
 //! `--thread-timeline`: the wall-clock records of the timing thread and
-//! the functional worker for the hello image, with the numeric backend and
-//! with the Python plane.
+//! the functional worker for the hello image, with the numeric backend.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,15 +78,4 @@ fn check(records: &[Value]) {
 fn the_numeric_backend_records_both_threads() {
     let records = timeline("numeric");
     check(&records);
-    assert!(records.iter().all(|r| r.get("child_ns").is_none()));
-}
-
-#[test]
-fn the_python_plane_reports_its_time_per_op() {
-    let records = timeline("python");
-    check(&records);
-    let applies = records.iter().filter(|r| r["state"] == "apply");
-    assert!(applies
-        .into_iter()
-        .all(|r| r["child_ns"].as_u64().is_some()));
 }

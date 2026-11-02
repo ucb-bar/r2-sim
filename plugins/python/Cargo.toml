@@ -1,0 +1,18 @@
+[package]
+name = "r2-python"
+description = "The Python backend of the functional plane: a plug-in (libr2_python.so) that runs CPython inside the r2-sim process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "r2_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+r2-backend = { path = "../../crates/r2-backend" }
+serde_json = "1"
+
+[lints]
+workspace = true

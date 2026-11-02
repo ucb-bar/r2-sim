@@ -511,6 +511,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         inferred_version: None,
                         pc: None,
                         call_path: Vec::new(),
+                        bytes: Vec::new(),
                         deps: Vec::new(),
                         label: None,
                         args: Args::Dma {
@@ -580,6 +581,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             inferred_version: None,
                             pc: None,
                             call_path: Vec::new(),
+                            bytes: Vec::new(),
                             deps: Vec::new(),
                             label: None,
                             args: Args::Matmul {
@@ -613,6 +615,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         inferred_version: None,
                         pc: None,
                         call_path: Vec::new(),
+                        bytes: Vec::new(),
                         deps: Vec::new(),
                         label: None,
                         args: Args::Vector {
@@ -779,6 +782,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         inferred_version: None,
                         pc: None,
                         call_path: Vec::new(),
+                        bytes: Vec::new(),
                         deps: Vec::new(),
                         label: Some(items.len() as u64),
                         args: Args::Dma {
@@ -928,6 +932,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                 inferred_version: None,
                 pc: None,
                 call_path: Vec::new(),
+                bytes: Vec::new(),
                 deps,
                 label: None,
                 args: Args::Dma {
@@ -993,6 +998,7 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         inferred_version: None,
                         pc: None,
                         call_path: Vec::new(),
+                        bytes: Vec::new(),
                         deps,
                         label: None,
                         args: Args::Matmul {

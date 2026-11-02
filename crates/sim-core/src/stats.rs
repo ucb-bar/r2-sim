@@ -280,7 +280,7 @@ pub struct ThreadRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub op: Option<&'static str>,
     /// Worker `apply`: the backend that applied the op (`store` for a
-    /// Neutrino store, `external` for the child-process plane).
+    /// Neutrino store).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<&'static str>,
     /// Worker `apply`: the Neutrino that emitted the op.
@@ -304,10 +304,6 @@ pub struct ThreadRecord {
     /// `load_wait`: the seq the load waits for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq_needed: Option<u64>,
-    /// Worker `apply` with a process backend that reports it: the time the
-    /// child process spent on the op, in ns, by its own clock.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub child_ns: Option<u64>,
 }
 
 /// One functional sync point.

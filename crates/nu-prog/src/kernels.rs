@@ -722,6 +722,7 @@ impl Builder {
                 inferred_version: None,
                 pc: None,
                 call_path: Vec::new(),
+                bytes: Vec::new(),
                 deps,
                 label: None,
                 args: Args::Dma {
@@ -816,6 +817,7 @@ impl Builder {
                 inferred_version: None,
                 pc: None,
                 call_path: Vec::new(),
+                bytes: Vec::new(),
                 deps,
                 label: None,
                 args: Args::Matmul {
@@ -872,6 +874,7 @@ impl Builder {
                 inferred_version: None,
                 pc: None,
                 call_path: Vec::new(),
+                bytes: Vec::new(),
                 deps,
                 label: None,
                 args: Args::Vector {

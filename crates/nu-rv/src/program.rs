@@ -495,6 +495,7 @@ impl RvProgram {
                                 },
                                 pc: Some(pc),
                                 call_path: call_path(&hart),
+                                bytes: Vec::new(),
                             };
                             ctx.invoke(d).await;
                             hart.set(rd, 0, 0);

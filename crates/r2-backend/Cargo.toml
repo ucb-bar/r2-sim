@@ -1,0 +1,11 @@
+[package]
+name = "r2-backend"
+description = "The C interface of a functional backend plug-in (include/r2_backend.h) as Rust types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

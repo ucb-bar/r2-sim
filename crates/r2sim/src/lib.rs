@@ -20,7 +20,7 @@ use sim_core::{build_config_file, Built, FatalError, ProfileRegistry, SimWarning
 
 /// The command line.
 pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
-[--functional trace|numeric|python|null [--functional-cmd CMD]] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--thread-timeline FILE.jsonl] [--quantize tile|none] \
+[--functional trace|numeric|python|null] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--thread-timeline FILE.jsonl] [--quantize tile|none] \
 [--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]";
 
 /// A functional backend of the command line.
@@ -30,7 +30,7 @@ pub enum Functional {
     Trace,
     /// Memory and numerics in Rust (`func::Numeric`).
     Numeric,
-    /// A child process (`func::Process`), by default the Python plane.
+    /// The Python plug-in for every FU kind (`libr2_python.so`).
     Python,
     /// No data (`sim_core::NullBackend`).
     Null,
@@ -50,77 +50,59 @@ impl std::str::FromStr for Functional {
     }
 }
 
-/// The default command of the process backend.
-pub const PYTHON_PLANE: &str = "python -m r2sim.func";
-
-/// Starts the process backend: `cmd` (white-space separated) or the
-/// Python plane. The Python plane finds the package `r2sim` in the
-/// source tree's `python` directory, appended to PYTHONPATH.
-pub fn spawn_process(cmd: Option<&str>) -> Result<func::Process, String> {
-    let words: Vec<String> = cmd
-        .unwrap_or(PYTHON_PLANE)
-        .split_whitespace()
-        .map(String::from)
-        .collect();
-    let mut env = Vec::new();
-    if cmd.is_none() {
-        let tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python");
-        if tree.join("r2sim/func").is_dir() {
-            // After the user's own entries, which keep precedence.
-            let path = match std::env::var("PYTHONPATH") {
-                Ok(p) if !p.is_empty() => format!("{p}:{}", tree.display()),
-                _ => tree.display().to_string(),
-            };
-            env.push(("PYTHONPATH".to_string(), path));
-        }
-    }
-    func::Process::spawn_with_env(&words, &env, "r2sim.func: ").map_err(|e| e.0)
-}
-
-/// The functional plane of a run: backends per FU kind, or the child
-/// process.
-enum Plane {
-    Backends(sim_core::Backends),
-    External(Box<dyn sim_core::ExternalPlane>),
-}
-
 /// The lists of a short form `--functional f` (dma, atlas, muon), as in
 /// the table of the functional plane: `numeric` leaves the Muon `null`.
 fn short_form(f: Functional) -> [&'static str; 3] {
     match f {
         Functional::Null => ["null"; 3],
-        Functional::Trace | Functional::Python => ["trace"; 3],
+        Functional::Trace => ["trace"; 3],
         Functional::Numeric => ["numeric", "numeric", "null"],
+        Functional::Python => ["python"; 3],
     }
 }
 
-/// The backends of the run: the lists of the short form `f`, replaced by
-/// the lists that the configuration's `functional` section names. A
-/// plug-in backend (an entry with `lib`) is an error in this version.
-fn backends(
-    f: Functional,
-    cfg: Option<&sim_core::FunctionalConfig>,
-) -> Result<sim_core::Backends, String> {
-    let empty = sim_core::FunctionalConfig::default();
-    let cfg = cfg.unwrap_or(&empty);
-    if let Some((name, _)) = cfg.backends.iter().find(|(_, e)| e.contains_key("lib")) {
-        return Err(format!(
-            "functional.backends.{name}: plug-in backends (lib) come in a later version"
-        ));
-    }
+/// The entry of the backend `python` when the configuration has none.
+const PYTHON_ENTRY: &str = "{lib: libr2_python.so, provider: numpy}";
+
+/// The backend lists of the run (dma, atlas, muon): those of the short
+/// form `f`, each replaced by the list that the configuration's
+/// `functional` section names.
+fn unit_lists(f: Functional, cfg: &sim_core::FunctionalConfig) -> [Vec<String>; 3] {
     let base = short_form(f);
     let pick = |own: &Option<Vec<String>>, k: usize| {
         own.clone().unwrap_or_else(|| vec![base[k].to_string()])
     };
     let u = &cfg.units;
-    let lists = [pick(&u.dma, 0), pick(&u.atlas, 1), pick(&u.muon, 2)];
+    [pick(&u.dma, 0), pick(&u.atlas, 1), pick(&u.muon, 2)]
+}
+
+/// The backends of the lists: the built-in ones, and the plug-ins of the
+/// section's `backends` (an entry with `lib`; `python` has a default
+/// entry). `pes`: the PE names by index.
+fn backends(
+    lists: &[Vec<String>; 3],
+    cfg: &sim_core::FunctionalConfig,
+    pes: &[String],
+) -> Result<sim_core::Backends, String> {
     sim_core::Backends::from_names([&lists[0], &lists[1], &lists[2]], |name| {
         Ok(match name {
             "null" => Box::new(sim_core::NullBackend),
             "numeric" => Box::new(func::Numeric::new()),
             "trace" => Box::new(func::Trace::new()),
-            n if cfg.backends.contains_key(n) => return Err(format!("backend {n:?} has no lib")),
-            n => return Err(format!("unknown backend {n:?}")),
+            n => {
+                let default = (n == "python").then(|| {
+                    serde_yaml::from_str::<serde_yaml::Mapping>(PYTHON_ENTRY).expect("YAML")
+                });
+                let Some(entry) = cfg.backends.get(n).or(default.as_ref()) else {
+                    return Err(format!("unknown backend {n:?}"));
+                };
+                let Some(lib) = entry.get("lib").and_then(|l| l.as_str()) else {
+                    return Err(format!("backend {n:?} has no lib"));
+                };
+                let json =
+                    serde_json::to_string(entry).map_err(|e| format!("backend {n:?}: {e}"))?;
+                Box::new(func::Plugin::open(n, lib, &json, pes.to_vec())?)
+            }
         })
     })
 }
@@ -139,9 +121,6 @@ pub struct Options {
     /// `--functional`: the functional backend (default: Null for the
     /// kernels program, Trace for the others).
     pub functional: Option<Functional>,
-    /// `--functional-cmd`: the command of the process backend, split at
-    /// white space (default `python -m r2sim.func`).
-    pub functional_cmd: Option<String>,
     /// `--image`: the memory image loaded before the run ([`image`]).
     pub image: Option<PathBuf>,
     /// `--image-out`: the named image entries, read back after the run.
@@ -445,20 +424,9 @@ fn execute(
     } else {
         Functional::Trace
     });
-    let plane = match functional {
-        // Spawned here, on the main thread: the child's parent-death
-        // signal follows the thread that spawns it.
-        Functional::Python => {
-            let mut p = spawn_process(a.functional_cmd.as_deref())?;
-            p.set_op_time(a.thread_timeline.is_some());
-            Plane::External(Box::new(p))
-        }
-        f => Plane::Backends(backends(f, b.functional.as_ref())?),
-    };
-    let has_data = match &plane {
-        Plane::External(_) => true,
-        Plane::Backends(bs) => bs.list.iter().any(|b| b.has_data()),
-    };
+    let fcfg = b.functional.clone().unwrap_or_default();
+    let lists = unit_lists(functional, &fcfg);
+    let has_data = lists.iter().flatten().any(|n| n != "null");
     b.sim.set_thread_timeline(a.thread_timeline.is_some());
     let image = match &a.image {
         Some(p) => {
@@ -478,10 +446,15 @@ fn execute(
         b.sim.make_core_resources();
     }
     let (blocks, sync_only) = (b.sim.functional_blocks(), b.sim.sync_only_ranges().to_vec());
-    match plane {
-        Plane::Backends(bs) => b.sim.set_backends(bs),
-        Plane::External(p) => b.sim.set_external(p),
+    // The PE names by index, after the lazy PEs of an RV run.
+    let mut pes = Vec::new();
+    for (name, id) in b.pe_paths() {
+        let i = id.0 as usize;
+        pes.resize(pes.len().max(i + 1), String::new());
+        pes[i] = name;
     }
+    let bs = backends(&lists, &fcfg, &pes)?;
+    b.sim.set_backends(bs);
     // The names are taken now, before the run consumes the simulation.
     let names = tracing.then(|| trace::names(&b));
     let atlas = b

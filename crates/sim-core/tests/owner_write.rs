@@ -25,6 +25,7 @@ fn dma(b: &Built, pe: &str, src: u64, dst: Range, tile: u64) -> Descriptor {
         inferred_version: None,
         pc: None,
         call_path: Vec::new(),
+        bytes: Vec::new(),
         deps: vec![],
         label: None,
         args: Args::Dma {
