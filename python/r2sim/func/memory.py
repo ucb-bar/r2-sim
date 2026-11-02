@@ -109,14 +109,21 @@ class Memory:
     def read(self, addr: int, length: int) -> bytes:
         return self.view(addr, length).tobytes()
 
+    def target(self, addr: int, length: int) -> np.ndarray | None:
+        """The bytes [addr, addr + length) to write, as a view of the block;
+        None where a write has no effect (the sync-only space, a block of
+        a null subtree)."""
+        if self._is_sync_only(addr, length):
+            return None
+        b = self.block(addr, length)
+        if b.data is None:
+            return None
+        off = addr - b.base
+        return b.data[off:off + length]
+
     def write(self, addr: int, data) -> None:
         """Writes `data` (bytes or a uint8 array) at `addr`."""
         src = np.frombuffer(data, np.uint8) if isinstance(data, (bytes, bytearray)) else data
-        length = len(src)
-        if self._is_sync_only(addr, length):
-            return
-        b = self.block(addr, length)
-        if b.data is None:
-            return
-        off = addr - b.base
-        b.data[off:off + length] = src
+        dst = self.target(addr, len(src))
+        if dst is not None:
+            dst[:] = src

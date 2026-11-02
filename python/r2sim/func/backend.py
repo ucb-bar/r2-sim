@@ -5,22 +5,24 @@ granule, the PE names and the backend's entry of the configuration) and
 returns a backend; r2-sim calls its `apply` once per task, in order.
 
 Each block of the store becomes a NumPy array over the block's memory, so
-the ops write r2-sim's memory directly. Provider `numpy`: the ops of
-`ops` (DMA; matmul with the accumulator per Atlas and C base) and the Muon
-kernels of `kernels` (the registry in the key `kernels` of the backend's
-entry; the opaque kernel 0 writes nothing)."""
+the ops write r2-sim's memory directly. The ops of `ops` (DMA; matmul with
+the accumulator per Atlas and C base) and the Muon kernels of `kernels`
+(the registry in the key `kernels` of the backend's entry; the opaque
+kernel 0 writes nothing) run on the provider of the entry: `provider:
+numpy` (the default), or `provider: torch` with `device: cpu` (the
+default) or `cuda`. `threads` (default 1) is the number of threads of the
+plug-in's thread pools (`threads`)."""
 
 from __future__ import annotations
 
 import json
+import threading
 
-from r2sim.func import ops
+from r2sim.func import ops, threads
 from r2sim.func.descriptor import decode
-from r2sim.func.kernels import Registry
 from r2sim.func.memory import Block, FuncError, Memory, over
 from r2sim.func.plane import Plane
 
-PROVIDERS = ("numpy",)
 NO_PE = 0xFFFFFFFF
 
 
@@ -28,19 +30,34 @@ class Backend:
     """One backend of a run."""
 
     def __init__(self, memory: Memory, pes: list[str], config: dict) -> None:
-        provider = config.get("provider", "numpy")
-        if provider not in PROVIDERS:
-            raise FuncError(f"provider {provider!r}: this version has {', '.join(PROVIDERS)}")
         if "kernels" not in config:
             raise FuncError("the configuration has no kernels (the kernel registry)")
-        self.plane = Plane(memory, Registry(config["kernels"]))
+        self.thread_count = threads.check(config.get("threads", 1))
+        self.plane = Plane(memory, config["kernels"], config.get("provider", "numpy"),
+                           config.get("device", "cpu"))
         self.pes = pes
         self.config = config
+        # The pools of the thread that sets them (configure, then the
+        # thread of the tasks).
+        self.pools_of = None
+        self.set_pools()
+
+    def set_pools(self) -> None:
+        """Sets the thread pools for the calling thread, once per thread."""
+        me = threading.get_ident()
+        if self.pools_of != me:
+            threads.set_threads(self.thread_count)
+            self.pools_of = me
+
+    def pools(self) -> dict[str, int]:
+        """The threads of each pool, as the calling thread sees them."""
+        return threads.report()
 
     def apply(self, seq: int, cycle: int, gid: int, neutrino: int, pe: int, desc: bytes,
               block: bytes = b"") -> None:
         """One task: its descriptor bytes, its PE (an index of the PE table;
         NO_PE for none), and the argument block of a Muon task."""
+        self.set_pools()
         d = decode(desc, self.plane.memory.granule, None if pe == NO_PE else pe)
         d["block"] = block
         ops.task(self.plane, d)

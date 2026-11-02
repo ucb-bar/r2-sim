@@ -96,27 +96,32 @@ offset 0xd8 of the device image) and `sm_tile` (node type `sm`, a
 224-byte image at offset 0xf8 of the cluster image). Each record has
 entry 0x2a.
 
-`encoder.bin` (15,336 bytes) is a vision encoder kernel (27 layers of
+`encoder.bin` (16,496 bytes) is a vision encoder kernel (27 layers of
 width 1152, 16 heads of 72, an FFN of 4304, three images of 256 patches,
 and a projector to a width of 2048), built by the r2-toolchain
-(`r2-build --config configs/2p.yaml`). It models time only: the
-functional plane does not compute its values. It runs on configs/2p.yaml:
-the Atlas operands are in the tensor memory of each SM, and on
-configs/2p-smem.yaml the run stops with `Unowned`. The image holds every
-program of the kernel: the device program `encoder` (node type `root`,
-entry 0x2a) embeds the image of the cluster program `encoder_cluster`
-(node type `gpc`, entry 0x316, 15,016 bytes), which embeds the image of
-the SM program `encoder_step` (node type `sm`, entry 0x2068, 11,224
-bytes). The cluster image is at offset 248 of the device image, and the
-SM image at offset 3,704 of the cluster image (3,952 of the device
-image). The device starts `encoder_cluster` on each cluster. A cluster
-holds one half of the patches of each image and runs the steps of the
-encoder in stream order: for each step it starts one `encoder_step`
-program on each SM, in epoch step + 1. A GEMM step splits its output
-tiles over the SMs, and an attention step splits the heads; attention
-reads the keys and values of the other half of each image from the HBM
-of the other cluster. A step program returns without waiting for its
-tasks, and the programs of the next step name the keys of those tasks.
+(`r2-build --config configs/2p.yaml`). Its Muon tasks run the kernels of
+the registry (crates/sim-core/kernels.yaml): the LayerNorm statistics,
+the GEMM epilogues and the softmax. The `python` backend computes its
+values once a loader has put the weights and the images into the HBM: the
+loader and the comparison with a PyTorch model are in the r2-toolchain
+repository, examples/encoder/host. With the `null` or `trace` backend the
+run models time only, as before. It runs on configs/2p.yaml: the Atlas
+operands are in the tensor memory of each SM, and on configs/2p-smem.yaml
+the run stops with `Unowned`. The image holds every program of the
+kernel: the device program `encoder` (node type `root`, entry 0x2a)
+embeds the image of the cluster program `encoder_cluster` (node type
+`gpc`, entry 0x2ac, 16,176 bytes), which embeds the image of the SM
+program `encoder_step` (node type `sm`, entry 0x2822, 13,392 bytes). The
+cluster image is at offset 248 of the device image, and the SM image at
+offset 2,696 of the cluster image (2,944 of the device image). The device
+starts `encoder_cluster` on each cluster. A cluster holds one half of the
+patches of each image and runs the steps of the encoder in stream order:
+for each step it starts one `encoder_step` program on each SM, in epoch
+step + 1. A GEMM step splits its output tiles over the SMs, and an
+attention step splits the heads; attention reads the keys and values of
+the other half of each image from the HBM of the other cluster. A step
+program returns without waiting for its tasks, and the programs of the
+next step name the keys of those tasks.
 
 `probe2.bin` (392 bytes) has one task of each new descriptor form of ABI
 version 2 on root.gpc0.sm0: a 2D copy, a matmul with B transposed, and a

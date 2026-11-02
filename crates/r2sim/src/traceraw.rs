@@ -2229,7 +2229,8 @@ fn program_label_schema() -> Value {
 }
 
 /// The label schema of an RV run, from the kernel registry: the kernel of
-/// a Muon task by name (0: `opaque`), and one bit per flag of the
+/// a Muon task by name in the field `kind` (0: `opaque`; the name of the
+/// first field of the Rust programs' schema), and one bit per flag of the
 /// registry, shown as `+name` when set. The other tasks have no label.
 fn kernel_label_schema() -> Value {
     use sim_core::kernels;
@@ -2237,8 +2238,8 @@ fn kernel_label_schema() -> Value {
     let names: Vec<&str> = (0..=top)
         .map(|id| kernels::name(id).unwrap_or(""))
         .collect();
-    let mut fields = vec![json!({"name": "kernel", "shift": 0, "bits": 16, "enum": names})];
-    let mut format = "{kernel}".to_string();
+    let mut fields = vec![json!({"name": "kind", "shift": 0, "bits": 16, "enum": names})];
+    let mut format = "{kind}".to_string();
     for (flag, bit) in kernels::flags() {
         let name = flag.to_lowercase();
         fields.push(json!({

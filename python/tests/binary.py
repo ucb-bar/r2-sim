@@ -1,5 +1,7 @@
-"""The r2sim release binary of the end-to-end tests, and the kernel
-registry that it prints (`r2sim kernels`)."""
+"""The r2sim release binary of the end-to-end tests, the kernel registry
+that it prints (`r2sim kernels`), and the options of a run on the Python
+plug-in with a provider. A run on torch needs the plug-in built in the
+pixi environment torch (`pixi run -e torch build-python`)."""
 
 import functools
 import json
@@ -25,3 +27,11 @@ def registry() -> list[dict]:
     """The kernel registry as r2-sim passes it to a plug-in."""
     out = subprocess.run([str(r2sim()), "kernels"], check=True, capture_output=True, text=True)
     return json.loads(out.stdout)
+
+
+def python_plane(provider: str) -> list[str]:
+    """The r2sim options of the Python plug-in with `provider`."""
+    flags = ["--functional", "python"]
+    if provider != "numpy":
+        flags += ["--set", f"functional.backends.python={{lib: libr2_python.so, provider: {provider}}}"]
+    return flags

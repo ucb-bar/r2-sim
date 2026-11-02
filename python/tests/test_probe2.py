@@ -3,15 +3,17 @@ configs/2p-smem.yaml with the Python plug-in. On root.gpc0.sm0 it copies A
 (128 rows of 72 bf16 at a pitch of 128 elements in the HBM) into the
 SMEM with a 2D copy, computes C = A B^T (B stored [128][72] in the SMEM)
 and runs the registry kernel `epilogue` with BIAS: out = bf16(C + bias),
-bias fp32 in the HBM."""
+bias fp32 in the HBM. For each provider."""
 
 import subprocess
 
 import ml_dtypes
 import numpy as np
+import pytest
 from safetensors.numpy import load_file, save_file
 
-from binary import REPO, r2sim
+from binary import REPO, python_plane, r2sim
+from conftest import HAS_TORCH
 
 BF16 = ml_dtypes.bfloat16
 PROBE2_BIN = REPO / "crates/nu-rv/tests/fixtures/rv/probe2.bin"
@@ -19,7 +21,7 @@ PROBE2_BIN = REPO / "crates/nu-rv/tests/fixtures/rv/probe2.bin"
 A, B, C, OUT = 0, 0x8000, 0x10000, 0x18000
 
 
-def test_probe2_runs_the_epilogue_on_the_python_plane(tmp_path):
+def test_probe2_runs_the_epilogue_on_the_python_plane(tmp_path, provider):
     rng = np.random.default_rng(64)
     a = rng.standard_normal((128, 128)).astype(BF16)
     b = rng.standard_normal((128, 72)).astype(BF16)
@@ -39,7 +41,7 @@ def test_probe2_runs_the_epilogue_on_the_python_plane(tmp_path):
     out = tmp_path / "out.safetensors"
     subprocess.run(
         [str(r2sim()), "run", "--config", str(REPO / "configs/2p-smem.yaml"), "--program", "rv",
-         "--functional", "python", "--image", str(tmp_path / "image.toml"),
+         *python_plane(provider), "--image", str(tmp_path / "image.toml"),
          "--image-out", str(out)],
         check=True, stdout=subprocess.DEVNULL,
     )
@@ -47,3 +49,17 @@ def test_probe2_runs_the_epilogue_on_the_python_plane(tmp_path):
     c = (a[:, :72].astype(np.float32) @ b.astype(np.float32).T).astype(BF16)
     assert np.array_equal(got["C"], c)
     assert np.array_equal(got["out"], (c.astype(np.float32) + bias).astype(BF16))
+
+
+@pytest.mark.skipif(HAS_TORCH, reason="the plug-in of the environment torch has PyTorch")
+def test_torch_without_pytorch_stops_the_run_at_configure():
+    # The plug-in of the default environment.
+    out = subprocess.run(
+        [str(r2sim()), "run", "--config", str(REPO / "configs/2p-smem.yaml"), "--program", "rv",
+         *python_plane("torch"), "--image", str(PROBE2_BIN.with_suffix(".toml"))],
+        capture_output=True, text=True,
+    )
+    assert out.returncode == 2
+    assert "FATAL: Fatal { time: 0," in out.stdout
+    assert ("configure: FuncError: provider torch: PyTorch is not installed" in out.stdout
+            and "pixi run -e torch build-python" in out.stdout)

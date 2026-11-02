@@ -1,7 +1,8 @@
 """End to end: `r2sim run --program rv` with the RV hello fixture
 (crates/nu-rv/tests/fixtures/rv/hello.bin) on configs/2p-smem.yaml, with the
 Python plug-in (`--functional python`, libr2_python.so next to the r2sim
-binary: `pixi run build-python`) and a memory image. A and B are
+binary: `pixi run build-python`, or `pixi run -e torch build-python` for
+the provider torch) and a memory image. A and B are
 random bf16 matrices from a fixed seed; C, read back with --image-out, must
 equal numpy's A @ B computed in fp32 and rounded to bf16 once (exact
 equality: the plane accumulates in fp32 as numpy does, and the hello
@@ -14,13 +15,13 @@ import ml_dtypes
 import numpy as np
 from safetensors.numpy import load_file, save_file
 
-from binary import REPO, r2sim
+from binary import REPO, python_plane, r2sim
 
 BF16 = ml_dtypes.bfloat16
 HELLO_BIN = REPO / "crates/nu-rv/tests/fixtures/rv/hello.bin"
 
 
-def test_hello_with_the_python_plane(tmp_path):
+def test_hello_with_the_python_plane(tmp_path, provider):
     rng = np.random.default_rng(2026)
     a = rng.standard_normal((128, 128)).astype(BF16)
     b = rng.standard_normal((128, 128)).astype(BF16)
@@ -55,7 +56,7 @@ shape = [128, 128]
     out = tmp_path / "out.safetensors"
     subprocess.run(
         [str(r2sim()), "run", "--config", str(REPO / "configs/2p-smem.yaml"), "--program", "rv",
-         "--functional", "python", "--image", str(tmp_path / "image.toml"),
+         *python_plane(provider), "--image", str(tmp_path / "image.toml"),
          "--image-out", str(out)],
         check=True, stdout=subprocess.DEVNULL,
     )

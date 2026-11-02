@@ -1,5 +1,5 @@
 """The Python functional plane, op by op, on descriptors without the
-simulator, over a memory with arrays of its own."""
+simulator, over a memory with arrays of its own; for each provider."""
 
 import ml_dtypes
 import numpy as np
@@ -18,9 +18,10 @@ SYNC = (0x1F0000, 0x200000)  # the sync-only top of the numeric block
 
 
 @pytest.fixture
-def plane() -> Plane:
+def plane(provider) -> Plane:
     # The null block first: the memory sorts the blocks by base.
-    return Plane(Memory.owned([(NULL, MEM, False), (MEM, MEM, True)], [SYNC], G))
+    return Plane(Memory.owned([(NULL, MEM, False), (MEM, MEM, True)], [SYNC], G),
+                 provider=provider)
 
 
 def dma(src, to, n, dst=None, mask=FULL):

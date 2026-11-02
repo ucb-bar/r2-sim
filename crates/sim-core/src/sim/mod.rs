@@ -1409,8 +1409,15 @@ impl Sim {
                 Functional::new(list, null, store)
             }
         };
+        // A backend that fails at configure (a plug-in without what the
+        // configuration selects) stops the run before its first event.
         if let Err(e) = backend.configure() {
-            panic!("functional plane: {}", e.0);
+            self.set_fatal(Fatal {
+                time: 0,
+                nu: NeutrinoId(0),
+                gid: None,
+                error: FatalError::Invalid(format!("functional plane: {}", e.0)),
+            });
         }
         for (addr, bytes) in std::mem::take(&mut self.init) {
             if let Err(e) = backend.write(addr, &bytes) {
@@ -1434,7 +1441,10 @@ impl Sim {
         self.stats.outbound_stall = vec![0; self.nus.len()];
         self.stats.table_stall = vec![0; self.nus.len()];
         self.start_tracer();
-        while let Some((t, ev)) = self.queue.pop() {
+        while self.stats.fatal.is_none() {
+            let Some((t, ev)) = self.queue.pop() else {
+                break;
+            };
             debug_assert!(t >= self.now, "event in the past");
             self.now = t;
             self.clock.set(t);
@@ -1445,9 +1455,6 @@ impl Sim {
             self.dispatch(ev);
             if self.stats.events.is_multiple_of(POLL_WORKER_EVERY) && self.plane().failed() {
                 self.worker_failed();
-            }
-            if self.stats.fatal.is_some() {
-                break;
             }
         }
         self.finish()

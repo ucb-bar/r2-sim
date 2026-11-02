@@ -287,8 +287,8 @@ fn a_muon_task_of_an_rv_run_is_labelled_with_its_kernel_and_flags() {
             .clone()
     };
     assert_eq!(
-        f("kernel"),
-        serde_json::json!({"name": "kernel", "shift": 0, "bits": 16, "enum":
+        f("kind"),
+        serde_json::json!({"name": "kind", "shift": 0, "bits": 16, "enum":
             ["opaque", "row_stats", "epilogue", "softmax_stats", "softmax_apply"]})
     );
     assert_eq!(
@@ -299,7 +299,7 @@ fn a_muon_task_of_an_rv_run_is_labelled_with_its_kernel_and_flags() {
         f("gelu_tanh"),
         serde_json::json!({"name": "gelu_tanh", "shift": 35, "bits": 1, "enum": ["", "+gelu_tanh"]})
     );
-    assert_eq!(s["format"], "{kernel}{norm}{bias}{res}{gelu_tanh}{c_f32}");
+    assert_eq!(s["format"], "{kind}{norm}{bias}{res}{gelu_tanh}{c_f32}");
     // The format applied to the label.
     let label = 2 | BIAS << 32;
     let mut text = s["format"].as_str().unwrap().to_string();

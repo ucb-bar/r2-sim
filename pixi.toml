@@ -16,6 +16,15 @@ pytest = ">=9.1.1,<10"
 clang = "22.1.8.*"
 lld = "22.1.8.*"
 
+# PyTorch on the CPU for the provider `torch` of the Python plug-in: an
+# optional environment (`pixi run -e torch ...`); the default environment
+# has no PyTorch.
+[feature.torch.dependencies]
+pytorch = { version = ">=2.5", build = "cpu_*" }
+
+[environments]
+torch = ["torch"]
+
 [activation.env]
 PYTHONPATH = "$PIXI_PROJECT_ROOT/python"
 
