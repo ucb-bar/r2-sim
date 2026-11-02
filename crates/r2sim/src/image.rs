@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use nu_model::{Addr, NeutrinoId, Range};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sim_core::{Built, Core, FunctionalBackend, MemBlock};
+use sim_core::{Built, Core, Functional, MemBlock};
 
 /// An element type of an image entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,7 +716,7 @@ impl Image {
     /// safetensors file `out`.
     pub fn write_out(
         &self,
-        backend: &mut dyn FunctionalBackend,
+        backend: &mut Functional,
         blocks: &[MemBlock],
         sync_only: &[Range],
         out: &Path,

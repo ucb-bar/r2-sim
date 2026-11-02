@@ -417,6 +417,6 @@ pub enum RaceCheck {
 mod yaml;
 
 pub use self::yaml::{
-    build, build_file, build_str, AttachInfo, Built, Component, ConfigError, Layout, LinkInfo,
-    MemInfo, Role,
+    build, build_file, build_str, AttachInfo, Built, Component, ConfigError, FunctionalConfig,
+    Layout, LinkInfo, MemInfo, Role, UnitsConfig,
 };

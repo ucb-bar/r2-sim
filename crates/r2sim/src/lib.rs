@@ -77,6 +77,54 @@ pub fn spawn_process(cmd: Option<&str>) -> Result<func::Process, String> {
     func::Process::spawn_with_env(&words, &env, "r2sim.func: ").map_err(|e| e.0)
 }
 
+/// The functional plane of a run: backends per FU kind, or the child
+/// process.
+enum Plane {
+    Backends(sim_core::Backends),
+    External(Box<dyn sim_core::ExternalPlane>),
+}
+
+/// The lists of a short form `--functional f` (dma, atlas, muon), as in
+/// the table of the functional plane: `numeric` leaves the Muon `null`.
+fn short_form(f: Functional) -> [&'static str; 3] {
+    match f {
+        Functional::Null => ["null"; 3],
+        Functional::Trace | Functional::Python => ["trace"; 3],
+        Functional::Numeric => ["numeric", "numeric", "null"],
+    }
+}
+
+/// The backends of the run: the lists of the short form `f`, replaced by
+/// the lists that the configuration's `functional` section names. A
+/// plug-in backend (an entry with `lib`) is an error in this version.
+fn backends(
+    f: Functional,
+    cfg: Option<&sim_core::FunctionalConfig>,
+) -> Result<sim_core::Backends, String> {
+    let empty = sim_core::FunctionalConfig::default();
+    let cfg = cfg.unwrap_or(&empty);
+    if let Some((name, _)) = cfg.backends.iter().find(|(_, e)| e.contains_key("lib")) {
+        return Err(format!(
+            "functional.backends.{name}: plug-in backends (lib) come in a later version"
+        ));
+    }
+    let base = short_form(f);
+    let pick = |own: &Option<Vec<String>>, k: usize| {
+        own.clone().unwrap_or_else(|| vec![base[k].to_string()])
+    };
+    let u = &cfg.units;
+    let lists = [pick(&u.dma, 0), pick(&u.atlas, 1), pick(&u.muon, 2)];
+    sim_core::Backends::from_names([&lists[0], &lists[1], &lists[2]], |name| {
+        Ok(match name {
+            "null" => Box::new(sim_core::NullBackend),
+            "numeric" => Box::new(func::Numeric::new()),
+            "trace" => Box::new(func::Trace::new()),
+            n if cfg.backends.contains_key(n) => return Err(format!("backend {n:?} has no lib")),
+            n => return Err(format!("unknown backend {n:?}")),
+        })
+    })
+}
+
 /// What to run and what to write: the command line's options.
 #[derive(Default)]
 pub struct Options {
@@ -397,22 +445,24 @@ fn execute(
     } else {
         Functional::Trace
     });
-    let backend: Box<dyn sim_core::FunctionalBackend> = match functional {
-        Functional::Null => Box::new(sim_core::NullBackend),
-        Functional::Trace => Box::new(func::Trace::new()),
-        Functional::Numeric => Box::new(func::Numeric::new()),
+    let plane = match functional {
         // Spawned here, on the main thread: the child's parent-death
         // signal follows the thread that spawns it.
         Functional::Python => {
             let mut p = spawn_process(a.functional_cmd.as_deref())?;
             p.set_op_time(a.thread_timeline.is_some());
-            Box::new(p)
+            Plane::External(Box::new(p))
         }
+        f => Plane::Backends(backends(f, b.functional.as_ref())?),
+    };
+    let has_data = match &plane {
+        Plane::External(_) => true,
+        Plane::Backends(bs) => bs.list.iter().any(|b| b.has_data()),
     };
     b.sim.set_thread_timeline(a.thread_timeline.is_some());
     let image = match &a.image {
         Some(p) => {
-            if !backend.has_data() {
+            if !has_data {
                 return Err("--image needs a functional backend with data".into());
             }
             let img = image::Image::load(p, &b).map_err(|e| format!("--image: {e}"))?;
@@ -428,7 +478,10 @@ fn execute(
         b.sim.make_core_resources();
     }
     let (blocks, sync_only) = (b.sim.functional_blocks(), b.sim.sync_only_ranges().to_vec());
-    b.sim.set_functional(backend);
+    match plane {
+        Plane::Backends(bs) => b.sim.set_backends(bs),
+        Plane::External(p) => b.sim.set_external(p),
+    }
     // The names are taken now, before the run consumes the simulation.
     let names = tracing.then(|| trace::names(&b));
     let atlas = b
@@ -480,7 +533,7 @@ fn execute(
     let (stats, mut backend) = sim.run_with_backend();
     let wall = t0.elapsed().as_secs_f64();
     if let (Some(img), Some(out), Some(be), None) =
-        (&image, &a.image_out, backend.as_deref_mut(), &stats.fatal)
+        (&image, &a.image_out, backend.as_mut(), &stats.fatal)
     {
         img.write_out(be, &blocks, &sync_only, out)
             .map_err(|e| format!("--image-out: {e}"))?;
@@ -702,6 +755,7 @@ fn warning_counts(stats: &Stats) -> BTreeMap<String, u64> {
                 .to_string(),
             SimWarning::Race { .. } => "Race".into(),
             SimWarning::LateConsumer { .. } => "LateConsumer".into(),
+            SimWarning::NullRead { .. } => "NullRead".into(),
         };
         *warnings.entry(k).or_insert(0) += 1;
     }
@@ -746,6 +800,30 @@ fn print_summary(out: &Out, stats: &Stats, nodes: &[String]) {
             key_name(&versioned)
         );
     }
+    let null_reads: Vec<_> = stats
+        .warnings
+        .iter()
+        .filter_map(|w| match w.warning {
+            SimWarning::NullRead { range, writer } => Some((w, range, writer)),
+            _ => None,
+        })
+        .collect();
+    let gid = |g: Option<u64>| g.map_or("-".to_string(), |g| g.to_string());
+    for (w, range, writer) in null_reads.iter().take(NULL_READS_SHOWN) {
+        println!(
+            "warning NullRead at cycle {} on {}: task {} reads {range}, which the null task {} wrote",
+            w.time,
+            nodes[w.nu.0 as usize],
+            gid(w.gid),
+            gid(*writer)
+        );
+    }
+    if null_reads.len() > NULL_READS_SHOWN {
+        println!(
+            "warning NullRead: {} in all (the first {NULL_READS_SHOWN} above)",
+            null_reads.len()
+        );
+    }
     match &stats.fatal {
         Some(f) if matches!(f.error, FatalError::Deadlock { .. }) => print_deadlock(stats, nodes),
         Some(f) => {
@@ -757,6 +835,9 @@ fn print_summary(out: &Out, stats: &Stats, nodes: &[String]) {
         None => {}
     }
 }
+
+/// The `NullRead` warnings that the summary prints one by one.
+const NULL_READS_SHOWN: usize = 10;
 
 /// `addr` and the epoch and count of a versioned key.
 fn key_name(k: &Dep) -> String {

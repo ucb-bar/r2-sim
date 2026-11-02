@@ -1,9 +1,13 @@
 //! The YAML hardware loader (r2sim spec Section 10).
 //!
-//! A file has two sections, `global` and `device` (the root node). Every
-//! node has the sections `fabric`, `memory`, `compute`, `neutrino` and
-//! `children`. A child entry has a
-//! `name` and either its sections inline or `config: FILE`, a file
+//! A file has the sections `global`, `device` (the root node) and,
+//! optionally, `functional`: the backends of the functional plane per FU
+//! kind (`units: {dma, atlas, muon}`, lists of backend names, the first
+//! the default) and the backends that are not built in (`backends`). An
+//! override `functional.units.atlas=[null]` makes the section when the
+//! file has none. Every node has the sections `fabric`, `memory`,
+//! `compute`, `neutrino` and `children`. A child entry has a `name` and
+//! either its sections inline or `config: FILE`, a file
 //! (relative to the including file) that holds them; other keys of the
 //! entry override the file's (mappings merge key by key, anything else is
 //! replaced). A file may instead be `base: FILE` plus `set: [PATH=VALUE,
@@ -311,6 +315,32 @@ fn set_in_map(t: &mut Mapping, segs: &[Seg], v: &Value, insert: bool) -> usize {
     n
 }
 
+/// Sets `v` at `segs` in the root's `functional` section, which the
+/// override makes when the file has none (and the mappings on the path).
+fn set_functional(tree: &mut Value, segs: &[Seg], v: &Value) -> usize {
+    let Some(root) = tree.as_mapping_mut() else {
+        return 0;
+    };
+    let mut cur = root
+        .entry(Value::String("functional".into()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    for seg in &segs[..segs.len() - 1] {
+        if !seg.idx.is_empty() || seg.key.contains('*') {
+            return 0;
+        }
+        let Some(m) = cur.as_mapping_mut() else {
+            return 0;
+        };
+        cur = m
+            .entry(Value::String(seg.key.clone()))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+    }
+    match cur.as_mapping_mut() {
+        Some(m) => set_in_map(m, &segs[segs.len() - 1..], v, true),
+        None => 0,
+    }
+}
+
 /// True when `seg` names banks of a banked memory: `b<i>` or `b*`.
 fn is_bank_key(seg: &Seg) -> bool {
     let k = &seg.key;
@@ -401,7 +431,9 @@ fn apply_set(tree: &mut Value, s: &str) -> Result<(), ConfigError> {
     let value = value.trim();
     let v: Value = serde_yaml::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()));
     let segs = parse_path(path.trim())?;
-    let n = if segs[0].key == "global" && segs.len() > 1 {
+    let n = if segs[0].key == "functional" && segs.len() > 1 {
+        set_functional(tree, &segs[1..], &v)
+    } else if segs[0].key == "global" && segs.len() > 1 {
         tree.get_mut("global")
             .and_then(Value::as_mapping_mut)
             .map_or(0, |g| set_in_map(g, &segs[1..], &v, true))
@@ -428,6 +460,47 @@ fn apply_set(tree: &mut Value, s: &str) -> Result<(), ConfigError> {
 struct File {
     global: Global,
     device: NodeSec,
+    functional: Option<FunctionalConfig>,
+}
+
+/// The `functional` section of the root configuration: the backends of
+/// the FU kinds of the functional plane.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FunctionalConfig {
+    /// The backends that are not built in, by name: each with its `lib`
+    /// (a plug-in) and its own keys.
+    #[serde(default)]
+    pub backends: std::collections::BTreeMap<String, Mapping>,
+    /// Per FU kind, the backends the run can select; the first is the
+    /// default.
+    #[serde(default)]
+    pub units: UnitsConfig,
+}
+
+/// The lists of `functional.units`; a kind that is absent keeps the list
+/// of the run's default. YAML reads `null` in a list as no value: it names
+/// the backend `null`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitsConfig {
+    #[serde(default, deserialize_with = "backend_names")]
+    pub dma: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "backend_names")]
+    pub atlas: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "backend_names")]
+    pub muon: Option<Vec<String>>,
+}
+
+/// A list of backend names, where a YAML null is the name `null`.
+fn backend_names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<String>>, D::Error> {
+    let names: Vec<Option<String>> = Deserialize::deserialize(d)?;
+    Ok(Some(
+        names
+            .into_iter()
+            .map(|n| n.unwrap_or_else(|| "null".into()))
+            .collect(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -869,6 +942,8 @@ pub struct Built {
     pub layout: Layout,
     /// Configuration warnings (the configuration is valid).
     pub warnings: Vec<String>,
+    /// The `functional` section of the root configuration.
+    pub functional: Option<FunctionalConfig>,
     nodes: HashMap<String, NeutrinoId>,
     pes: HashMap<String, PeId>,
     memories: HashMap<String, Range>,
@@ -1086,6 +1161,7 @@ impl Builder {
                 clock_ghz,
                 layout: Layout::default(),
                 warnings: Vec::new(),
+                functional: None,
                 nodes: HashMap::new(),
                 pes: HashMap::new(),
                 memories: HashMap::new(),
@@ -1142,6 +1218,7 @@ impl Builder {
     }
 
     fn run(mut self) -> Result<Built, ConfigError> {
+        self.built.functional = self.file.functional.take();
         let root = std::mem::replace(
             &mut self.file.device,
             NodeSec {
@@ -1637,6 +1714,7 @@ impl Builder {
                 "{path}: a child needs a data link and a control link to its parent's buses"
             ));
         }
+        self.built.sim.set_fidelity(nu, numeric);
         self.memories(sec, &path, ppath, nu, own.base, numeric)?;
         self.compute(sec, &path, ppath, nu)?;
         Ok((nu, path, numeric))

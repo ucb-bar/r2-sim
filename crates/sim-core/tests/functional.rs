@@ -11,8 +11,8 @@ use common::{node, smem, v1, Knobs, DRAM, SMEM};
 use func::{bf16_to_f32, f32_to_bf16, Numeric};
 use nu_model::{Addr, Range};
 use sim_core::{
-    Args, Descriptor, FatalError, FuncError, FuncOp, FunctionalBackend, MemBlock, NuCtx, OpKind,
-    PeConfig, PeParams, RaceCheck, Ratio, SimWarning,
+    Args, Descriptor, FatalError, FuncError, FuncOp, FunctionalBackend, NuCtx, OpKind, PeConfig,
+    PeParams, RaceCheck, Ratio, SimWarning, Store,
 };
 
 const E: u64 = 64;
@@ -189,25 +189,16 @@ fn racy_load_can_be_a_warning() {
 struct Slow(Numeric);
 
 impl FunctionalBackend for Slow {
-    fn configure(&mut self, m: &[MemBlock], s: &[Range], g: u64) {
-        self.0.configure(m, s, g)
+    fn name(&self) -> &'static str {
+        "slow"
     }
-    fn has_data(&self) -> bool {
-        true
-    }
-    fn apply(&mut self, op: &FuncOp) -> Result<(), FuncError> {
+    fn apply(&mut self, op: &FuncOp, store: &mut Store) -> Result<(), FuncError> {
         if let OpKind::Task(d) = &op.kind {
             if matches!(d.args, Args::Matmul { .. }) {
                 std::thread::sleep(Duration::from_millis(30));
             }
         }
-        self.0.apply(op)
-    }
-    fn read(&mut self, a: Addr, l: u64) -> Result<Vec<u8>, FuncError> {
-        self.0.read(a, l)
-    }
-    fn write(&mut self, a: Addr, b: &[u8]) -> Result<(), FuncError> {
-        self.0.write(a, b)
+        self.0.apply(op, store)
     }
 }
 

@@ -71,6 +71,15 @@ pub enum SimWarning {
         /// Gid of a completed task that wrote the range; `None` for a store.
         writer: Option<u64>,
     },
+    /// A task on a computing backend read a range that a task on the
+    /// `null` backend wrote last: its values were not computed. Once per
+    /// range of a `null` task; the record's gid is the reading task.
+    NullRead {
+        /// The destination range of the `null` task.
+        range: Range,
+        /// Gid of the `null` task.
+        writer: Option<u64>,
+    },
 }
 
 /// One warning, with the time and place it was raised.
@@ -270,6 +279,10 @@ pub struct ThreadRecord {
     /// `imem_copy` or `store`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub op: Option<&'static str>,
+    /// Worker `apply`: the backend that applied the op (`store` for a
+    /// Neutrino store, `external` for the child-process plane).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<&'static str>,
     /// Worker `apply`: the Neutrino that emitted the op.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nu: Option<u32>,

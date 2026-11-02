@@ -28,6 +28,7 @@ use nu_model::{
 use crate::config::{MemBlock, NeutrinoConfig, PeConfig, RaceCheck};
 use crate::event::{Event, EventQueue};
 use crate::func::{FuncOp, FuncPlane, FunctionalBackend, NullBackend, OpKind, PlaneError};
+use crate::plane::{Backends, Dispatch, ExternalPlane, Functional, SelectFn};
 use crate::profile::{
     Args, Descriptor, NodeConfig, Occupancy, OpcodeId, PeId, Profile, ProfileRegistry,
 };
@@ -38,6 +39,7 @@ use crate::resource::{Demand, Dir, Kind, PathHop, ResourceId, Resources};
 use crate::stats::{
     Blocked, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning, Stall, Stats, WarningRec,
 };
+use crate::store::Store;
 use crate::time::{Cycle, Ratio};
 use crate::topology::{AttachId, Attachment, Bus, BusId, BusTopology, Lane, Topology};
 use crate::tracer::{
@@ -270,6 +272,14 @@ impl Neutrino {
     }
 }
 
+/// The functional plane of a run before its start.
+enum Setup {
+    /// Backends per FU kind over one store.
+    Backends(Backends),
+    /// A plane that keeps its own memory.
+    External(Box<dyn ExternalPlane>),
+}
+
 /// The address rewrite of a hash link.
 #[derive(Debug, Clone)]
 struct HashLink {
@@ -356,8 +366,15 @@ pub struct Sim {
     /// fidelity, rule.
     hashes: Vec<HashLink>,
     profiles: ProfileRegistry,
-    /// The backend before the run; it moves into `plane` at the start.
-    backend: Option<Box<dyn FunctionalBackend>>,
+    /// The functional plane before the run; it moves into `plane` at the
+    /// start.
+    setup: Option<Setup>,
+    /// A selection rule that replaces the fixed rule (tests).
+    select: Option<SelectFn>,
+    /// The selection of the backend of each task (from the start).
+    dispatch: Option<Dispatch>,
+    /// False for a Neutrino in a subtree of fidelity null (default true).
+    numeric: Vec<bool>,
     plane: Option<FuncPlane>,
     /// Host writes applied to the backend before the run.
     init: Vec<(Addr, Vec<u8>)>,
@@ -432,7 +449,10 @@ impl Sim {
             hop_buf: Vec::new(),
             hashes: Vec::new(),
             profiles,
-            backend: Some(Box::new(NullBackend)),
+            setup: Some(Setup::Backends(Backends::one(Box::new(NullBackend)))),
+            select: None,
+            dispatch: None,
+            numeric: Vec::new(),
             plane: None,
             init: Vec::new(),
             track_writers: false,
@@ -550,9 +570,38 @@ impl Sim {
         &self.profiles
     }
 
-    /// Sets the functional backend for the run (default: [`NullBackend`]).
+    /// Sets one functional backend for every FU kind (default:
+    /// [`NullBackend`]).
     pub fn set_functional(&mut self, func: Box<dyn FunctionalBackend>) {
-        self.backend = Some(func);
+        self.setup = Some(Setup::Backends(Backends::one(func)));
+    }
+
+    /// Sets the backends of the FU kinds.
+    pub fn set_backends(&mut self, backends: Backends) {
+        self.setup = Some(Setup::Backends(backends));
+    }
+
+    /// Sends every op of the run to `plane`, which keeps its own memory
+    /// (the child-process Python plane).
+    pub fn set_external(&mut self, plane: Box<dyn ExternalPlane>) {
+        self.setup = Some(Setup::External(plane));
+    }
+
+    /// Replaces the fixed selection rule of the backends: `f` gets the task
+    /// and the backend the rule selects, and returns the backend to use.
+    /// For tests of the detection of fidelity switches.
+    pub fn set_selection(&mut self, f: SelectFn) {
+        self.select = Some(f);
+    }
+
+    /// Sets the fidelity of the subtree of `nu`: false for null (its tasks
+    /// use the `null` backend).
+    pub fn set_fidelity(&mut self, nu: NeutrinoId, numeric: bool) {
+        let i = nu.0 as usize;
+        if self.numeric.len() <= i {
+            self.numeric.resize(i + 1, true);
+        }
+        self.numeric[i] = numeric;
     }
 
     /// Messages one hop stage holds per protocol class (default 1).
@@ -1338,9 +1387,9 @@ impl Sim {
         self.run_with_backend().0
     }
 
-    /// Like [`Sim::run`], and returns the functional backend (`None` after
-    /// a worker panic) so that its final state can be inspected.
-    pub fn run_with_backend(mut self) -> (Stats, Option<Box<dyn FunctionalBackend>>) {
+    /// Like [`Sim::run`], and returns the functional plane (`None` after a
+    /// worker panic) so that its memory can be read.
+    pub fn run_with_backend(mut self) -> (Stats, Option<Functional>) {
         if let Err(e) = self.topo.finish() {
             panic!("fabric: {e}");
         }
@@ -1353,10 +1402,28 @@ impl Sim {
             let t_retry = self.nus.iter().map(|n| n.cfg.t_retry).max().unwrap_or(0);
             10 * t_retry + self.topo.max_latency()
         });
-        let mut backend = self.backend.take().expect("backend");
         let stores = self.functional_blocks();
         let granule = self.nus.first().map_or(1, |n| n.tables.config().granule);
-        backend.configure(&stores, &self.sync_only, granule);
+        let mut backend = match self.setup.take().expect("functional plane") {
+            Setup::Backends(b) => {
+                let (d, list, null) = Dispatch::new(b, self.select.take());
+                self.dispatch = Some(d);
+                let store = list
+                    .iter()
+                    .any(|b| b.has_data())
+                    .then(|| Store::new(&stores, &self.sync_only, granule))
+                    .transpose()
+                    .unwrap_or_else(|e| panic!("functional plane: {}", e.0));
+                Functional::new(list, null, store)
+            }
+            Setup::External(p) => {
+                self.dispatch = Some(Dispatch::external());
+                Functional::external(p)
+            }
+        };
+        if let Err(e) = backend.configure(&stores, &self.sync_only, granule) {
+            panic!("functional plane: {}", e.0);
+        }
         for (addr, bytes) in std::mem::take(&mut self.init) {
             if let Err(e) = backend.write(addr, &bytes) {
                 panic!("init_memory at {:#x}: {}", addr.0, e.0);
@@ -1438,7 +1505,7 @@ impl Sim {
         }
     }
 
-    fn finish(mut self) -> (Stats, Option<Box<dyn FunctionalBackend>>) {
+    fn finish(mut self) -> (Stats, Option<Functional>) {
         self.worker_failed();
         // A message still in a stage, an invoke in an inbound table, or a
         // program that has not returned when no event is left: nothing can
@@ -1454,8 +1521,23 @@ impl Sim {
         }
         self.stats.stages = self.stage_stats();
         let plane = self.plane.take().expect("functional plane");
-        let (joined, late, backend, timeline) = plane.finish(self.now);
+        let (joined, late, mut backend, timeline) = plane.finish(self.now);
         self.stats.thread_timeline = timeline;
+        for w in backend
+            .as_mut()
+            .map(|b| b.take_warnings())
+            .unwrap_or_default()
+        {
+            self.stats.warnings.push(WarningRec {
+                time: w.time,
+                nu: w.nu,
+                gid: w.reader,
+                warning: SimWarning::NullRead {
+                    range: w.range,
+                    writer: w.writer,
+                },
+            });
+        }
         // An op that failed after the last look at the worker (2026-10-21:
         // such an error was lost).
         if let Some(e) = late {
@@ -2206,14 +2288,31 @@ impl Sim {
         }
     }
 
-    /// Emits one functional op and returns its seq.
+    /// Emits one functional op and returns its seq. A task op goes to the
+    /// backend that the dispatch selects; a fidelity switch inside a
+    /// matmul chain stops the run.
     fn emit(&mut self, nu: NeutrinoId, gid: Option<u64>, kind: OpKind) -> u64 {
         self.func_seq += 1;
+        let backend = match &kind {
+            OpKind::Task(desc) => {
+                let numeric = self.numeric.get(nu.0 as usize).copied().unwrap_or(true);
+                let d = self.dispatch.as_mut().expect("dispatch");
+                match d.select(numeric, desc) {
+                    Ok(b) => b,
+                    Err(msg) => {
+                        self.fatal(nu, gid, FatalError::Invalid(msg));
+                        return self.func_seq;
+                    }
+                }
+            }
+            OpKind::Store { .. } => 0,
+        };
         let op = FuncOp {
             seq: self.func_seq,
             time: self.now,
             nu,
             gid,
+            backend,
             kind,
         };
         let plane = self.plane.as_mut().expect("functional plane");

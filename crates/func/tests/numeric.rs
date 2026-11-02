@@ -1,6 +1,6 @@
 use func::{bf16_to_f32, f32_to_bf16, Numeric};
 use nu_model::{Addr, Range};
-use sim_core::{FunctionalBackend, MemBlock, ResourceId};
+use sim_core::{FunctionalBackend, MemBlock, ResourceId, Store};
 
 #[test]
 fn bf16_rounds_to_nearest_even() {
@@ -15,38 +15,18 @@ fn bf16_rounds_to_nearest_even() {
     assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
 }
 
-fn numeric() -> Numeric {
-    let mut n = Numeric::new();
-    n.configure(
-        &[MemBlock::plain(
-            "m".into(),
-            nu_model::NeutrinoId(0),
-            Range::new(0x10_0000, 0x30_0000),
-            ResourceId(0),
-            0,
-        )],
-        &[Range::new(0x20_0000, 0x21_0000)],
-        512,
+/// The Numeric backend and a store of one block, [1 MiB, 3 MiB), with the
+/// sync-only space [2 MiB, 2 MiB + 64 KiB).
+fn numeric() -> (Numeric, Store) {
+    let block = MemBlock::plain(
+        "m".into(),
+        nu_model::NeutrinoId(0),
+        Range::new(0x10_0000, 0x30_0000),
+        ResourceId(0),
+        0,
     );
-    n
-}
-
-#[test]
-fn sparse_pages_cross_boundaries_and_read_zero() {
-    let mut n = numeric();
-    let data: Vec<u8> = (0..200u8).collect();
-    // Crosses a 64 KiB page boundary.
-    n.write(Addr(0x10_ffa0), &data).unwrap();
-    assert_eq!(n.read(Addr(0x10_ffa0), 200).unwrap(), data);
-    assert_eq!(n.read(Addr(0x18_0000), 4).unwrap(), vec![0; 4]);
-    assert!(n.read(Addr(0x2f_fff0), 32).is_err(), "outside the block");
-}
-
-#[test]
-fn writes_to_sync_only_are_ignored() {
-    let mut n = numeric();
-    n.write(Addr(0x20_0000), &[1, 2, 3]).unwrap();
-    assert_eq!(n.read(Addr(0x20_0000), 3).unwrap(), vec![0; 3]);
+    let store = Store::new(&[block], &[Range::new(0x20_0000, 0x21_0000)], 512).unwrap();
+    (Numeric::new(), store)
 }
 
 /// C = A x B for A 4 x 2 and B 2 x 4 (tile 2 x 2): once with each operand
@@ -64,7 +44,7 @@ fn a_split_operand_reads_its_halves() {
     let b: Vec<f32> = (1..=8).map(|x| (x * 10) as f32).collect();
     let (a, b) = (&a, &b);
     let run = |split: bool| -> Vec<u8> {
-        let mut n = numeric();
+        let (mut n, mut m) = numeric();
         let (pa, pa2, pb, pb2, pc) = (0x10_0000, 0x11_0000, 0x12_0000, 0x13_0000, 0x14_0000);
         if split {
             // Rows 0 and 2 (low halves of the two row tiles) at pa, 1 and 3
@@ -74,18 +54,18 @@ fn a_split_operand_reads_its_halves() {
                     .flat_map(|&i| a[2 * i..2 * i + 2].to_vec())
                     .collect()
             };
-            n.write(Addr(pa), &bf(&rows(&[0, 2]))).unwrap();
-            n.write(Addr(pa2), &bf(&rows(&[1, 3]))).unwrap();
+            m.write(pa, &bf(&rows(&[0, 2]))).unwrap();
+            m.write(pa2, &bf(&rows(&[1, 3]))).unwrap();
             let cols = |c: &[usize]| -> Vec<f32> {
                 (0..2)
                     .flat_map(|p| c.iter().map(move |&j| b[4 * p + j]))
                     .collect()
             };
-            n.write(Addr(pb), &bf(&cols(&[0, 2]))).unwrap();
-            n.write(Addr(pb2), &bf(&cols(&[1, 3]))).unwrap();
+            m.write(pb, &bf(&cols(&[0, 2]))).unwrap();
+            m.write(pb2, &bf(&cols(&[1, 3]))).unwrap();
         } else {
-            n.write(Addr(pa), &bf(a)).unwrap();
-            n.write(Addr(pb), &bf(b)).unwrap();
+            m.write(pa, &bf(a)).unwrap();
+            m.write(pb, &bf(b)).unwrap();
         }
         let desc = Descriptor {
             opcode: OpcodeId(2),
@@ -123,10 +103,11 @@ fn a_split_operand_reads_its_halves() {
             time: 0,
             nu: nu_model::NeutrinoId(0),
             gid: None,
+            backend: 0,
             kind: OpKind::Task(desc),
         };
-        n.apply(&op).unwrap();
-        n.read(Addr(pc), 32).unwrap()
+        n.apply(&op, &mut m).unwrap();
+        m.read(pc, 32).unwrap()
     };
     let one = run(false);
     assert_eq!(
@@ -165,20 +146,21 @@ fn matmul(
         time: 0,
         nu: nu_model::NeutrinoId(0),
         gid: None,
+        backend: 0,
         kind: OpKind::Task(desc),
     }
 }
 
-fn put_bf16(n: &mut Numeric, addr: u64, v: &[f32]) {
+fn put_bf16(n: &mut Store, addr: u64, v: &[f32]) {
     let bytes: Vec<u8> = v
         .iter()
         .flat_map(|&x| f32_to_bf16(x).to_le_bytes())
         .collect();
-    n.write(Addr(addr), &bytes).unwrap();
+    n.write(addr, &bytes).unwrap();
 }
 
-fn get_bf16(n: &mut Numeric, addr: u64, len: usize) -> Vec<u16> {
-    let bytes = n.read(Addr(addr), 2 * len as u64).unwrap();
+fn get_bf16(n: &mut Store, addr: u64, len: usize) -> Vec<u16> {
+    let bytes = n.read(addr, 2 * len as u64).unwrap();
     bytes
         .as_chunks::<2>()
         .0
@@ -198,18 +180,21 @@ fn the_accumulator_keeps_the_partial_in_fp32() {
     let (pa, pb, pc) = (0x10_0000, 0x11_0000, 0x12_0000);
     let a: Vec<f32> = (0..m * k).map(|i| 1.0 + (i % 7) as f32 / 8.0).collect();
     let b: Vec<f32> = (0..k * n).map(|i| 1.0 + (i % 5) as f32 / 8.0).collect();
-    let mut nb = numeric();
-    put_bf16(&mut nb, pa, &a);
-    put_bf16(&mut nb, pb, &b);
+    let (mut nb, mut mem) = numeric();
+    put_bf16(&mut mem, pa, &a);
+    put_bf16(&mut mem, pb, &b);
     let dims = (m as u64, n as u64, k as u64);
-    nb.apply(&matmul(0, pa, pb, pc, dims, false, true)).unwrap();
-    nb.apply(&matmul(0, pa, pb, pc, dims, true, true)).unwrap();
+    nb.apply(&matmul(0, pa, pb, pc, dims, false, true), &mut mem)
+        .unwrap();
+    nb.apply(&matmul(0, pa, pb, pc, dims, true, true), &mut mem)
+        .unwrap();
     assert_eq!(
-        get_bf16(&mut nb, pc, m * n),
+        get_bf16(&mut mem, pc, m * n),
         vec![0; m * n],
         "C stays in the accumulator"
     );
-    nb.apply(&matmul(0, pa, pb, pc, dims, true, false)).unwrap();
+    nb.apply(&matmul(0, pa, pb, pc, dims, true, false), &mut mem)
+        .unwrap();
     // The product is exact in fp32 (multiples of 1/64, at most 16 * 4).
     let p: Vec<f32> = (0..m * n)
         .map(|x| (0..k).map(|q| a[x / n * k + q] * b[q * n + x % n]).sum())
@@ -218,14 +203,15 @@ fn the_accumulator_keeps_the_partial_in_fp32() {
     let r = |x: f32| bf16_to_f32(f32_to_bf16(x));
     let each: Vec<u16> = p.iter().map(|&x| f32_to_bf16(r(r(x) + x) + x)).collect();
     assert_ne!(once, each, "the data tell a rounding of the partial");
-    assert_eq!(get_bf16(&mut nb, pc, m * n), once);
-    nb.apply(&matmul(0, pa, pb, pc, dims, true, false)).unwrap();
+    assert_eq!(get_bf16(&mut mem, pc, m * n), once);
+    nb.apply(&matmul(0, pa, pb, pc, dims, true, false), &mut mem)
+        .unwrap();
     let from_memory: Vec<u16> = once
         .iter()
         .zip(&p)
         .map(|(&c, &x)| f32_to_bf16(bf16_to_f32(c) + x))
         .collect();
-    assert_eq!(get_bf16(&mut nb, pc, m * n), from_memory);
+    assert_eq!(get_bf16(&mut mem, pc, m * n), from_memory);
 }
 
 #[test]
@@ -234,12 +220,12 @@ fn the_accumulator_is_per_atlas() {
     // PE 1 starts from C in memory (zero).
     let (m, n, k) = (8, 8, 8);
     let (pa, pb, pc) = (0x10_0000, 0x11_0000, 0x12_0000);
-    let mut nb = numeric();
-    put_bf16(&mut nb, pa, &[1.0; 64]);
-    put_bf16(&mut nb, pb, &[1.0; 64]);
-    nb.apply(&matmul(0, pa, pb, pc, (m, n, k), false, true))
+    let (mut nb, mut mem) = numeric();
+    put_bf16(&mut mem, pa, &[1.0; 64]);
+    put_bf16(&mut mem, pb, &[1.0; 64]);
+    nb.apply(&matmul(0, pa, pb, pc, (m, n, k), false, true), &mut mem)
         .unwrap();
-    nb.apply(&matmul(1, pa, pb, pc, (m, n, k), true, false))
+    nb.apply(&matmul(1, pa, pb, pc, (m, n, k), true, false), &mut mem)
         .unwrap();
-    assert_eq!(get_bf16(&mut nb, pc, 64), vec![f32_to_bf16(8.0); 64]);
+    assert_eq!(get_bf16(&mut mem, pc, 64), vec![f32_to_bf16(8.0); 64]);
 }

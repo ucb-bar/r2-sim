@@ -17,11 +17,13 @@ pub mod abi;
 pub mod config;
 pub(crate) mod event;
 pub mod func;
+pub mod plane;
 pub mod profile;
 pub mod program;
 pub mod resource;
 pub mod sim;
 pub mod stats;
+pub mod store;
 pub mod time;
 pub mod topology;
 pub mod tracer;
@@ -29,10 +31,12 @@ mod writers;
 
 pub use config::{
     build as build_config, build_file as build_config_file, build_str as build_config_str,
-    AttachInfo, Built, Component, ConfigError, Layout, LinkInfo, MemBlock, MemInfo, NeutrinoConfig,
-    NuCosts, PeConfig, PeParams, RaceCheck, Role, ScalarCosts,
+    AttachInfo, Built, Component, ConfigError, FunctionalConfig, Layout, LinkInfo, MemBlock,
+    MemInfo, NeutrinoConfig, NuCosts, PeConfig, PeParams, RaceCheck, Role, ScalarCosts,
+    UnitsConfig,
 };
 pub use func::{FuncError, FuncOp, FunctionalBackend, NullBackend, OpKind};
+pub use plane::{Backends, ExternalPlane, FuKind, Functional, NullRead, SelectFn, Units};
 pub use profile::{
     split_row, Args, Chunk, Descriptor, Dtype, NodeConfig, Occupancy, OpcodeId, PeId, Profile,
     ProfileFn, ProfileRegistry,
@@ -48,6 +52,7 @@ pub use stats::{
     Blocked, BlockedProgram, ChunkRec, Fatal, FatalError, LoadRec, OpenPendingRec, SimWarning,
     Stall, Stats, TableState, TaskTimeline, ThreadRecord, WarningRec,
 };
+pub use store::{Store, StoreBlock};
 pub use time::{Cycle, Ratio};
 pub use topology::{
     AttachId, Attachment, Bus, BusId, BusTopology, FabricLink, Hop, Lane, Link, Path, TopoNode,

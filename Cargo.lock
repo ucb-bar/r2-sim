@@ -312,6 +312,7 @@ name = "sim-core"
 version = "0.1.0"
 dependencies = [
  "func",
+ "libc",
  "nu-model",
  "serde",
  "serde_yaml",

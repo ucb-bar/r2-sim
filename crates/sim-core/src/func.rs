@@ -11,8 +11,10 @@
 //! value is the same either way; the timing plane rejects racy loads
 //! (r2sim spec Section 3.4).
 //!
-//! A backend without data (`Null`) runs without a worker thread; a load is
-//! then an error.
+//! The worker applies each op with the backend that the timing thread
+//! selected for it ([`crate::plane`]); every backend works on one memory
+//! store ([`crate::store`]). A run whose backends are all `null` runs
+//! without a worker thread; a load is then an error.
 //!
 //! With the thread timeline on, both threads record their intervals in
 //! wall-clock time ([`ThreadRecord`]): the timing thread its waits for the
@@ -25,11 +27,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use nu_model::{Addr, NeutrinoId, Range};
+use nu_model::{Addr, NeutrinoId};
 
-use crate::config::MemBlock;
+use crate::plane::Functional;
 use crate::profile::{Args, Descriptor};
 use crate::stats::ThreadRecord;
+use crate::store::Store;
 use crate::time::Cycle;
 
 /// What one functional op does.
@@ -60,6 +63,9 @@ pub struct FuncOp {
     pub nu: NeutrinoId,
     /// The task gid, for task ops.
     pub gid: Option<u64>,
+    /// The backend that applies a task op: an index of the run's backends
+    /// ([`crate::plane::Backends`]).
+    pub backend: usize,
     /// What the op does.
     pub kind: OpKind,
 }
@@ -68,21 +74,25 @@ pub struct FuncOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncError(pub String);
 
-/// A functional backend. It runs on the worker thread.
+/// A functional backend: it applies the tasks of the FU kinds that select
+/// it, on the store. It runs on the worker thread.
 pub trait FunctionalBackend: Send {
-    /// Called once before the run with the memory blocks, the sync-only
-    /// ranges and the Neutrino granule (the unit of a destination range's
-    /// mask).
-    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64);
-    /// False for a backend that keeps no data; the simulator then runs it
-    /// without a worker thread and a load is an error.
-    fn has_data(&self) -> bool;
-    /// Applies one op; ops arrive in `seq` order.
-    fn apply(&mut self, op: &FuncOp) -> Result<(), FuncError>;
-    /// Reads `len` bytes starting at `addr`.
-    fn read(&mut self, addr: Addr, len: u64) -> Result<Vec<u8>, FuncError>;
-    /// Host-side initialization before the run.
-    fn write(&mut self, addr: Addr, bytes: &[u8]) -> Result<(), FuncError>;
+    /// The backend's name in the configuration (`null`, `numeric`,
+    /// `trace`) and in the thread timeline.
+    fn name(&self) -> &'static str;
+    /// False for a backend that writes nothing (`null`); a run whose
+    /// backends all write nothing has no store and no worker thread, and a
+    /// load is an error.
+    fn has_data(&self) -> bool {
+        true
+    }
+    /// Called once before the run with the store.
+    fn configure(&mut self, _store: &Store) -> Result<(), FuncError> {
+        Ok(())
+    }
+    /// Applies one task op on the store; ops arrive in `seq` order. A
+    /// Neutrino store does not reach a backend.
+    fn apply(&mut self, op: &FuncOp, store: &mut Store) -> Result<(), FuncError>;
     /// The time a child process spent on the last applied op, in ns by its
     /// own clock, for the thread timeline; `None` when the backend does
     /// not report it.
@@ -91,28 +101,21 @@ pub trait FunctionalBackend: Send {
     }
 }
 
-/// Discards every op. A load is an error: the run declared no
-/// data-dependent control.
+/// Writes nothing.
 #[derive(Debug, Default)]
 pub struct NullBackend;
 
 impl FunctionalBackend for NullBackend {
-    fn configure(&mut self, _: &[MemBlock], _: &[Range], _: u64) {}
+    fn name(&self) -> &'static str {
+        "null"
+    }
 
     fn has_data(&self) -> bool {
         false
     }
 
-    fn apply(&mut self, _: &FuncOp) -> Result<(), FuncError> {
+    fn apply(&mut self, _: &FuncOp, _: &mut Store) -> Result<(), FuncError> {
         Ok(())
-    }
-
-    fn read(&mut self, _: Addr, _: u64) -> Result<Vec<u8>, FuncError> {
-        Err(FuncError("the Null backend has no data".into()))
-    }
-
-    fn write(&mut self, _: Addr, _: &[u8]) -> Result<(), FuncError> {
-        Err(FuncError("the Null backend has no data".into()))
     }
 }
 
@@ -233,10 +236,10 @@ impl Control {
 /// The timing thread's handle on the functional plane.
 pub(crate) enum FuncPlane {
     /// A backend without data, on the timing thread.
-    Inline(Box<dyn FunctionalBackend>),
+    Inline(Functional),
     Worker {
         shared: Arc<Shared>,
-        handle: JoinHandle<(Box<dyn FunctionalBackend>, Option<Timeline>)>,
+        handle: JoinHandle<(Functional, Option<Timeline>)>,
         capacity: usize,
         /// The timing thread's timeline, when on.
         control: Option<Control>,
@@ -252,9 +255,9 @@ pub(crate) enum PlaneError {
 }
 
 impl FuncPlane {
-    /// Starts the worker of a backend with data. `timeline`: both threads
-    /// record their intervals (not for a backend without data).
-    pub fn start(mut backend: Box<dyn FunctionalBackend>, capacity: usize, timeline: bool) -> Self {
+    /// Starts the worker of a plane with data. `timeline`: both threads
+    /// record their intervals (not for a plane without data).
+    pub fn start(mut backend: Functional, capacity: usize, timeline: bool) -> Self {
         if !backend.has_data() {
             return FuncPlane::Inline(backend);
         }
@@ -270,7 +273,7 @@ impl FuncPlane {
         let handle = std::thread::Builder::new()
             .name("r2-func".into())
             .spawn(move || {
-                worker(&mut *backend, &sh, worker_timeline.as_mut());
+                worker(&mut backend, &sh, worker_timeline.as_mut());
                 (backend, worker_timeline)
             })
             .expect("spawn the functional worker");
@@ -407,7 +410,7 @@ impl FuncPlane {
     ) -> (
         Result<(), String>,
         Option<WorkerError>,
-        Option<Box<dyn FunctionalBackend>>,
+        Option<Functional>,
         Vec<ThreadRecord>,
     ) {
         match self {
@@ -485,11 +488,7 @@ fn op_fields(op: &FuncOp) -> ThreadRecord {
     r
 }
 
-fn worker(
-    backend: &mut dyn FunctionalBackend,
-    shared: &Shared,
-    mut timeline: Option<&mut Timeline>,
-) {
+fn worker(backend: &mut Functional, shared: &Shared, mut timeline: Option<&mut Timeline>) {
     // A panic in the backend must not leave the timing thread blocked.
     struct PanicGuard<'a>(&'a Shared);
     impl Drop for PanicGuard<'_> {
@@ -563,7 +562,8 @@ fn worker(
                 let r = backend.apply(&op);
                 if let Some(t) = timeline.as_deref_mut() {
                     let fields = ThreadRecord {
-                        child_ns: backend.child_ns(),
+                        child_ns: backend.child_ns(&op),
+                        backend: Some(backend.backend_name(&op)),
                         ..op_fields(&op)
                     };
                     t.push("worker", "apply", from, Instant::now(), fields);

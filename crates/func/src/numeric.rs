@@ -2,77 +2,44 @@
 
 use std::collections::HashMap;
 
-use nu_model::{Addr, Range};
+use nu_model::Range;
+use sim_core::store::check_in_dst;
 use sim_core::{
-    split_row, Args, Descriptor, Dtype, FuncError, FuncOp, FunctionalBackend, MemBlock, OpKind,
-    PeId,
+    split_row, Args, Descriptor, Dtype, FuncError, FuncOp, FunctionalBackend, OpKind, PeId, Store,
 };
 
 use crate::dtype::{bf16_to_f32, f32_to_bf16};
-use crate::memory::{check_in_dst, err, Memory};
 
-/// Executes ops on sparse byte memory: DMA copies, GEMM, stores. Muon
-/// vector tasks are opaque in phase 1 and write nothing.
+fn err<T>(msg: String) -> Result<T, FuncError> {
+    Err(FuncError(msg))
+}
+
+/// Executes tasks on the store: DMA copies and GEMM. Muon vector tasks are
+/// opaque (no kernel yet) and write nothing.
 ///
 /// A GEMM is output stationary, as in the Python plane: the partial C of a
 /// chain stays in the accumulator of its Atlas (fp32, keyed by the PE and
 /// the C base) while the tasks keep it, and is written once.
 #[derive(Default)]
 pub struct Numeric {
-    mem: Memory,
     /// The partials held in the Atlas accumulators, by (PE, C base):
     /// `m x n` row-major fp32.
     acc: HashMap<(Option<PeId>, u64), Vec<f32>>,
 }
 
 impl Numeric {
-    /// Builds a backend with empty memory.
+    /// Builds a backend with no partial sums.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Reads a row-major `rows x cols` matrix with leading dimension `ld`.
-    fn read_matrix(
-        &mut self,
-        base: u64,
-        rows: u64,
-        cols: u64,
-        ld: u64,
-        dt: Dtype,
-    ) -> Result<Vec<f32>, FuncError> {
-        let es = dt.bytes();
-        let mut out = Vec::with_capacity((rows * cols) as usize);
-        for r in 0..rows {
-            let row = self.mem.read(base + r * ld * es, cols * es)?;
-            out.extend(decode(&row, dt));
-        }
-        Ok(out)
-    }
-
-    fn write_matrix(
-        &mut self,
-        base: u64,
-        rows: u64,
-        cols: u64,
-        ld: u64,
-        dt: Dtype,
-        v: &[f32],
-    ) -> Result<(), FuncError> {
-        let es = dt.bytes();
-        for r in 0..rows {
-            let row = &v[(r * cols) as usize..((r + 1) * cols) as usize];
-            self.mem.write(base + r * ld * es, &encode(row, dt))?;
-        }
-        Ok(())
-    }
-
-    fn task(&mut self, desc: &Descriptor) -> Result<(), FuncError> {
+    fn task(&mut self, desc: &Descriptor, mem: &mut Store) -> Result<(), FuncError> {
         match &desc.args {
             // An IMEM_COPY moves bytes of the control plane: no data here.
             Args::Join | Args::Spawn { .. } | Args::Vector { .. } | Args::ImemCopy { .. } => Ok(()),
             &Args::Dma {
                 src, dst, bytes, ..
-            } => self.mem.dma(&desc.held(), src.0, dst.0, bytes),
+            } => mem.dma(&desc.held(), src.0, dst.0, bytes),
             &Args::Matmul {
                 a,
                 b,
@@ -101,17 +68,18 @@ impl Numeric {
                 // Each row of C, against the masked dst.
                 for r in 0..m {
                     let row = Range::from_len(c + r * ldc * es, n * es);
-                    check_in_dst(&desc.held(), self.mem.granule(), &row)?;
+                    check_in_dst(&desc.held(), mem.granule(), &row)?;
                 }
                 let es_a = in_dtype.bytes();
                 let av = match a2 {
-                    None => self.read_matrix(a.0, m, k, lda, in_dtype)?,
+                    None => read_matrix(mem, a.0, m, k, lda, in_dtype)?,
                     Some(a2) => {
                         let mut v = Vec::with_capacity((m * k) as usize);
                         for r in 0..m {
                             let (hi, i) = split_row(r, tile[0]);
                             let base = if hi { a2.0 } else { a.0 };
-                            v.extend(self.read_matrix(
+                            v.extend(read_matrix(
+                                mem,
                                 base + i * lda * es_a,
                                 1,
                                 k,
@@ -123,14 +91,14 @@ impl Numeric {
                     }
                 };
                 let bv = match b2 {
-                    None => self.read_matrix(b.0, k, n, ldb, b_dtype)?,
+                    None => read_matrix(mem, b.0, k, n, ldb, b_dtype)?,
                     Some(b2) => {
                         let es_b = b_dtype.bytes();
                         let mut v = vec![0.0; (k * n) as usize];
                         for c in 0..n {
                             let (hi, i) = split_row(c, tile[1]);
                             let base = if hi { b2.0 } else { b.0 } + i * es_b;
-                            let col = self.read_matrix(base, k, 1, ldb, b_dtype)?;
+                            let col = read_matrix(mem, base, k, 1, ldb, b_dtype)?;
                             for (p, x) in col.into_iter().enumerate() {
                                 v[p * n as usize + c as usize] = x;
                             }
@@ -150,7 +118,7 @@ impl Numeric {
                             p.len()
                         ))
                     }
-                    (true, None) => Some(self.read_matrix(c, m, n, ldc, out_dtype)?),
+                    (true, None) => Some(read_matrix(mem, c, m, n, ldc, out_dtype)?),
                 };
                 let mut cv = gemm(&av, &bv, m as usize, n as usize, k as usize);
                 if let Some(start) = start {
@@ -162,11 +130,46 @@ impl Numeric {
                     self.acc.insert((desc.pe, c), cv);
                     Ok(())
                 } else {
-                    self.write_matrix(c, m, n, ldc, out_dtype, &cv)
+                    write_matrix(mem, c, m, n, ldc, out_dtype, &cv)
                 }
             }
         }
     }
+}
+
+/// Reads a row-major `rows x cols` matrix with leading dimension `ld`.
+fn read_matrix(
+    mem: &Store,
+    base: u64,
+    rows: u64,
+    cols: u64,
+    ld: u64,
+    dt: Dtype,
+) -> Result<Vec<f32>, FuncError> {
+    let es = dt.bytes();
+    let mut out = Vec::with_capacity((rows * cols) as usize);
+    for r in 0..rows {
+        out.extend(decode(mem.bytes(base + r * ld * es, cols * es)?, dt));
+    }
+    Ok(out)
+}
+
+/// Writes a row-major `rows x cols` matrix with leading dimension `ld`.
+fn write_matrix(
+    mem: &mut Store,
+    base: u64,
+    rows: u64,
+    cols: u64,
+    ld: u64,
+    dt: Dtype,
+    v: &[f32],
+) -> Result<(), FuncError> {
+    let es = dt.bytes();
+    for r in 0..rows {
+        let row = &v[(r * cols) as usize..((r + 1) * cols) as usize];
+        mem.write(base + r * ld * es, &encode(row, dt))?;
+    }
+    Ok(())
 }
 
 /// The product A B (`m x k` times `k x n`, row-major) in f32: each
@@ -211,26 +214,14 @@ fn encode(v: &[f32], dt: Dtype) -> Vec<u8> {
 }
 
 impl FunctionalBackend for Numeric {
-    fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64) {
-        self.mem.configure(memories, sync_only, granule);
+    fn name(&self) -> &'static str {
+        "numeric"
     }
 
-    fn has_data(&self) -> bool {
-        true
-    }
-
-    fn apply(&mut self, op: &FuncOp) -> Result<(), FuncError> {
+    fn apply(&mut self, op: &FuncOp, mem: &mut Store) -> Result<(), FuncError> {
         match &op.kind {
-            OpKind::Task(desc) => self.task(desc),
-            OpKind::Store { addr, bytes } => self.mem.write(addr.0, bytes),
+            OpKind::Task(desc) => self.task(desc, mem),
+            OpKind::Store { addr, bytes } => mem.write(addr.0, bytes),
         }
-    }
-
-    fn read(&mut self, addr: Addr, len: u64) -> Result<Vec<u8>, FuncError> {
-        self.mem.read(addr.0, len)
-    }
-
-    fn write(&mut self, addr: Addr, bytes: &[u8]) -> Result<(), FuncError> {
-        self.mem.write(addr.0, bytes)
     }
 }

@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use nu_model::Range;
 use serde_json::{json, Value};
-use sim_core::{Args, Descriptor, Dtype, FuncError, FuncOp, FunctionalBackend, MemBlock, OpKind};
+use sim_core::{Args, Descriptor, Dtype, ExternalPlane, FuncError, FuncOp, MemBlock, OpKind};
 
 /// The protocol version of the handshake.
 pub const PROTOCOL: u64 = 1;
@@ -295,7 +295,7 @@ pub fn descriptor(d: &Descriptor) -> Value {
     v
 }
 
-impl FunctionalBackend for Process {
+impl ExternalPlane for Process {
     fn configure(&mut self, memories: &[MemBlock], sync_only: &[Range], granule: u64) {
         let blocks: Vec<Value> = memories
             .iter()
@@ -314,10 +314,6 @@ impl FunctionalBackend for Process {
         if let Err(e) = self.call(frame::CONFIGURE, &head, &[], 0) {
             self.failed = Some(e);
         }
-    }
-
-    fn has_data(&self) -> bool {
-        true
     }
 
     fn apply(&mut self, op: &FuncOp) -> Result<(), FuncError> {

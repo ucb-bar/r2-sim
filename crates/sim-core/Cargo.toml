@@ -9,6 +9,7 @@ license.workspace = true
 nu-model = { path = "../nu-model", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+libc = "0.2"
 
 [dev-dependencies]
 func = { path = "../func" }
