@@ -144,6 +144,19 @@ pub struct ScalarCosts {
     pub div: Cycle,
 }
 
+impl ScalarCosts {
+    /// Every class at 0 cycles (`global.rv_instruction_costs: zero`).
+    pub const ZERO: Self = Self {
+        alu: 0,
+        branch_taken: 0,
+        branch: 0,
+        load: 0,
+        store: 0,
+        mul: 0,
+        div: 0,
+    };
+}
+
 impl Default for ScalarCosts {
     fn default() -> Self {
         Self {

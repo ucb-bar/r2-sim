@@ -45,7 +45,10 @@
 //!   run; default 10 x the largest `t_retry` plus the longest route
 //!   latency), `flow` (readyvalid | ticket), `hop_queue` (messages one
 //!   hop stage holds per protocol class, default 1: a pipeline register,
-//!   not a buffer to size).
+//!   not a buffer to size), `rv_instruction_costs` (default | zero: with
+//!   zero, every instruction class of an RV program costs 0 cycles on every
+//!   node, whatever `neutrino.scalar` says; the `nu.*` instructions keep
+//!   the Neutrino costs `c_invoke`, `c_wait` and the others).
 //! * buses and links: a bus or link without `bw_bytes` is unlimited.
 //!   A data bus or data link with `bw_bytes` may have `wr_bytes`: a
 //!   separate write channel at that rate (Radiance 2 spec Section 3.4): `<link>.ab.wr`
@@ -521,6 +524,9 @@ struct Global {
     hop_queue: Option<usize>,
     cocharge: Option<String>,
     livelock_cycles: Option<u64>,
+    /// "default" or "zero": the instructions of RV programs at their
+    /// `neutrino.scalar` costs, or at 0 cycles on every node.
+    rv_instruction_costs: Option<String>,
     address: AddrSec,
 }
 
@@ -1159,6 +1165,14 @@ impl Builder {
         if let Some(c) = g.livelock_cycles {
             sim.set_livelock_cycles(c);
         }
+        match g.rv_instruction_costs.as_deref() {
+            None | Some("default" | "zero") => {}
+            Some(c) => {
+                return err(format!(
+                    "unknown rv_instruction_costs {c:?} (default, zero)"
+                ))
+            }
+        }
         let clock_ghz = g.clock_ghz.unwrap_or(1.0);
         Ok(Self {
             file,
@@ -1534,12 +1548,15 @@ impl Builder {
                 "{path}: no neutrino section (nodes without a Neutrino are not supported yet)"
             ));
         };
-        let cfg = nu_config(
+        let mut cfg = nu_config(
             &path,
             nsec,
             self.file.global.neutrino_granule,
             sec.compute.len(),
         )?;
+        if self.file.global.rv_instruction_costs.as_deref() == Some("zero") {
+            cfg.scalar = super::ScalarCosts::ZERO;
+        }
         self.table_sizes.push(TableSizes {
             name: path.clone(),
             scoreboard: cfg.tables.scoreboard_capacity,

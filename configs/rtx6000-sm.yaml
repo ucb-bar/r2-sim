@@ -21,6 +21,11 @@
 #   MAC per cycle: bf16 128, fp8 256, fp4 512 (mma.sync from registers on
 #   all four: 511.8, 1023.6, 2047 per SM). acc_buffer is per unit (the
 #   sub-partition's registers; --acc-buffer sets every unit's).
+#   quantize: none: the card's tile depends on the kernel, and the Atlas
+#   key `tile` (default 128 x 128) only cuts a matmul into chunks; with
+#   quantize: tile each matmul would be padded to it. The programs charge
+#   the exact shapes, as the Rust `kernels` program did when it gave each
+#   matmul a tile of its own shape.
 # * muon: the 128 CUDA cores as a 128-lane vector unit (125 fp32 FMA per
 #   cycle measured); overhead 20 cycles per task (not measured).
 # * dma: the SM's bulk copy engine (TMA). Latency 208 cycles, the one
@@ -44,13 +49,13 @@ memory:
   - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
 compute:
   - {name: atlas0, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
-     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+     quantize: none, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: atlas1, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
-     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+     quantize: none, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: atlas2, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
-     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+     quantize: none, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: atlas3, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
-     quantize: tile, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
+     quantize: none, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: muon, type: vector, rate: {lane_op: 128}, overhead: 20, master: [$this.lbus, $this.smsbus]}
   - {name: dma, type: dma, latency: 208, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,

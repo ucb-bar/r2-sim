@@ -313,6 +313,8 @@ fn execute(mut mem: Flat, entry: u64) -> (Outcome, Hart) {
                 Ok(())
             }
             Some(Event::Epoch { epoch, .. }) => versions.set_epoch(epoch),
+            // The simulator's controls have no effect on the ISA tests.
+            Some(Event::Mark { .. } | Event::CacheFlush { .. }) => Ok(()),
         };
         if let Err(e) = result {
             return (Outcome::Error(format!("pc {pc:#x}: {e}")), hart);

@@ -8,6 +8,12 @@
 //! 0xFC1 (the instruction `epoch`) sets [`Hart::epoch`] and also returns an
 //! [`Event`], so that the Neutrino model changes its epoch.
 //!
+//! Two write-only CSRs are controls of the simulator, not of the Neutrino
+//! ISA: a write of CSR 0x8C0 is a phase mark ([`Event::Mark`]) and a write
+//! of CSR 0x8C1 empties the cache of the DRAM ([`Event::CacheFlush`]).
+//! Only `csrrw` and `csrrwi` with rd = x0, which do not read the CSR,
+//! write them; any other access is [`Fault::Csr`].
+//!
 //! Every bit of a register carries a taint bit, and a [`Bus`] keeps taint
 //! for the bytes of its memory. A load from a tainted byte taints the bits
 //! it loads, and each instruction taints the bits of its result that depend
@@ -72,6 +78,12 @@ pub enum Event {
     /// `epoch`: a CSR instruction wrote `epoch` to CSR 0xFC1 (the hart's
     /// `epoch` already holds it).
     Epoch { pc: u64, epoch: u64, taint: u64 },
+    /// A write of `id` to CSR 0x8C0 (`insn::mark`): a phase mark of the
+    /// simulator.
+    Mark { pc: u64, id: u64, taint: u64 },
+    /// A write to CSR 0x8C1 (`insn::cache_flush`): the simulator empties
+    /// the cache of the DRAM.
+    CacheFlush { pc: u64 },
     /// `nu.exit`: the program ends.
     Exit { pc: u64 },
     /// `ebreak` or `ecall`.
@@ -142,6 +154,10 @@ impl CallStack {
 /// CSR numbers.
 pub const CSR_PREFIX: u16 = 0xfc0;
 pub const CSR_EPOCH: u16 = 0xfc1;
+/// The simulator's phase mark (write-only).
+pub const CSR_MARK: u16 = 0x8c0;
+/// The simulator's cache flush (write-only).
+pub const CSR_CACHE_FLUSH: u16 = 0x8c1;
 const CSR_CYCLE: u16 = 0xc00;
 const CSR_INSTRET: u16 = 0xc02;
 const CSR_MHARTID: u16 = 0xf14;
@@ -287,6 +303,28 @@ impl Hart {
                     alu_taint(f, (a, ta), (b, tb), w)
                 };
                 self.set(rd, v, t);
+            }
+            Csr {
+                f,
+                rd,
+                rs1,
+                uimm,
+                csr,
+            } if csr == CSR_MARK || csr == CSR_CACHE_FLUSH => {
+                // Write-only: csrrw and csrrwi with rd = x0 do not read.
+                if !matches!(f, 1 | 5) || rd != 0 {
+                    return Err(Fault::Csr { pc, csr });
+                }
+                let (src, taint) = if f == 5 {
+                    (uimm as u64, 0)
+                } else {
+                    self.get(rs1)
+                };
+                event = Some(if csr == CSR_MARK {
+                    Event::Mark { pc, id: src, taint }
+                } else {
+                    Event::CacheFlush { pc }
+                });
             }
             Csr {
                 f,

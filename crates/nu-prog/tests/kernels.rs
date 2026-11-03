@@ -372,11 +372,10 @@ fn attention_holds_s_and_o_in_the_accumulator_by_default() {
     // SMEM bytes per CTA (2 KV tiles of 128): Q in; per KV tile K and V
     // in, S = Q K^T reads Q and K, P V reads P and V; then O written by
     // the last P V, read and written by the normalize, read by the pull.
-    // The online softmax moves none, and S never reaches SMEM. P V's B (V,
-    // 64 columns) is read padded to the Atlas tile's 128 columns (quantize
-    // `tile`).
+    // The online softmax moves none, and S never reaches SMEM. The tensor
+    // units charge exact shapes (quantize none on rtx6000-sm.yaml).
     let tile = 128 * 64 * 2;
-    let per_kv = 2 * tile + 2 * tile + (128 * 128 * 2 + 128 * 128 * 2);
+    let per_kv = 2 * tile + 2 * tile + (128 * 128 * 2 + tile);
     let per_cta = tile + 2 * per_kv + tile + 2 * tile + tile;
     let smem: u64 = s
         .resources

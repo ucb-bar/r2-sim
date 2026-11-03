@@ -30,14 +30,20 @@
 //! JAL and JALR; a new hart per program start) without the start code's
 //! call of the program function.
 //!
-//! An illegal instruction, an unknown CSR, `ecall`, `ebreak`, a fetch
-//! outside the IMEM, a store into the IMEM, a bad descriptor and the
-//! instruction limit stop the run with an error that names the node and
-//! the PC.
+//! Two CSRs are controls of r2-sim, not of the Neutrino ISA (nu-abi
+//! `insn::mark` and `insn::cache_flush`): a write of an id to CSR 0x8C0 is
+//! a phase mark named by the id in decimal (`NuCtx::mark`), and a write to
+//! CSR 0x8C1 empties the cache of the DRAM (`NuCtx::cache_flush`). Both are
+//! write-only.
+//!
+//! An illegal instruction, an unknown CSR, a read of a write-only CSR,
+//! `ecall`, `ebreak`, a fetch outside the IMEM, a store into the IMEM, a
+//! bad descriptor and the instruction limit stop the run with an error that
+//! names the node and the PC.
 
 use std::rc::Rc;
 
-use nu_iss::{decode as decode_insn, Bus, Event, Fault, Hart, Inst};
+use nu_iss::{decode as decode_insn, Bus, Event, Fault, Hart, Inst, CSR_CACHE_FLUSH, CSR_MARK};
 use nu_model::{Addr, NeutrinoId, Range};
 use sim_core::{abi, Args, Built, CoreMem, Descriptor, NuCtx, OpcodeId, ProgramName, ScalarCosts};
 
@@ -313,10 +319,13 @@ fn batch(
                 }
             }
             Err(Fault::Csr { csr, .. }) => {
-                return Stop::Fault {
-                    pc,
-                    msg: format!("unknown CSR {csr:#x}"),
-                }
+                let msg = match csr {
+                    CSR_MARK | CSR_CACHE_FLUSH => {
+                        format!("CSR {csr:#x} is write-only (csrrw or csrrwi with rd = x0)")
+                    }
+                    _ => format!("unknown CSR {csr:#x}"),
+                };
+                return Stop::Fault { pc, msg };
             }
         }
     }
@@ -525,6 +534,11 @@ impl RvProgram {
                 }
                 Stop::Event(Event::VresetAll { .. }) => ctx.vreset_all().await,
                 Stop::Event(Event::Epoch { epoch, .. }) => ctx.set_epoch(epoch).await,
+                // The simulator's controls (r2-sim CSRs, not the Neutrino
+                // ISA): a phase mark named by its id in decimal, and the
+                // flush of the cache of the DRAM.
+                Stop::Event(Event::Mark { id, .. }) => ctx.mark(&id.to_string()).await,
+                Stop::Event(Event::CacheFlush { .. }) => ctx.cache_flush().await,
             }
         }
     }

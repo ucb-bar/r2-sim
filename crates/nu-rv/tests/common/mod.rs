@@ -50,6 +50,10 @@ pub mod rv {
     pub fn csrr(rd: u32, csr: u32) -> u32 {
         (csr << 20) | (2 << 12) | (rd << 7) | 0x73
     }
+    /// `csrrw x0, csr, rs1` (`csrw csr, rs1`).
+    pub fn csrw(csr: u32, rs1: u32) -> u32 {
+        (csr << 20) | (rs1 << 15) | (1 << 12) | 0x73
+    }
     pub fn jal(rd: u32, off: i32) -> u32 {
         let o = off as u32;
         (((o >> 20) & 1) << 31)

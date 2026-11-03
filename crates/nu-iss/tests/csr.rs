@@ -1,8 +1,9 @@
 //! The CSRs of the node: CSR 0xFC0 returns the prefix and CSR 0xFC1 the
 //! epoch, both untainted. A write of CSR 0xFC1 sets the epoch and is the
-//! instruction `epoch`; a write of CSR 0xFC0 is ignored.
+//! instruction `epoch`; a write of CSR 0xFC0 is ignored. The simulator's
+//! write-only CSRs 0x8C0 (mark) and 0x8C1 (cache flush).
 
-use nu_iss::{Bus, Event, Fault, Hart, CSR_EPOCH, CSR_PREFIX};
+use nu_iss::{Bus, Event, Fault, Hart, CSR_CACHE_FLUSH, CSR_EPOCH, CSR_MARK, CSR_PREFIX};
 
 /// A memory of one instruction at every address; no data.
 struct One(u32);
@@ -93,5 +94,46 @@ fn a_write_of_the_epoch_csr_is_the_instruction_epoch() {
         // A later read returns the new epoch.
         h.step(&mut One(csrrs(6, CSR_EPOCH, 0))).unwrap();
         assert_eq!(h.get(6), (h.epoch, 0), "{what}");
+    }
+}
+
+#[test]
+fn a_write_of_a_simulator_csr_is_an_event_and_a_read_is_a_fault() {
+    // csrw 0x8c0, x7 with x7 = 42 (tainted bit 0): a mark of id 42.
+    let mut h = Hart::new(0x40, 0x2000);
+    h.set(7, 42, 1);
+    let ev = h.step(&mut One(csr_insn(1, 0, CSR_MARK, 7))).unwrap();
+    assert_eq!(
+        ev,
+        Some(Event::Mark {
+            pc: 0x40,
+            id: 42,
+            taint: 1
+        })
+    );
+    // csrwi 0x8c0, 9 and csrwi 0x8c1, 0.
+    let ev = h.step(&mut One(csr_insn(5, 0, CSR_MARK, 9))).unwrap();
+    assert_eq!(
+        ev,
+        Some(Event::Mark {
+            pc: 0x44,
+            id: 9,
+            taint: 0
+        })
+    );
+    let ev = h
+        .step(&mut One(csr_insn(5, 0, CSR_CACHE_FLUSH, 0)))
+        .unwrap();
+    assert_eq!(ev, Some(Event::CacheFlush { pc: 0x48 }));
+    // A read: csrr, csrrs and csrrc with a source, csrrw with rd != x0.
+    for (f, rd, rs1) in [(2, 5, 0), (2, 0, 7), (3, 0, 7), (1, 5, 7), (6, 0, 1)] {
+        for csr in [CSR_MARK, CSR_CACHE_FLUSH] {
+            let e = h.step(&mut One(csr_insn(f, rd, csr, rs1))).unwrap_err();
+            assert_eq!(
+                e,
+                Fault::Csr { pc: h.pc, csr },
+                "funct3 {f} rd {rd} rs1 {rs1}"
+            );
+        }
     }
 }
