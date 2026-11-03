@@ -513,7 +513,8 @@ pub struct Half {
     /// Read half: the block's port, the route to the engine and the
     /// engine's links. Write half: the route from the engine and the
     /// block's write port. A latency before the route's first rated hop
-    /// is on the hop before it.
+    /// is on the hop before it. A hop's amount is 0 (it carries the
+    /// chunk's bytes) unless it has one of its own.
     pub hops: Rc<[PathHop]>,
     /// Write half: the latency before its first rated hop, added to the
     /// last hop of the read half.
@@ -568,11 +569,14 @@ pub struct Run {
 }
 
 impl TransferChunk {
-    /// The hops of the chunk in route order with its bytes, into `buf`.
+    /// The hops of the chunk in route order with its bytes, into `buf`. A
+    /// hop of a half with an amount of its own (the fill of a cache line
+    /// into its slice, `sim::cache`) keeps it.
     pub fn hops_into(&self, buf: &mut Vec<PathHop>) {
         buf.clear();
+        let amount = |h: &PathHop| if h.amount > 0 { h.amount } else { self.bytes };
         buf.extend(self.read.hops.iter().map(|h| PathHop {
-            amount: self.bytes,
+            amount: amount(h),
             ..*h
         }));
         if let Some(last) = buf.last_mut() {
@@ -580,7 +584,7 @@ impl TransferChunk {
         }
         let first = buf.len();
         buf.extend(self.write.hops.iter().map(|h| PathHop {
-            amount: self.bytes,
+            amount: amount(h),
             ..*h
         }));
         // A pool crossed after the read half's last hop ends with the

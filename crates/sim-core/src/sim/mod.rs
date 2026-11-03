@@ -357,6 +357,9 @@ pub struct Sim {
     cache_of: Vec<Option<(usize, usize)>>,
     /// Per cache: the DMA engine whose route halves carry write-backs.
     cache_wb: Vec<PeId>,
+    /// The read halves of a read miss, by (engine, channel block, slice
+    /// block): the channel's read half with the slice's fill and read-out.
+    miss_reads: HashMap<(PeId, usize, usize), Rc<crate::profile::Half>>,
     /// The hops of the transfer chunk being reserved (kept across chunks).
     hop_buf: Vec<PathHop>,
 
@@ -444,6 +447,7 @@ impl Sim {
             caches: Vec::new(),
             cache_of: Vec::new(),
             cache_wb: Vec::new(),
+            miss_reads: HashMap::new(),
             hop_buf: Vec::new(),
             hashes: Vec::new(),
             profiles,

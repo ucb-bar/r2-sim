@@ -6,8 +6,15 @@
 //! order and a dirty bit per line; its capacity is its bank's bytes / L.
 //!
 //! The bookkeeping runs when a DMA's chunks are built (before its issue):
-//! a chunk whose source is in the DRAM reads the slice on a hit and the
-//! channel on a miss (the line becomes resident and clean); a chunk whose
+//! a chunk whose source is in the DRAM reads the slice on a hit; on a miss
+//! it reads the channel, fills the line into the slice (the line's bytes on
+//! the slice's write port) and reads the chunk's bytes out of the slice
+//! (its read port), with no latency added: the two slice hops follow the
+//! channel's port in the chunk's path, in the chunk's beat chain (the line
+//! becomes resident and clean). The device's fabric puts a slice beside the
+//! route between a channel and a reader, not on it (on rtx6000.yaml the L2
+//! slices and the GDDR7 channels are behind two links of the device bus),
+//! so the miss charges no fabric hop of the slice. A chunk whose
 //! destination is in the DRAM writes the slice (write-allocate without a
 //! fetch; the line is resident and dirty). A new line in a full slice
 //! evicts the slice's LRU line; a dirty victim adds a write-back chunk of
@@ -15,7 +22,7 @@
 //! over the device's fabric (the route halves of the cache owner's DMA
 //! engine). A program's `cache_flush` empties every cache with no traffic.
 //!
-//! Not modeled: the fill write into the slice on a miss; sectors (32 B);
+//! Not modeled: sectors (32 B: a miss fills the whole line);
 //! set associativity and the slice hash; hit-under-miss (a read that hits
 //! a line still being filled reads the slice at once); replacement other
 //! than LRU; the write-back buffer (a write-back is a chunk of the
@@ -27,7 +34,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use crate::profile::{Args, Chunk, Descriptor, Half, PeId, Profile, TransferChunk};
-use crate::resource::Dir;
+use crate::resource::{Dir, PathHop};
 use crate::time::Cycle;
 use crate::tracer::RouteUse;
 
@@ -63,6 +70,8 @@ pub struct CacheCounts {
     pub write_allocs: u64,
     /// Lines made resident (read misses and write allocations).
     pub allocs: u64,
+    /// Bytes filled into the slices by read misses (a line each).
+    pub fill_bytes: u64,
     pub clean_evictions: u64,
     pub dirty_evictions: u64,
     pub writeback_bytes: u64,
@@ -150,6 +159,7 @@ impl Cache {
             self.counts.write_allocs += 1;
         } else {
             self.counts.read_misses += 1;
+            self.counts.fill_bytes += self.cfg.line;
         }
         self.counts.allocs += 1;
         let mut victim = None;
@@ -220,6 +230,7 @@ impl super::Sim {
     pub(super) fn setup_caches(&mut self) {
         self.cache_of = vec![None; self.memories.len()];
         self.cache_wb.clear();
+        self.miss_reads.clear();
         for (ci, c) in self.caches.iter().enumerate() {
             for (k, &b) in c.cfg.channels.iter().enumerate() {
                 self.cache_of[b] = Some((ci, k));
@@ -336,6 +347,10 @@ impl super::Sim {
                         }
                     }
                 }
+                if !a.hit {
+                    let sb = self.caches[ci].cfg.slices[a.slice];
+                    t.read = self.miss_read(pe, &t.read, sa, sb, line);
+                }
                 wbs.extend(self.writeback(ci, a.slice, a.victim, t.beat, c.rate));
             }
             if let Some((ci, ch)) = self.cached(da) {
@@ -353,6 +368,50 @@ impl super::Sim {
         }
         prof.chunks = out;
         Ok(())
+    }
+
+    /// The read half of a read miss at `addr` on engine `pe`: the channel's
+    /// read half `channel` with, after the channel's port, the fill of the
+    /// `line` bytes into slice block `slice` (its write port) and the
+    /// read-out of the chunk's bytes (its read port). The channel port's
+    /// latency to the route moves to the read-out, so the path keeps its
+    /// latency.
+    fn miss_read(
+        &mut self,
+        pe: PeId,
+        channel: &Rc<Half>,
+        addr: u64,
+        slice: usize,
+        line: u64,
+    ) -> Rc<Half> {
+        let (cb, _) = self.routes.locate(addr).expect("a cached address");
+        if let Some(h) = self.miss_reads.get(&(pe, cb, slice)) {
+            return Rc::clone(h);
+        }
+        let m = &self.memories[slice];
+        let mut hops: Vec<PathHop> = channel.hops.to_vec();
+        let lead = std::mem::take(&mut hops[0].latency);
+        let fill = PathHop {
+            resource: m.port_for(Dir::Write),
+            amount: line,
+            dir: Dir::Write,
+            latency: 0,
+            pool: None,
+        };
+        let out = PathHop {
+            resource: m.port_for(Dir::Read),
+            amount: 0,
+            dir: Dir::Read,
+            latency: lead,
+            pool: None,
+        };
+        hops.splice(1..1, [fill, out]);
+        let h = Rc::new(Half {
+            hops: hops.into(),
+            ..(**channel).clone()
+        });
+        self.miss_reads.insert((pe, cb, slice), Rc::clone(&h));
+        h
     }
 
     /// The write-back chunk of a dirty `victim` (line, dirty) of slice

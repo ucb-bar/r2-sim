@@ -9,6 +9,11 @@ use sim_core::{build_config, Args, Built, Descriptor, NuCtx, ProfileRegistry, St
 const LINE: u64 = 256;
 
 fn built() -> Built {
+    built_with("")
+}
+
+/// [`built`] with the YAML `set` list `sets` (empty: none).
+fn built_with(sets: &str) -> Built {
     let text = "global:
   neutrino_granule: 512
   address: {fields: [{name: sm, bits: 2}], offset_bits: 24}
@@ -27,8 +32,10 @@ device:
   compute:
     - {name: dma, type: dma, latency: 4, master: [$this.sbus]}
   neutrino: {c_invoke: 0, c_base: 0, c_dep: 0, c_word: 0}
-";
-    build_config(text, ProfileRegistry::with_builtins()).expect("config")
+"
+    .to_string()
+        + sets;
+    build_config(&text, ProfileRegistry::with_builtins()).expect("config")
 }
 
 /// One step of a program: a store of `lines` lines from `buf` into DRAM
@@ -43,7 +50,11 @@ enum Step {
 /// Runs `steps` in order on the root's DMA engine, each after the one
 /// before ends.
 fn run(steps: &[Step]) -> Stats {
-    let b = built();
+    run_on(built(), steps)
+}
+
+/// [`run`] on `b`.
+fn run_on(b: Built, steps: &[Step]) -> Stats {
     let root = b.nu("root");
     let (hbm, buf) = (b.memory("root.hbm").base, b.memory("root.buf").base);
     let (dma, pe) = (b.sim.profiles().lookup("dma").unwrap(), b.pe("root.dma"));
@@ -136,9 +147,12 @@ fn a_new_line_evicts_the_least_recently_used_one() {
     assert_eq!((k.read_hits, k.read_misses), (2, 18));
     assert_eq!((k.clean_evictions, k.dirty_evictions), (3, 0));
     // The 16 first reads come from the channel, the two hits from the
-    // slice, the misses of lines 1 and 2 from the channel again.
+    // slice, the misses of lines 1 and 2 from the channel again. The slice
+    // (one port for both directions) carries the two hits, the store, and
+    // per miss the fill of the line and its read-out.
     assert_eq!(bytes(&s, "root.hbm.b0.port"), 18 * LINE);
-    assert_eq!(bytes(&s, "root.l2.b0.port"), (2 + 1) * LINE);
+    assert_eq!(bytes(&s, "root.l2.b0.port"), (2 + 1 + 2 * 18) * LINE);
+    assert_eq!(k.fill_bytes, 18 * LINE);
 }
 
 #[test]
@@ -186,4 +200,32 @@ fn a_2d_copy_through_the_cache_stops_the_run() {
         ))
     );
     assert_eq!(f.gid, Some(0));
+}
+
+#[test]
+fn a_read_miss_fills_the_slice_and_reads_it_out_in_the_same_time() {
+    // The slices with a write port (wr_bytes): a miss of one line charges
+    // the channel's port, the slice's write port with the fill of the line
+    // and its read port with the read-out; the hit that follows charges
+    // the slice's read port only. The miss keeps its time: the slice's
+    // hops follow the channel's port at the same rate with no latency
+    // (the chunk [54, 58), the task complete at 62, as without them).
+    let b = built_with("set:\n  - \"root.l2.wr_bytes=64\"\n");
+    let s = run_on(b, &[Step::Read(0, 1)]);
+    assert_eq!(bytes(&s, "root.hbm.b0.port"), LINE);
+    assert_eq!(bytes(&s, "root.l2.b0.wport"), LINE);
+    assert_eq!(bytes(&s, "root.l2.b0.port"), LINE);
+    let t = &s.tasks[0];
+    assert_eq!(
+        (t.chunks[0].start, t.chunks[0].end, t.complete),
+        (54, 58, Some(62))
+    );
+    let k = s.caches[0].counts;
+    assert_eq!((k.read_misses, k.fill_bytes), (1, LINE));
+    let b = built_with("set:\n  - \"root.l2.wr_bytes=64\"\n");
+    let s = run_on(b, &[Step::Read(0, 1), Step::Read(0, 1)]);
+    assert_eq!(bytes(&s, "root.hbm.b0.port"), LINE);
+    assert_eq!(bytes(&s, "root.l2.b0.wport"), LINE);
+    assert_eq!(bytes(&s, "root.l2.b0.port"), 2 * LINE);
+    assert_eq!(s.caches[0].counts.read_hits, 1);
 }
