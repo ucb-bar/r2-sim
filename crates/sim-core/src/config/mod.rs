@@ -205,7 +205,7 @@ pub enum PeParams {
         /// Latency of every chunk (r2sim spec Section 5.9).
         latency: Cycle,
         /// Chunk size of every transfer (a transaction of the fabric);
-        /// `None`: the descriptor's `tile_bytes`.
+        /// `None`: no limit (a transfer is one chunk).
         burst: Option<u64>,
         /// Data width in bytes: the engine moves at most one beat per
         /// cycle, the start of a transfer's narrowing chain (r2sim spec Section 5.6).
@@ -239,9 +239,13 @@ pub enum PeParams {
         smem_wport: Option<ResourceId>,
         /// Efficiency of the array, in (0, 1].
         utilization: Ratio,
-        /// Pad m and n of every chunk to the descriptor's tile shape for
-        /// tensor ops and operand bytes (K exact): a 51-token row costs a
-        /// full 128-row tile. False counts the exact shape.
+        /// The output tile `[rows, columns]` (key `tile`, default [128,
+        /// 128]): a matmul has one chunk per output tile, and a split
+        /// operand has its halves per tile.
+        tile: [u64; 2],
+        /// Pad m and n of every chunk to the tile shape for tensor ops and
+        /// operand bytes (K exact): a 51-token row costs a full 128-row
+        /// tile. False counts the exact shape.
         quantize: bool,
         /// Keep the A row panel across the output tiles of a row (r2sim
         /// spec Section 6.2): A is read from SMEM once per row panel instead of
@@ -302,8 +306,8 @@ pub struct MemBlock {
     /// The block's attachments to the buses it is a slave on; fabric
     /// routes to it end at one of them (none: no fabric, an empty route).
     pub attach: Vec<crate::topology::AttachId>,
-    /// False in a `null`-fidelity subtree: the Numeric backend drops writes
-    /// and rejects reads.
+    /// False in a `null`-fidelity subtree: the store keeps no data there
+    /// (writes are dropped and reads are errors).
     pub numeric: bool,
     /// The block's contiguous range.
     pub range: Range,

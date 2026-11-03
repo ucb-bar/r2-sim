@@ -67,6 +67,11 @@ class Registry:
         self.functions[kernel.name](Task(plane, desc, kernel), args)
 
 
+def opaque(t: Task, a: dict) -> None:
+    """Kernel 0: a task with a time and no data; it writes nothing (both
+    providers)."""
+
+
 class Task:
     """The memory access of one Muon task, by the names of its kernel; the
     arrays are those of the plane's provider."""

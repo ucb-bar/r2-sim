@@ -207,7 +207,6 @@ fn a_dma_from_the_linear_gddr7_is_cut_at_the_hash_granule() {
                     src: Addr(hbm + i * T),
                     dst: Addr(dst),
                     bytes: T,
-                    tile_bytes: T,
                     rows: None,
                 },
             }
@@ -293,7 +292,6 @@ fn two_matmuls(units: [&str; 2]) -> [u64; 2] {
                 out_dtype: Dtype::Bf16,
                 accumulate: false,
                 keep: false,
-                tile: [128, 128],
                 transpose_b: false,
             },
         })

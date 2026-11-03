@@ -66,7 +66,6 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
             out_dtype: Dtype::Bf16,
             accumulate: false,
             keep: false,
-            tile: [64, 64],
             transpose_b: false,
         },
     }
@@ -119,19 +118,19 @@ fn descriptor_assembly_precedes_each_invoke() {
     // forwarded_invoke_with_a_dep_back_on_the_invoker with the default
     // descriptor costs on sm0 (c_base 8, c_dep 3, c_word 1), charged on
     // sm0's scalar before each c_invoke 8:
-    // * P0 (no deps; 24 + 72 = 96 B = 12 words): c_desc 8 + 12 = 20,
-    //   [0, 20), then c_invoke [20, 28); P0 runs [28, 220), completes 224.
-    // * M (one dep; 104 B = 13 words): c_desc 8 + 3 + 13 = 24, [28, 52),
-    //   then c_invoke [52, 60): queued and sent at 60. Its path as before
-    //   (32 cycles, 2 message beats): M enters sm1's scoreboard at 92; its
-    //   Await to sm0 arrives 118, before P0 completes (Registered).
+    // * P0 (no deps; 24 + 40 = 64 B = 8 words): c_desc 8 + 8 = 16,
+    //   [0, 16), then c_invoke [16, 24); P0 runs [24, 216), completes 220.
+    // * M (one dep; 72 B = 9 words): c_desc 8 + 3 + 9 = 20, [24, 44),
+    //   then c_invoke [44, 52): queued and sent at 52. Its path as before
+    //   (32 cycles, 2 message beats): M enters sm1's scoreboard at 84; its
+    //   Await to sm0 arrives 110, before P0 completes (Registered).
     // * A bridge (capacity 1/2 at the 64 B message beat) has its slot at
-    //   odd cycles. Resolve(A) leaves sm0 at 224 and waits for the slot at
-    //   225: sm0's up bridge [225, 226) + 10, the crossbar ports
-    //   [236, 238), sm1's down bridge [238, 240) + 10: it arrives 250. M
-    //   runs [250, 442), completes 446; Resolve(M) takes sm1's up bridge,
+    //   odd cycles. Resolve(A) leaves sm0 at 220 and waits for the slot at
+    //   221: sm0's up bridge [221, 222) + 10, the crossbar ports
+    //   [232, 234), sm1's down bridge [234, 236) + 10: it arrives 246. M
+    //   runs [246, 438), completes 442; Resolve(M) takes sm1's up bridge,
     //   the ports and sm0's down bridge as before: for sm0's wait it
-    //   arrives 472.
+    //   arrives 468.
     let b = two_sm(&[
         "root.gpc0.sm0.neutrino.c_base=8",
         "root.gpc0.sm0.neutrino.c_dep=3",
@@ -142,31 +141,31 @@ fn descriptor_assembly_precedes_each_invoke() {
     let c = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
     let p0 = matmul(&b, "root.gpc0.sm0.atlas", a, vec![]);
     let m = matmul(&b, "root.gpc0.sm1.atlas", c, vec![v1(a)]).with_inferred_version(1);
-    assert_eq!((p0.wire_bytes(), m.wire_bytes()), (96, 104));
+    assert_eq!((p0.wire_bytes(), m.wire_bytes()), (64, 72));
     let mut sim = b.sim;
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.invoke(p0).await;
-        assert_eq!(ctx.now(), 28);
+        assert_eq!(ctx.now(), 24);
         let h = ctx.invoke(m).await;
-        assert_eq!(ctx.now(), 60, "the invoke returns once queued");
+        assert_eq!(ctx.now(), 52, "the invoke returns once queued");
         ctx.wait(h.addr, 1).await;
-        assert_eq!(ctx.now(), 472);
+        assert_eq!(ctx.now(), 468);
     });
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let (tp, tm) = (&s.tasks[0], &s.tasks[1]);
-    assert_eq!((tp.invoke, tp.complete), (28, Some(224)));
-    assert_eq!(tm.invoke, 92);
-    assert_eq!(tm.ready, Some(250));
-    assert_eq!((tm.chunks[0].start, tm.chunks[0].end), (250, 442));
-    assert_eq!(s.end_time, 472);
-    // sm0's scalar: 20 + 8 + 24 + 8 + c_wait 2.
+    assert_eq!((tp.invoke, tp.complete), (24, Some(220)));
+    assert_eq!(tm.invoke, 84);
+    assert_eq!(tm.ready, Some(246));
+    assert_eq!((tm.chunks[0].start, tm.chunks[0].end), (246, 438));
+    assert_eq!(s.end_time, 468);
+    // sm0's scalar: 16 + 8 + 20 + 8 + c_wait 2.
     let scalar = s
         .resources
         .iter()
         .find(|r| r.name == "root.gpc0.sm0.scalar")
         .unwrap();
-    assert_eq!(scalar.busy_cycles, 62);
+    assert_eq!(scalar.busy_cycles, 54);
 }
 
 #[test]
@@ -227,8 +226,9 @@ fn forwarded_invoke_of_a_matmul_on_the_invokers_atlas_is_fatal() {
     let s = sim.run();
     let f = s.fatal.expect("fatal");
     assert!(matches!(f.error, FatalError::Invalid(_)));
-    // The Invoke (72 B, 2 beats) sent at 8 arrives at 40.
-    assert_eq!((f.nu, f.time), (sm1, 40), "at the owner, on arrival");
+    // The Invoke (64 B: the header and the 40 bytes of a matmul's
+    // arguments; 1 beat) sent at 8 arrives at 34.
+    assert_eq!((f.nu, f.time), (sm1, 34), "at the owner, on arrival");
 }
 
 #[test]
@@ -258,7 +258,6 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
             src: Addr(src),
             dst: Addr(dst),
             bytes: 8192,
-            tile_bytes: 8192,
             rows: None,
         },
     };
@@ -270,21 +269,20 @@ fn forwarded_invoke_of_a_dma_pulling_from_the_invoker() {
     let s = sim.run();
     assert_eq!(s.fatal, None);
     let t = &s.tasks[0];
-    // The Invoke (72 B: the header and the 48 bytes of a DMA's arguments;
-    // 2 beats of 64 B, each hop one cycle per beat more than for 1 beat)
-    // arrives at sm1 at 40 and issues; the request's trip from sm1's
-    // engine to sm0's SMEM (sm1's bridge up and sm0's bridge down, 10
-    // each; 2026-10-21), sm0's SMEM latency 10 (the pipeline fill) and the
-    // engine latency 100: the hops in route order from 170, at the
-    // engine's 64 B beat narrowed by each hop: sm0's SMEM port [170, 298);
-    // sm0's bridge up (32 B/cycle) [170, 426), latency 10; the crossbar
-    // ports and sm1's bridge down narrowed to 32, [180, 436), latency 10;
-    // sm1's SMEM port [190, 446). Complete 450; Resolve arrives at sm0 at
-    // 476.
-    assert_eq!(t.invoke, 40);
-    assert_eq!((t.chunks[0].start, t.chunks[0].end), (170, 446));
-    assert_eq!(t.complete, Some(450));
-    assert_eq!(s.end_time, 476);
+    // The Invoke (56 B: the header and the 32 bytes of a DMA's arguments;
+    // 1 beat of 64 B) arrives at sm1 at 34 and issues; the request's trip
+    // from sm1's engine to sm0's SMEM (sm1's bridge up and sm0's bridge
+    // down, 10 each; 2026-10-21), sm0's SMEM latency 10 (the pipeline
+    // fill) and the engine latency 100: the hops in route order from 164,
+    // at the engine's 64 B beat narrowed by each hop: sm0's SMEM port
+    // [164, 292); sm0's bridge up (32 B/cycle) [164, 420), latency 10; the
+    // crossbar ports and sm1's bridge down narrowed to 32, [174, 430),
+    // latency 10; sm1's SMEM port [184, 440). Complete 444; Resolve arrives
+    // at sm0 at 470.
+    assert_eq!(t.invoke, 34);
+    assert_eq!((t.chunks[0].start, t.chunks[0].end), (164, 440));
+    assert_eq!(t.complete, Some(444));
+    assert_eq!(s.end_time, 470);
 }
 
 #[test]
@@ -362,7 +360,6 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
             src: Addr(x.base),
             dst: Addr(h.base),
             bytes: MAT,
-            tile_bytes: MAT,
             rows: None,
         },
     };
@@ -379,51 +376,53 @@ fn an_await_from_a_third_neutrino_before_the_producers_invoke_binds() {
     assert!(s.unfinished.is_empty() && s.open_pending.is_empty());
     let (tc, tp) = (&s.tasks[0], &s.tasks[1]);
     assert_eq!((tc.nu, tp.nu), (dev, sm1));
-    // C (80 B: the header, a key and the 48 bytes of a DMA's arguments; 2
-    // beats) is sent at 8 and enters the device at 48 (sm0's up bridge 4 +
-    // 10, two crossbar ports of 2, the cluster bridge 2 + 20); its Await
-    // for (X, 1) reaches sm1 at 83 (the cluster bridge 1 + 20, two ports,
-    // sm1's down bridge 2 + 10) and waits on a pending entry. P
-    // (72 B, 2 beats) is invoked at [208, 216) and enters sm1 at 248,
-    // adopting the entry; it runs [248, 440) and completes at 444. Resolve
-    // reaches the device at 479: C is ready. C's DMA: the request's trip
-    // from the device's engine to sm1's SMEM (the cluster bridge down 20
-    // and sm1's bridge down 10: 30; 2026-10-21), sm1's SMEM latency 10
-    // (the pipeline fill) and the engine latency 100, its first hop (sm1's
-    // SMEM port) at 619; 8 KiB at 32 B/cycle on sm1's bridge up from 619,
-    // then the crossbar ports and the cluster bridge narrowed to 32 from
-    // 629 and the HBM port from 649, to 905; complete 909; Resolve reaches
-    // sm0's wait at 944.
-    assert_eq!((tc.invoke, tp.invoke), (48, 248));
-    assert_eq!((tp.complete, tc.ready), (Some(444), Some(479)));
+    // C (64 B: the header, a key and the 32 bytes of a DMA's arguments; 1
+    // beat) is sent at 8 and enters the device at 43 (sm0's up bridge 2 +
+    // 10, two crossbar ports of 1, the cluster bridge 1 + 20); its Await
+    // for (X, 1) reaches sm1 at 78 (the cluster bridge 1 + 20, two ports,
+    // sm1's down bridge 2 + 10) and waits on a pending entry. P (64 B, 1
+    // beat) is invoked at [208, 216) and enters sm1 at 242, adopting the
+    // entry; it runs [242, 434) and completes at 438. Resolve reaches the
+    // device at 473: C is ready. C's DMA: the request's trip from the
+    // device's engine to sm1's SMEM (the cluster bridge down 20 and sm1's
+    // bridge down 10: 30; 2026-10-21), sm1's SMEM latency 10 (the pipeline
+    // fill) and the engine latency 100, its first hop (sm1's SMEM port) at
+    // 613; 8 KiB at 32 B/cycle on sm1's bridge up from 613, then the
+    // crossbar ports and the cluster bridge narrowed to 32 from 623 and
+    // the HBM port from 643, to 899; complete 903; Resolve reaches sm0's
+    // wait at 938.
+    assert_eq!((tc.invoke, tp.invoke), (43, 242));
+    assert_eq!((tp.complete, tc.ready), (Some(438), Some(473)));
     assert_eq!(
         (tc.chunks[0].start, tc.chunks[0].end, tc.complete),
-        (619, 905, Some(909))
+        (613, 899, Some(903))
     );
-    assert_eq!(s.end_time, 944);
+    assert_eq!(s.end_time, 938);
 }
 
 #[test]
 fn backpressure_holds_invokes_across_two_hops() {
     // sm1: one scoreboard entry, one inbound invoke table entry. P1 runs
     // [8,200); P2 holds the scoreboard entry until it issues at 200. sm0
-    // forwards M1, M2 and M3 (72 B, 2 beats each) at 8, 16 and 24: M1 takes
+    // forwards M1, M2 and M3 (64 B, 1 beat each) at 8, 16 and 24: M1 takes
     // the inbound entry, M2 waits in the last stage (after sm1's down
     // bridge) and M3 in the stage before it (after the crossbar port to
     // sm1); no invoke is rejected. Stages hold one message each, from the
-    // start of the transmission into them until the message moves on.
+    // start of the transmission into them until the message moves on. A
+    // bridge moves half a 64 B beat per cycle on its slots: a beat takes 2
+    // cycles from an even cycle, 1 from an odd one.
     //
-    // M1: sm0's up bridge [8,12), in stage 1 at 22; port [22,24), stage 2
-    // at 24; port [24,26); sm1's down bridge [26,30) + 10: the inbound
-    // table at 40.
-    // M2: waits in sm0's source queue for stage 1 until 24 (M1 left it);
-    // [24,28), stage 1 at 38; [38,40); [40,42); [42,46) + 10: stage 4 at
-    // 56, where it waits for the inbound entry (held by M1 until 200).
-    // M3: waits for stage 1 until M2's transmission out of it ends at 40;
-    // [40,44), stage 1 at 54; [54,56), stage 2 at 56; [56,58) (M2 left
-    // stage 3 at 46), stage 3 at 58, where it waits for stage 4 (M2).
+    // M1: sm0's up bridge [8,10), in stage 1 at 20; port [20,21), stage 2
+    // at 21; port [21,22); sm1's down bridge [22,24) + 10: the inbound
+    // table at 34.
+    // M2: waits in sm0's source queue for stage 1 until 21 (M1 left it);
+    // [21,22), stage 1 at 32; [32,33); [33,34); [34,36) + 10: stage 4 at
+    // 46, where it waits for the inbound entry (held by M1 until 200).
+    // M3: waits for stage 1 until M2's transmission out of it ends at 33;
+    // [33,34), stage 1 at 44; [44,45), stage 2 at 45; [45,46) (M2 left
+    // stage 3 at 36), stage 3 at 46, where it waits for stage 4 (M2).
     // At 200 P2 issues and M1 enters the scoreboard: M2 moves into the
-    // inbound table, M3 takes stage 4 ([200,204) + 10, at 214) and waits
+    // inbound table, M3 takes stage 4 ([200,202) + 10, at 212) and waits
     // there for M2. At 392 M1 issues, M2 enters and M3 moves into the
     // table; at 584 M2 issues and M3 enters.
     let b = built_with(&["scoreboard=1", "inbound_invokes=1"]);
@@ -463,14 +462,14 @@ fn backpressure_holds_invokes_across_two_hops() {
             .find(|x| x.stage == name)
             .map_or(0, |x| x.hol_cycles)
     };
-    // Head-of-line cycles: the stage after sm1's down bridge M2 [56,200)
-    // and M3 [214,392); the stage after the port to sm1 M3 [58,200); none
-    // after the port from sm0; sm0's source queue M2 [16,24) and M3
-    // [24,40).
-    assert_eq!(hol("root.gpc0.sm1.smcbus_to_clcbus.ba.invoke"), 144 + 178);
-    assert_eq!(hol("root.gpc0.clcbus.sm1.smcbus_to_clcbus.out.invoke"), 142);
+    // Head-of-line cycles: the stage after sm1's down bridge M2 [46,200)
+    // and M3 [212,392); the stage after the port to sm1 M3 [46,200); none
+    // after the port from sm0; sm0's source queue M2 [16,21) and M3
+    // [24,33).
+    assert_eq!(hol("root.gpc0.sm1.smcbus_to_clcbus.ba.invoke"), 154 + 180);
+    assert_eq!(hol("root.gpc0.clcbus.sm1.smcbus_to_clcbus.out.invoke"), 154);
     assert_eq!(hol("root.gpc0.clcbus.sm0.smcbus_to_clcbus.in.invoke"), 0);
-    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 8 + 16);
+    assert_eq!(hol("root.gpc0.sm0.source.invoke"), 5 + 9);
 }
 
 #[test]

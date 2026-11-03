@@ -83,7 +83,7 @@ fn latency_atlas_and_muon() {
     // 4 KiB at 64 B/cycle is at least 64 cycles of data.
     assert!(data >= 64.0 && all >= data, "{r}");
     // A 64 x 64 x 64 bf16 matmul on a 4096 MAC/cycle array.
-    let r = micro(&["mode=\"atlas\"", "m=64", "n=64", "k=64", "tile=[64, 64]"]);
+    let r = micro(&["mode=\"atlas\"", "m=64", "n=64", "k=64"]);
     assert!(f(&r, "mac_per_cycle_per_sm") <= 4096.0);
     // 6400 lane-ops on a 64-lane Muon: at least 100 cycles.
     let r = micro(&["mode=\"muon\"", "lane_ops=6400", "bytes=1024"]);

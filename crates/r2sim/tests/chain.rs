@@ -1,4 +1,4 @@
-//! A chained matmul end to end on the Numeric backend: C (128 x 128) =
+//! A chained matmul end to end on the builtin backend: C (128 x 128) =
 //! A (128 x 1152) B (1152 x 128) in bf16 as 9 tasks of k = 128 on the
 //! Atlas of root.gpc0.sm0 (configs/2p-smem.yaml; A in SMEM bank 0, B and
 //! C in bank 1), the first without `accumulate`, all but the last with
@@ -108,6 +108,6 @@ fn a_chain_rounds_c_to_bf16_once() {
     // 2,814 of the 16,384 elements of C differ.
     let differ = once.iter().zip(&each).filter(|(x, y)| x != y).count();
     assert!(differ > 1000, "the data tell a per-task rounding: {differ}");
-    let numeric = |s: &mut Sim| s.set_functional(Box::new(func::Numeric::new()));
-    assert_eq!(chain(numeric), once);
+    let builtin = |s: &mut Sim| s.set_functional(Box::new(func::Builtin::new()));
+    assert_eq!(chain(builtin), once);
 }

@@ -75,7 +75,6 @@ fn run_some(b: Built, dma: bool, store: bool) -> (u64, Stats) {
             src: Addr(hbm),
             dst: Addr(smem),
             bytes: 4096,
-            tile_bytes: 4096,
             rows: None,
         },
     };

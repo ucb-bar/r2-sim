@@ -21,7 +21,7 @@ fn another_abi_version_is_an_error() {
         let set: extern "C" fn(u32) = std::mem::transmute(f);
         set(2);
     }
-    let e = Plugin::open("test", lib.to_str().unwrap(), "{}", vec![])
+    let e = Plugin::open("test", lib.to_str().unwrap(), "{}", vec![], &[])
         .err()
         .unwrap();
     assert!(e.ends_with("ABI version 2, r2-sim has 1"), "{e}");

@@ -79,7 +79,6 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
             out_dtype: Dtype::Bf16,
             accumulate: false,
             keep: false,
-            tile: [64, 64],
             transpose_b: false,
         },
     }
@@ -383,7 +382,6 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
             src: Addr(src),
             dst: Addr(dst),
             bytes: 8192,
-            tile_bytes: 8192,
             rows: None,
         },
     };
@@ -436,7 +434,7 @@ fn remote_load_charges_the_path_twice_in_latency() {
     let sm0 = b.nu("root.gpc0.sm0");
     let src = b.memory("root.gpc0.sm1.smem").base;
     let mut sim = b.sim;
-    sim.set_functional(Box::new(func::Numeric::new()));
+    sim.set_functional(Box::new(func::Builtin::new()));
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         let v = ctx.load(Addr(src), 64).await;
         assert_eq!(v, vec![0; 64]);
@@ -472,7 +470,7 @@ fn remote_load_race_check_reads_the_owners_tables() {
     let x = Range::from_len(b.memory("root.gpc0.sm1.smem").base, MAT);
     let p = matmul(&b, "root.gpc0.sm1.atlas", x, vec![]);
     let mut sim = b.sim;
-    sim.set_functional(Box::new(func::Numeric::new()));
+    sim.set_functional(Box::new(func::Builtin::new()));
     sim.spawn(sm1, move |ctx: NuCtx| async move {
         ctx.invoke(p).await;
     });
@@ -520,7 +518,7 @@ fn null_fidelity_rejects_a_load() {
     let sm0 = b.nu("root.gpc0.sm0");
     let src = b.memory("root.gpc0.sm1.smem").base;
     let mut sim = b.sim;
-    sim.set_functional(Box::new(func::Numeric::new()));
+    sim.set_functional(Box::new(func::Builtin::new()));
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.load(Addr(src), 64).await;
     });

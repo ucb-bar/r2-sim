@@ -84,7 +84,7 @@ fn the_three_level_dump() {
             "--program",
             "rv",
             "--functional",
-            "numeric",
+            "builtin",
             "--image",
             image.to_str().unwrap(),
         ],
@@ -94,18 +94,18 @@ fn the_three_level_dump() {
     let images = m["images"].as_array().unwrap();
     let want = [
         (
-            832,
-            "d589e2925d3816b350948b7906248764b9e2c4e66ca16d9aaca6590ae3f6e928",
+            848,
+            "8cc9f73f886b153d768d792d934bc68dc338d30666db309596f1b14c8d34bda3",
             true,
         ),
         (
-            544,
-            "fc02dae9073e7fbfd593e54d0ab1b459d53630817fb42723e715a728b4d73a4b",
+            560,
+            "efa4858698d80443ce1869c1b0a10d07fd539ecca8c8475f766f8a5177b66572",
             false,
         ),
         (
-            224,
-            "aa7d49214e4e997949313589b152edd8b9b225acac78e8a5fbe2f6074e9fb711",
+            240,
+            "e6b1388e9ac0dd37125398bbb9536a39ab9183dccef13912356cc30722e91e11",
             false,
         ),
     ];
@@ -155,7 +155,7 @@ fn the_three_level_dump() {
     }
     assert_eq!(seen.len(), 11);
     // The pcs: the device's IMEM copies at 0x90 and spawns at 0xae, the
-    // matmuls at 0x88; the copies run on their node's instruction DMA.
+    // matmuls at 0x8c; the copies run on their node's instruction DMA.
     let opcodes: Vec<&str> = m["opcodes"]
         .as_array()
         .unwrap()
@@ -174,7 +174,7 @@ fn the_three_level_dump() {
         match (op, nu) {
             ("imem_copy", 0) => assert_eq!(pc, 0x90),
             ("spawn", 0) => assert_eq!(pc, 0xae),
-            ("atlas.matmul", _) => assert_eq!(pc, 0x88),
+            ("atlas.matmul", _) => assert_eq!(pc, 0x8c),
             _ => {}
         }
         if op == "imem_copy" {
@@ -239,7 +239,8 @@ fn a_rust_program_has_no_pc_image_or_images() {
 
 #[test]
 fn a_muon_task_of_an_rv_run_is_labelled_with_its_kernel_and_flags() {
-    // probe2: a 2D copy, a matmul and the kernel epilogue with BIAS.
+    // probe2: a 2D copy, a matmul, the kernel epilogue with BIAS and an
+    // opaque task.
     let d = dir("probe2");
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     std::fs::copy(
@@ -263,14 +264,15 @@ fn a_muon_task_of_an_rv_run_is_labelled_with_its_kernel_and_flags() {
             (ops[u16_at(t, 10) as usize], label)
         })
         .collect();
-    // epilogue (2) with BIAS (2) in the flags word; the others none.
+    // epilogue (2) with BIAS (2) in the flags word, then the opaque task
+    // (0); the others none.
     const BIAS: u64 = 2;
     assert_eq!(
         labels
             .iter()
             .filter(|l| l.0 == "muon.vector")
             .collect::<Vec<_>>(),
-        [&("muon.vector", 2 | BIAS << 32)]
+        [&("muon.vector", 2 | BIAS << 32), &("muon.vector", 0)]
     );
     assert!(labels
         .iter()

@@ -1,10 +1,9 @@
 //! Ticket flow (Neutrino spec Section 9.5) on configs/two_sm.yaml. Path timings as in
 //! `hierarchy.rs`: a message of b beats between the SMs arrives 20 + 6b
-//! cycles after it is sent when the path is free (a 72 B matmul
-//! descriptor: 2 beats, 32 cycles; `InvokeAck`, `RetryAck`, `Reject` and
-//! `PCrdGrant`: 1 beat, 26 cycles: sm1's up bridge 2 + 10, the two crossbar
-//! ports 1 + 1, sm0's down bridge 2 + 10); a 64^3 bf16 matmul takes 192
-//! cycles on smem.
+//! cycles after it is sent when the path is free (a 64 B matmul
+//! descriptor, `InvokeAck`, `RetryAck`, `Reject` and `PCrdGrant`: 1 beat,
+//! 26 cycles: sm1's up bridge 2 + 10, the two crossbar ports 1 + 1, sm0's
+//! down bridge 2 + 10); a 64^3 bf16 matmul takes 192 cycles on smem.
 
 use nu_model::{Addr, Dep, Range};
 use sim_core::{build_config_file, Args, Built, Descriptor, Dtype, NuCtx, ProfileRegistry};
@@ -63,7 +62,6 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>, label: u64) -> Descript
             out_dtype: Dtype::Bf16,
             accumulate: false,
             keep: false,
-            tile: [64, 64],
             transpose_b: false,
         },
     }
@@ -90,15 +88,15 @@ fn sm1_program(b: &Built, at: impl Fn(u64) -> Range) -> Program {
 
 #[test]
 fn one_ticket_on_a_full_inbound_table() {
-    // sm0 forwards M1 and M2 (2 beats each) at 8 and 16. M1 takes sm1's
-    // inbound entry at 40; its InvokeAck reaches sm0 at 66. M2 reaches sm1
-    // at 56 (as in backpressure_holds_invokes_across_two_hops): the table
-    // is full, so sm1 sets sm0's bit and answers RetryAck, at sm0 at 82
-    // (sm1's up bridge [56, 58) + 10, the ports [68, 70), sm0's down bridge
-    // [70, 72) + 10). At 200 P2 issues, M1 enters the scoreboard and its
+    // sm0 forwards M1 and M2 (1 beat each) at 8 and 16. M1 takes sm1's
+    // inbound entry at 34; its InvokeAck reaches sm0 at 60. M2 reaches sm1
+    // at 46 (as in backpressure_holds_invokes_across_two_hops): the table
+    // is full, so sm1 sets sm0's bit and answers RetryAck, at sm0 at 72
+    // (sm1's up bridge [47, 48) + 10, the ports [58, 60), sm0's down bridge
+    // [60, 62) + 10). At 200 P2 issues, M1 enters the scoreboard and its
     // inbound entry frees: sm1 reserves it and sends a PCrdGrant, at sm0 at
-    // 226. sm0 replays M2 with the ticket at 226; it arrives at 258, takes
-    // the reserved entry, and its InvokeAck reaches sm0 at 284. M1 issues
+    // 226. sm0 replays M2 with the ticket at 226; it arrives at 252, takes
+    // the reserved entry, and its InvokeAck reaches sm0 at 278. M1 issues
     // at 392 (the atlas is free); M2 enters the scoreboard then and issues
     // at 584. sm0 holds both requests from their sends to their acks.
     let b = built("ticket");
@@ -137,8 +135,8 @@ fn one_ticket_on_a_full_inbound_table() {
     assert_eq!(s.tickets[i0], 1);
     assert_eq!(s.ticket_rejects[i0], 0);
     assert_eq!(s.invoke_acks[i0], 2);
-    // The ticket from the RetryAck (82) to the replay (226).
-    assert_eq!(s.ticket_wait[i0], 226 - 82);
+    // The ticket from the RetryAck (72) to the replay (226).
+    assert_eq!(s.ticket_wait[i0], 226 - 72);
     assert_eq!(s.ticket_bitmap_peak[sm1.0 as usize], 1);
     assert_eq!(s.outbound_invoke_peak[i0], 2);
     assert_eq!(s.resends, 1);
@@ -147,7 +145,7 @@ fn one_ticket_on_a_full_inbound_table() {
 #[test]
 fn grants_go_round_robin_between_two_ticket_holders() {
     // sm0 forwards M1, M2, M3 at 8, 16, 24; gpc0 forwards N1 and N2
-    // after 30 cycles, so they reach sm1 after M1 (at 40) took the one
+    // after 30 cycles, so they reach sm1 after M1 (at 34) took the one
     // inbound entry. M2 sets sm0's bit and N1 gpc0's; M3 and N2 are
     // rejected behind them and replayed later. Each freed entry goes to the next set
     // bit after the last one granted: gpc0 (id 1), sm0 (id 2),
@@ -209,11 +207,13 @@ fn grants_go_round_robin_between_two_ticket_holders() {
 fn a_requester_sends_no_invoke_while_it_holds_a_ticket() {
     // As one_ticket_on_a_full_inbound_table, and at 124 sm0 forwards J, a
     // join on gpc0's sync memory (a free owner). Under ready/valid J
-    // leaves at once. Under ticket flow sm0 holds a ticket from 82 to 226,
+    // leaves at once. Under ticket flow sm0 holds a ticket from 72 to 226,
     // so J waits in its outbound invoke table: M2's replay takes sm0's up
-    // bridge [226, 230) and the stage after it until its transmission
-    // through the port from sm0 ends at 242; J follows it. J therefore
-    // reaches gpc0 242 - 124 = 118 cycles later than under ready/valid.
+    // bridge [226, 228) and the stage after it until its transmission
+    // through the port from sm0 ends at 239; J follows it. Its beat on
+    // sm0's bridge starts at an odd cycle there (1 cycle) and at the even
+    // cycle 124 under ready/valid (2 cycles). J therefore reaches gpc0
+    // 239 - 124 - 1 = 114 cycles later than under ready/valid.
     let run = |flow: &str| {
         let b = built(flow);
         let (sm0, sm1) = (b.nu("root.gpc0.sm0"), b.nu("root.gpc0.sm1"));
@@ -250,19 +250,19 @@ fn a_requester_sends_no_invoke_while_it_holds_a_ticket() {
     };
     let (rv, _) = run("readyvalid");
     let (tk, wait) = run("ticket");
-    assert_eq!(wait, 226 - 82);
-    assert_eq!(tk - rv, 242 - 124);
+    assert_eq!(wait, 226 - 72);
+    assert_eq!(tk - rv, 239 - 124 - 1);
 }
 
 #[test]
 fn a_request_in_flight_behind_the_ticket_is_rejected_and_replayed_in_order() {
     // sm0 forwards M1, M2, M3 at 8, 16, 24. M1 takes the inbound entry at
-    // 40; M2 at 56 gets the RetryAck (at sm0 at 82). M3 was sent before
-    // sm0 knew: it reaches sm1 at 72 (sm0's up bridge [40, 44), stage at
-    // 54; ports [54, 58); sm1's down bridge [58, 62) + 10) and is rejected
-    // (the Reject reaches sm0 at 98). At 82 sm0 marks M2 and M3 for replay.
+    // 34; M2 at 46 gets the RetryAck (at sm0 at 72). M3 was sent before
+    // sm0 knew: it reaches sm1 at 58 (sm0's up bridge [33, 34), stage at
+    // 44; ports [44, 46); sm1's down bridge [46, 48) + 10) and is rejected
+    // (the Reject reaches sm0 at 84). At 72 sm0 marks M2 and M3 for replay.
     // The first grant (sent at 200, at sm0 at 226) replays M2 (accepted at
-    // 258); M2 then holds the inbound entry until M1 issues at 392 and M2
+    // 252); M2 then holds the inbound entry until M1 issues at 392 and M2
     // enters the scoreboard; the second grant (at sm0 at 418) replays M3.
     // M3 enters the scoreboard when M2 issues at 584.
     let b = built("ticket");
@@ -294,8 +294,8 @@ fn a_request_in_flight_behind_the_ticket_is_rejected_and_replayed_in_order() {
     assert_eq!(s.resends, 2);
     assert_eq!(s.messages_by_kind.get("PCrdGrant"), Some(&2));
     assert_eq!(s.messages_by_kind.get("Invoke"), Some(&5));
-    // The ticket from the RetryAck (82) to the last replay (418).
-    assert_eq!(s.ticket_wait[i0], 418 - 82);
+    // The ticket from the RetryAck (72) to the last replay (418).
+    assert_eq!(s.ticket_wait[i0], 418 - 72);
     assert_eq!(s.ticket_bitmap_peak[sm1.0 as usize], 1);
 }
 
@@ -303,10 +303,10 @@ fn a_request_in_flight_behind_the_ticket_is_rejected_and_replayed_in_order() {
 fn an_outbound_entry_frees_on_its_invoke_ack() {
     // sm0 has one outbound invoke entry and sm1 has room. sm0 forwards M1
     // at 8 and M2 at 16. Under ready/valid M1's entry frees when M1 leaves
-    // sm0's source queue, and M2 reaches sm1 at 56 (it waits for the stage
+    // sm0's source queue, and M2 reaches sm1 at 46 (it waits for the stage
     // after sm0's up bridge, as in backpressure_holds_invokes_across_two_hops).
-    // Under ticket flow sm0 holds M1 until its InvokeAck arrives at 66: the
-    // program stalls from 16 to 66, and M2 arrives at 66 + 32 = 98.
+    // Under ticket flow sm0 holds M1 until its InvokeAck arrives at 60: the
+    // program stalls from 16 to 60, and M2 arrives at 60 + 26 = 86.
     let run = |flow: &str| {
         let b = built_with(flow, &["root.gpc0.sm0.neutrino.outbound_invokes=1"]);
         let sm0 = b.nu("root.gpc0.sm0");
@@ -334,10 +334,10 @@ fn an_outbound_entry_frees_on_its_invoke_ack() {
             s.outbound_invoke_peak[i0],
         )
     };
-    assert_eq!(run("readyvalid").0, (40, 56));
+    assert_eq!(run("readyvalid").0, (34, 46));
     let (t, stall, peak) = run("ticket");
-    assert_eq!(t, (40, 98));
-    assert_eq!(stall, 66 - 16);
+    assert_eq!(t, (34, 86));
+    assert_eq!(stall, 60 - 16);
     assert_eq!(peak, 1);
 }
 

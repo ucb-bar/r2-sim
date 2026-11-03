@@ -68,7 +68,7 @@ shape = [128, 128]
 
 
 def test_hello_with_each_backend(tmp_path):
-    """C = A @ B with the Numeric backend and with the Python plane."""
+    """C = A @ B with the builtin backend and with the Python plane."""
     rng = np.random.default_rng(2026)
     a = rng.standard_normal((128, 128)).astype(BF16)
     b = rng.standard_normal((128, 128)).astype(BF16)
@@ -97,7 +97,7 @@ shape = [128, 128]
 """
     )
     want = (a.astype(np.float32) @ b.astype(np.float32)).astype(BF16)
-    for backend in ["numeric", "python"]:
+    for backend in ["builtin", "python"]:
         out = tmp_path / f"{backend}.safetensors"
         subprocess.run(
             [str(r2sim()), "run", "--config", str(REPO / "configs/2p-smem.yaml"), "--program", "rv",
@@ -109,8 +109,8 @@ shape = [128, 128]
 
 
 def test_a_mixed_run_with_the_atlas_on_python(tmp_path):
-    """The numeric short form with the Atlas on the Python plug-in: the
-    DMAs on numeric, the matmul on python; C exact."""
+    """The builtin short form with the Atlas on the Python plug-in: the
+    DMAs on builtin, the matmul on python; C exact."""
     rng = np.random.default_rng(2026)
     a = rng.standard_normal((128, 128)).astype(BF16)
     b = rng.standard_normal((128, 128)).astype(BF16)
@@ -142,7 +142,7 @@ shape = [128, 128]
     timeline = tmp_path / "timeline.jsonl"
     subprocess.run(
         [str(r2sim()), "run", "--config", str(REPO / "configs/2p-smem.yaml"), "--program", "rv",
-         "--functional", "numeric", "--set", "functional.units.atlas=[python]",
+         "--functional", "builtin", "--set", "functional.units.atlas=[python]",
          "--image", str(tmp_path / "image.toml"), "--image-out", str(out),
          "--thread-timeline", str(timeline)],
         check=True, stdout=subprocess.DEVNULL,
@@ -151,8 +151,8 @@ shape = [128, 128]
     assert np.array_equal(load_file(str(out))["C"], want)
     applies = [json.loads(line) for line in timeline.read_text().splitlines()]
     used = [(r["op"], r["backend"]) for r in applies if r["state"] == "apply"]
-    assert used == [("dma", "numeric"), ("dma", "numeric"), ("matmul", "python"),
-                    ("dma", "numeric")]
+    assert used == [("dma", "builtin"), ("dma", "builtin"), ("matmul", "python"),
+                    ("dma", "builtin")]
 
 
 KERNELS_GEMM = """

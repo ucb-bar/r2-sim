@@ -1,14 +1,46 @@
-# The Muon kernel registry (functional plane per FU kind, 2026-10-30).
+# The Muon kernel registry (functional plane per FU kind, 2026-10-30;
+# kernel 0 and the time sections, 2026-11-02).
 #
-# One entry per kernel. Kernel 0 is the opaque task (a time, no data) and
-# is not listed. The fields of an argument block are in order, in C layout
-# with no implicit padding (each field starts where the one before it
-# ends, at a multiple of its size), and the block is a multiple of 8
-# bytes. Addresses are global byte addresses; `ld` values are in
-# elements. Element types: bf16 storage, fp32 arithmetic, round to nearest
-# even at each bf16 store, unless the semantics say otherwise. The time of
-# a task comes from its descriptor (ops, bytes_in, bytes_out, src), not
-# from this file.
+# One entry per kernel. Kernel 0 (`opaque`) is listed: a task that writes
+# nothing, whose argument block gives its time. The fields of an argument
+# block are in order, in C layout with no implicit padding (each field
+# starts where the one before it ends, at a multiple of its size), and the
+# block is a multiple of 8 bytes. Addresses are global byte addresses; `ld`
+# values are in elements. Element types: bf16 storage, fp32 arithmetic,
+# round to nearest even at each bf16 store, unless the semantics say
+# otherwise.
+#
+# `time` gives the traffic of a task from its block:
+# - `ops`: the lane operations, the sum of the terms. A term is an
+#   expression, or {expr, if: NAME} / {expr, unless: NAME}.
+# - `reads`, `writes`: per entry {field, bytes, if?, unless?}: `bytes`
+#   bytes read from (written to) the memory block that holds the address
+#   in the u64 field `field`; `dst` (or an address of 0) is the base of the
+#   task's destination range.
+# - An expression is a sum (+) of products (*) of integer literals and the
+#   u32 and u64 fields of the block. NAME is a flag of the kernel (a bit of
+#   its field `flags`) or an integer field of the block (true when not 0).
+# - An entry whose condition is false or whose bytes are 0 has no traffic.
+
+- id: 0
+  name: opaque
+  summary: a task with a time and no data
+  semantics: |
+    Writes nothing. The block gives the time of the task: ops lane
+    operations, bytes_in bytes read from src, bytes_out bytes written to
+    the destination.
+  fields:
+    - [src, u64, "read: the address that the task reads; 0: the destination"]
+    - [ops, u32, "the lane operations"]
+    - [bytes_in, u32, "the bytes read from src"]
+    - [bytes_out, u32, "the bytes written to the destination"]
+    - [reserved, u32, "0"]
+  time:
+    ops: [ops]
+    reads:
+      - {field: src, bytes: bytes_in}
+    writes:
+      - {field: dst, bytes: bytes_out}
 
 - id: 1
   name: row_stats
@@ -25,6 +57,13 @@
     - [cols, u32, "the columns of the chunk"]
     - [ld, u32, "the leading dimension of src"]
     - [count, u32, "the elements per row merged before this chunk; 0 for the first chunk"]
+  time:
+    ops: [rows * cols * 4]
+    reads:
+      - {field: src, bytes: rows * cols * 2}
+      - {field: stats, bytes: rows * 8, if: count}
+    writes:
+      - {field: stats, bytes: rows * 8}
 
 - id: 2
   name: epilogue
@@ -58,6 +97,21 @@
     - [k, u32, "the elements per row of the LayerNorm input; with NORM"]
     - [eps, f32, "the LayerNorm epsilon; with NORM"]
     - [flags, u32, "NORM, BIAS, RES, GELU_TANH, C_F32"]
+  time:
+    ops:
+      - {expr: rows * cols, if: BIAS}
+      - {expr: rows * cols, if: RES}
+      - {expr: rows * cols * 2, if: NORM}
+      - {expr: rows * cols * 8, if: GELU_TANH}
+    reads:
+      - {field: c, bytes: rows * cols * 2, unless: C_F32}
+      - {field: c, bytes: rows * cols * 4, if: C_F32}
+      - {field: res, bytes: rows * cols * 2, if: RES}
+      - {field: bias, bytes: cols * 4, if: BIAS}
+      - {field: u, bytes: cols * 4, if: NORM}
+      - {field: stats, bytes: rows * 8, if: NORM}
+    writes:
+      - {field: out, bytes: rows * cols * 2}
 
 - id: 3
   name: softmax_stats
@@ -73,6 +127,13 @@
     - [cols, u32, "the columns of one half"]
     - [ld, u32, "the leading dimension of s0 and s1"]
     - [scale, f32, "the attention scale"]
+  time:
+    ops: [rows * cols * 6]
+    reads:
+      - {field: s0, bytes: rows * cols * 2}
+      - {field: s1, bytes: rows * cols * 2}
+    writes:
+      - {field: stats, bytes: rows * 8}
 
 - id: 4
   name: softmax_apply
@@ -87,3 +148,10 @@
     - [cols, u32, "the columns"]
     - [ld, u32, "the leading dimension of src and dst"]
     - [scale, f32, "the same scale as softmax_stats"]
+  time:
+    ops: [rows * cols * 3]
+    reads:
+      - {field: src, bytes: rows * cols * 2}
+      - {field: stats, bytes: rows * 8}
+    writes:
+      - {field: dst, bytes: rows * cols * 2}

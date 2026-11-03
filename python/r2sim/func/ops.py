@@ -74,7 +74,7 @@ def read_matrix(plane: Plane, base: int, rows: int, cols: int, ld: int, dt: str)
 
 def matmul_operands(plane: Plane, desc: dict):
     """A (m x k) and B (k x n) in fp32, halves of split operands joined as
-    the Rust Numeric backend joins them."""
+    the Rust builtin backend joins them."""
     m, n, k = desc["m"], desc["n"], desc["k"]
     at, bt = desc["a_dtype"], desc["b_dtype"]
     tile = desc["tile"]

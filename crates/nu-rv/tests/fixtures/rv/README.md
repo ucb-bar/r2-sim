@@ -5,10 +5,10 @@ the IMEM of the root node, for `r2sim run --config CONFIG --program rv
 --image NAME.toml`. `hello.bin`, `three-level.bin` and `probe2.bin` run on
 configs/2p-smem.yaml, and `encoder.bin` runs on configs/2p.yaml. The
 golden check (`tools/golden.sh`) runs hello, three-level and the encoder.
-The images have ABI version 2: they were built by the r2-toolchain at its
-ABI version 2 (`r2-build --config CONFIG` in a copy of the example).
+The images have ABI version 3: they were built by the r2-toolchain at its
+ABI version 3 (`r2-build --config CONFIG` in a copy of the example).
 
-`hello.bin` (400 bytes) is a device program as an RV64 program: it loads
+`hello.bin` (392 bytes) is a device program as an RV64 program: it loads
 two tiles into the SMEM of an SM, multiplies them there and copies the
 product back. The image was built by the r2-toolchain
 (`r2-build --config configs/2p-smem.yaml`) from this source:
@@ -35,11 +35,11 @@ fn hello(_: &Args) {
 
 `N` is 128 and `BYTES` is `N * N * 2`: A and B are 128 x 128 bf16
 matrices. The image holds the trap word at offset 0, the start code at
-offset 4, the program, and its record at offset 0x148 (entry 0x2a, name
+offset 4, the program, and its record at offset 0x140 (entry 0x2a, name
 `hello`, node type `root`). The program expects A at `root.gpc0.hbm+0x0`
 and B at `root.gpc0.hbm+0x8000`, and writes C to `root.gpc0.hbm+0x10000`.
 
-`three-level.bin` (832 bytes) is a program on each level of the 2p
+`three-level.bin` (848 bytes) is a program on each level of the 2p
 hierarchy, built by the r2-toolchain from one crate. Each program is its
 own image; a parent embeds the image of each child program it starts.
 
@@ -90,13 +90,13 @@ fn device(_: &Args) {
 `TILE` is 128 x 128 x 2 bytes, and `TileArgs` and `FanoutArgs` hold one
 `k: u32`. `insn::spawn` invokes an IMEM_COPY of the child image (its
 record is the `copy` range) and then a SPAWN that depends on the copy.
-The records: `device` at offset 0x2f8 (node type `root`), and in the
-embedded images `gpc_fanout` (node type `gpc`, a 544-byte image at
+The records: `device` at offset 0x308 (node type `root`), and in the
+embedded images `gpc_fanout` (node type `gpc`, a 560-byte image at
 offset 0xd8 of the device image) and `sm_tile` (node type `sm`, a
-224-byte image at offset 0xf8 of the cluster image). Each record has
+240-byte image at offset 0xf8 of the cluster image). Each record has
 entry 0x2a.
 
-`encoder.bin` (16,496 bytes) is a vision encoder kernel (27 layers of
+`encoder.bin` (16,128 bytes) is a vision encoder kernel (27 layers of
 width 1152, 16 heads of 72, an FFN of 4304, three images of 256 patches,
 and a projector to a width of 2048), built by the r2-toolchain
 (`r2-build --config configs/2p.yaml`). Its Muon tasks run the kernels of
@@ -104,14 +104,14 @@ the registry (crates/sim-core/kernels.yaml): the LayerNorm statistics,
 the GEMM epilogues and the softmax. The `python` backend computes its
 values once a loader has put the weights and the images into the HBM: the
 loader and the comparison with a PyTorch model are in the r2-toolchain
-repository, examples/encoder/host. With the `null` or `trace` backend the
-run models time only, as before. It runs on configs/2p.yaml: the Atlas
+repository, examples/encoder/host. With the `null` backend (the default) the
+run models time only. It runs on configs/2p.yaml: the Atlas
 operands are in the tensor memory of each SM, and on configs/2p-smem.yaml
 the run stops with `Unowned`. The image holds every program of the
 kernel: the device program `encoder` (node type `root`, entry 0x2a)
 embeds the image of the cluster program `encoder_cluster` (node type
-`gpc`, entry 0x2ac, 16,176 bytes), which embeds the image of the SM
-program `encoder_step` (node type `sm`, entry 0x2822, 13,392 bytes). The
+`gpc`, entry 0x2ac, 15,808 bytes), which embeds the image of the SM
+program `encoder_step` (node type `sm`, entry 0x26f2, 13,024 bytes). The
 cluster image is at offset 248 of the device image, and the SM image at
 offset 2,696 of the cluster image (2,944 of the device image). The device
 starts `encoder_cluster` on each cluster. A cluster holds one half of the
@@ -123,16 +123,18 @@ the other half of each image from the HBM of the other cluster. A step
 program returns without waiting for its tasks, and the programs of the
 next step name the keys of those tasks.
 
-`probe2.bin` (392 bytes) has one task of each new descriptor form of ABI
-version 2 on root.gpc0.sm0: a 2D copy, a matmul with B transposed, and a
+`probe2.bin` (424 bytes) has one task of each descriptor form of ABI
+version 3 on root.gpc0.sm0: a 2D copy, a matmul with B transposed, a
 Muon task that runs the registry kernel `epilogue` (id 2, an 80-byte
-argument block) with the flag `BIAS`: out = bf16(C + bias). Its record is
-at offset 0x140 (entry 0x2a, name `probe2`, node type `root`). The
-argument block is the struct that the toolchain generates from the
-kernel registry (crates/sim-core/kernels.yaml). `trace` and `null` write
-nothing for a Muon kernel (the short form `--functional numeric` puts the
+argument block) with the flag `BIAS`: out = bf16(C + bias), and an opaque
+Muon task (kernel 0, its 24-byte block) that reads `out` (32 KiB, 16,384
+lane operations) and writes nothing; the program waits for version 2 of
+`out`. Its record is at offset 0x160 (entry 0x2a, name `probe2`, node type
+`root`). The argument blocks are the structs that the toolchain generates
+from the kernel registry (crates/sim-core/kernels.yaml). `null` writes
+nothing for a Muon task (the short form `--functional builtin` puts the
 Muon on `null`), the run stops with an error when the Muon's backend is
-`numeric` (`--set functional.units.muon=[numeric]`), and `python`
+`builtin` (`--set functional.units.muon=[builtin]`), and `python`
 computes the epilogue. Load A (128 rows of 128 bf16) at the HBM of gpc0,
 B ([128][72] bf16) at offset 0x8000 of the SMEM of root.gpc0.sm0, and the
 bias (128 fp32) at offset 0x100000 of the HBM; C is at SMEM offset
@@ -148,15 +150,12 @@ fn probe2(_: &Args) {
     let smem = sm::prefix(0, 0) | sm::SMEM;
     let (a, b, c, out) = (smem, smem + BYTES, smem + 2 * BYTES, smem + 3 * BYTES);
     let bias = dram + 0x10_0000;
-    // A 2D copy: 128 rows of 144 B at a pitch of 256 B
     let load = desc::dma2d(sm::PE_DMA, dst(a, BYTES), dram, a, 128, 144, 256, 144);
     unsafe { insn::invoke(load.addr()) };
-    // A matmul with B transposed (k = 72)
     let mm = desc::matmul(sm::PE_ATLAS, dst(c, BYTES), a, b, N, N, 72, desc::DT_BF16)
         .transpose_b()
         .with_deps([key(a, 1)]);
     unsafe { insn::invoke(mm.addr()) };
-    // The epilogue of C: out = bf16(C + bias)
     let ep = kernels::EpilogueArgs {
         c,
         out,
@@ -168,9 +167,17 @@ fn probe2(_: &Args) {
         flags: kernels::epilogue::BIAS,
         ..Default::default()
     };
-    let e = desc::muon(sm::PE_MUON, dst(out, BYTES), &ep, (N * N) as u64, BYTES, BYTES)
-        .with_deps([key(c, 1)]);
+    let e = desc::muon(sm::PE_MUON, dst(out, BYTES), &ep).with_deps([key(c, 1)]);
     unsafe { insn::invoke(e.addr()) };
-    insn::wait(key(out, 1));
+    let op = OpaqueArgs {
+        src: out,
+        ops: N * N,
+        bytes_in: BYTES as u32,
+        bytes_out: 0,
+        reserved: 0,
+    };
+    let o = desc::muon(sm::PE_MUON, dst(out, BYTES), &op).with_deps([key(out, 1)]);
+    unsafe { insn::invoke(o.addr()) };
+    insn::wait(key(out, 2));
 }
 ```

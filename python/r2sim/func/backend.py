@@ -24,6 +24,7 @@ from r2sim.func.memory import Block, FuncError, Memory, over
 from r2sim.func.plane import Plane
 
 NO_PE = 0xFFFFFFFF
+DEFAULT_TILE = (128, 128)
 
 
 class Backend:
@@ -37,6 +38,8 @@ class Backend:
                            config.get("device", "cpu"))
         self.pes = pes
         self.config = config
+        # The output tile of each PE's Atlas (the halves of split operands).
+        self.tiles = [list(t) for t in config.get("tiles", [])]
         # The pools of the thread that sets them (configure, then the
         # thread of the tasks).
         self.pools_of = None
@@ -60,6 +63,7 @@ class Backend:
         self.set_pools()
         d = decode(desc, self.plane.memory.granule, None if pe == NO_PE else pe)
         d["block"] = block
+        d["tile"] = self.tiles[pe] if pe < len(self.tiles) else list(DEFAULT_TILE)
         ops.task(self.plane, d)
 
 

@@ -22,7 +22,7 @@ fn u64_at(s: &[u8], o: usize) -> u64 {
 
 #[test]
 fn an_invoke_of_a_dma_built_with_stores_then_a_wait_and_a_load() {
-    // The program stores the 9 words of a DMA descriptor (gpc0's HBM to
+    // The program stores the 7 words of a DMA descriptor (gpc0's HBM to
     // sm0's SMEM, on sm0's engine) at scratch + 0x100, invokes it, waits
     // for version 1 of the SMEM range, and loads the first word of the
     // SMEM (another node's memory) into scratch + 0x210.
@@ -42,7 +42,9 @@ fn an_invoke_of_a_dma_built_with_stores_then_a_wait_and_a_load() {
             .map(|c| u64::from_le_bytes(c.try_into().unwrap())),
     );
     let mut code = vec![k(rv::T0, 0)];
-    for i in 0..9 {
+    let n = d.len() as i32 / 8;
+    assert_eq!(n, 7, "a 24-byte header and 32 bytes of arguments");
+    for i in 0..n {
         code.push(k(rv::T1, 3 + i));
         code.push(rv::sd(rv::T1, rv::T0, 8 * i));
     }
@@ -67,7 +69,8 @@ fn an_invoke_of_a_dma_built_with_stores_then_a_wait_and_a_load() {
         (t.opcode, t.dst),
         (OpcodeId::DMA, Range::from_len(SMEM, 4096))
     );
-    assert_eq!(t.pc, Some(4 + 4 * 19));
+    // The invoke follows the base load and the 7 load-store pairs.
+    assert_eq!(t.pc, Some(4 + 4 * 15));
     // A forwarded invoke returns 0; the load sees the DMA's data.
     assert_eq!(u64_at(&r.scratch, 0x200), 0);
     assert_eq!(u64_at(&r.scratch, 0x210), 0x1122_3344_5566_7788);
@@ -225,10 +228,7 @@ fn bad_descriptors_stop_the_run() {
 fn a_muon_kernel_outside_the_registry_names_the_pc_and_the_kernel() {
     let code = [k(rv::A0, 0), rv::invoke(rv::A0, rv::A0)];
     let consts = [SCRATCH + 0x100];
-    let mut args = common::words(&[100, 512, 256, 0]);
-    args.extend(7u32.to_le_bytes());
-    args.extend(24u32.to_le_bytes());
-    args.extend((SCRATCH + 0x300).to_le_bytes());
+    let args = common::vector_args(7, 24, SCRATCH + 0x300);
     let d = Desc {
         opcode: 4,
         pe: 0,
@@ -287,6 +287,6 @@ fn an_image_of_abi_version_1_is_an_error_that_names_the_version() {
     let r = common::run(&m, &[]);
     assert_eq!(
         common::fatal(&r),
-        "root: the program test has ABI version 1; r2-sim runs ABI version 2"
+        "root: the program test has ABI version 1; r2-sim runs ABI version 3"
     );
 }

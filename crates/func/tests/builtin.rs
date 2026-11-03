@@ -1,4 +1,4 @@
-use func::{bf16_to_f32, f32_to_bf16, Numeric};
+use func::{bf16_to_f32, f32_to_bf16, Builtin};
 use nu_model::{Addr, Range};
 use sim_core::{FunctionalBackend, MemBlock, ResourceId, Store};
 
@@ -15,9 +15,9 @@ fn bf16_rounds_to_nearest_even() {
     assert!(bf16_to_f32(f32_to_bf16(f32::NAN)).is_nan());
 }
 
-/// The Numeric backend and a store of one block, [1 MiB, 3 MiB), with the
+/// The builtin backend and a store of one block, [1 MiB, 3 MiB), with the
 /// sync-only space [2 MiB, 2 MiB + 64 KiB).
-fn numeric() -> (Numeric, Store) {
+fn builtin() -> (Builtin, Store) {
     let block = MemBlock::plain(
         "m".into(),
         nu_model::NeutrinoId(0),
@@ -26,7 +26,7 @@ fn numeric() -> (Numeric, Store) {
         0,
     );
     let store = Store::new(&[block], &[Range::new(0x20_0000, 0x21_0000)], 512).unwrap();
-    (Numeric::new(), store)
+    (Builtin::new(), store)
 }
 
 /// C = A x B for A 4 x 2 and B 2 x 4 (tile 2 x 2): once with each operand
@@ -44,7 +44,7 @@ fn a_split_operand_reads_its_halves() {
     let b: Vec<f32> = (1..=8).map(|x| (x * 10) as f32).collect();
     let (a, b) = (&a, &b);
     let run = |split: bool| -> Vec<u8> {
-        let (mut n, mut m) = numeric();
+        let (mut n, mut m) = builtin();
         let (pa, pa2, pb, pb2, pc) = (0x10_0000, 0x11_0000, 0x12_0000, 0x13_0000, 0x14_0000);
         if split {
             // Rows 0 and 2 (low halves of the two row tiles) at pa, 1 and 3
@@ -96,10 +96,10 @@ fn a_split_operand_reads_its_halves() {
                 out_dtype: Dtype::Bf16,
                 accumulate: false,
                 keep: false,
-                tile: [2, 2],
                 transpose_b: false,
             },
         };
+        // The halves of the split operands by an Atlas tile of 2 x 2.
         let op = FuncOp {
             seq: 1,
             time: 0,
@@ -107,6 +107,7 @@ fn a_split_operand_reads_its_halves() {
             gid: None,
             backend: 0,
             kind: OpKind::Task(desc),
+            tile: [2, 2],
         };
         n.apply(&op, &mut m).unwrap();
         m.read(pc, 32).unwrap()
@@ -150,6 +151,7 @@ fn matmul(
         gid: None,
         backend: 0,
         kind: OpKind::Task(desc),
+        tile: sim_core::func::DEFAULT_TILE,
     }
 }
 
@@ -182,7 +184,7 @@ fn the_accumulator_keeps_the_partial_in_fp32() {
     let (pa, pb, pc) = (0x10_0000, 0x11_0000, 0x12_0000);
     let a: Vec<f32> = (0..m * k).map(|i| 1.0 + (i % 7) as f32 / 8.0).collect();
     let b: Vec<f32> = (0..k * n).map(|i| 1.0 + (i % 5) as f32 / 8.0).collect();
-    let (mut nb, mut mem) = numeric();
+    let (mut nb, mut mem) = builtin();
     put_bf16(&mut mem, pa, &a);
     put_bf16(&mut mem, pb, &b);
     let dims = (m as u64, n as u64, k as u64);
@@ -222,7 +224,7 @@ fn the_accumulator_is_per_atlas() {
     // PE 1 starts from C in memory (zero).
     let (m, n, k) = (8, 8, 8);
     let (pa, pb, pc) = (0x10_0000, 0x11_0000, 0x12_0000);
-    let (mut nb, mut mem) = numeric();
+    let (mut nb, mut mem) = builtin();
     put_bf16(&mut mem, pa, &[1.0; 64]);
     put_bf16(&mut mem, pb, &[1.0; 64]);
     nb.apply(&matmul(0, pa, pb, pc, (m, n, k), false, true), &mut mem)
@@ -244,7 +246,7 @@ fn a_matmul_with_b_transposed() {
     let bt: Vec<f32> = (0..n * k)
         .map(|x| ((x / k * 7 + x % k * 2) % 7) as f32)
         .collect();
-    let (mut nb, mut mem) = numeric();
+    let (mut nb, mut mem) = builtin();
     put_bf16(&mut mem, pa, &a);
     put_bf16(&mut mem, pb, &bt);
     let mut op = matmul(0, pa, pb, pc, (m, n, k), false, false);
@@ -278,11 +280,8 @@ fn muon(
 ) -> Result<(), sim_core::FuncError> {
     use sim_core::{Descriptor, FuncOp, OpKind, PeId};
     let mut d = Descriptor::vector(PeId(0), Range::from_len(0x10_0000, 512), 1, 64, 64);
-    if let sim_core::Args::Vector {
-        kernel: k, block, ..
-    } = &mut d.args
-    {
-        (*k, *block) = (kernel, vec![1, 2, 3]);
+    if let sim_core::Args::Vector { kernel: k, .. } = &mut d.args {
+        *k = kernel;
     }
     let op = FuncOp {
         seq: 1,
@@ -291,21 +290,19 @@ fn muon(
         gid: None,
         backend: 0,
         kind: OpKind::Task(d),
+        tile: sim_core::func::DEFAULT_TILE,
     };
     backend.apply(&op, mem)
 }
 
 #[test]
-fn a_muon_kernel_is_an_error_on_numeric_and_writes_nothing_on_trace() {
-    let (mut nb, mut mem) = numeric();
+fn the_opaque_kernel_writes_nothing_and_another_kernel_is_an_error() {
+    let (mut nb, mut mem) = builtin();
     muon(&mut nb, &mut mem, 0).unwrap();
+    assert_eq!(mem.read(0x10_0000, 512).unwrap(), vec![0; 512]);
     let e = muon(&mut nb, &mut mem, 7).unwrap_err();
     assert_eq!(
         e.0,
-        "Muon kernel 7: the numeric backend has no Muon kernels"
+        "Muon kernel 7: the builtin backend has no Muon kernels"
     );
-    let mut t = func::Trace::new();
-    muon(&mut t, &mut mem, 0).unwrap();
-    muon(&mut t, &mut mem, 7).unwrap();
-    assert_eq!(mem.read(0x10_0000, 512).unwrap(), vec![0; 512]);
 }

@@ -65,7 +65,7 @@ fn run_traced(mut b: Built, imem: &[u8]) -> (Stats, Seen, Abi) {
     b.sim.core(NeutrinoId(0)).mem.borrow_mut().imem()[..imem.len()].copy_from_slice(imem);
     let life = Life::default();
     b.sim.set_tracer(Box::new(life.clone()));
-    b.sim.set_functional(Box::new(func::Numeric::new()));
+    b.sim.set_functional(Box::new(func::Builtin::new()));
     let p = RvProgram::root(Rc::new(abi.clone()), 0, nu_rv::DEFAULT_LIMIT);
     b.sim
         .spawn_named(NeutrinoId(0), "device", move |ctx| p.run(ctx));
@@ -107,8 +107,8 @@ fn the_three_level_image() {
     sms.sort();
     sms.dedup();
     assert_eq!(sms.len(), 8);
-    // The copies: two at the device (src 0xd8, 544 B; records at sync +0x0
-    // and +0x400), eight at the clusters (src 0xf8, 224 B).
+    // The copies: two at the device (src 0xd8, 560 B; records at sync +0x0
+    // and +0x400), eight at the clusters (src 0xf8, 240 B).
     let copies: Vec<_> = tasks
         .iter()
         .filter(|t| t.1.opcode == OpcodeId::IMEM_COPY)
@@ -124,10 +124,10 @@ fn the_three_level_image() {
         };
         match nu.0 {
             0 => {
-                assert_eq!((src, bytes, offset), (0xd8, 544, 0));
+                assert_eq!((src, bytes, offset), (0xd8, 560, 0));
                 device_records.push(d.dst.base - SYNC);
             }
-            _ => assert_eq!((src, bytes, offset), (0xf8, 224, 0)),
+            _ => assert_eq!((src, bytes, offset), (0xf8, 240, 0)),
         }
     }
     device_records.sort();
@@ -154,16 +154,16 @@ fn the_three_level_image() {
             assert!([0x200, 0x600].contains(&(d.dst.base - SYNC)));
         }
     }
-    // The IMEMs: gpc_fanout (544 B) in each cluster, sm_tile (224 B) in
+    // The IMEMs: gpc_fanout (560 B) in each cluster, sm_tile (240 B) in
     // each SM.
     let imem = |nu: NeutrinoId, n: usize| abi.node(nu).core.mem.borrow_mut().imem()[..n].to_vec();
-    let root = abi.node(NeutrinoId(0)).core.mem.borrow_mut().imem()[0xd8..0xd8 + 544].to_vec();
+    let root = abi.node(NeutrinoId(0)).core.mem.borrow_mut().imem()[0xd8..0xd8 + 560].to_vec();
     for g in ["root.gpc0", "root.gpc1"] {
         let gpc = b.nu(g);
-        assert_eq!(imem(gpc, 544), root);
-        let fan = abi.node(gpc).core.mem.borrow_mut().imem()[0xf8..0xf8 + 224].to_vec();
+        assert_eq!(imem(gpc, 560), root);
+        let fan = abi.node(gpc).core.mem.borrow_mut().imem()[0xf8..0xf8 + 240].to_vec();
         for i in 0..4 {
-            assert_eq!(imem(b.nu(&format!("{g}.sm{i}")), 224), fan);
+            assert_eq!(imem(b.nu(&format!("{g}.sm{i}")), 240), fan);
         }
     }
     // The children read their arguments from their parents' data scratch:

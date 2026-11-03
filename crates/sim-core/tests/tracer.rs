@@ -52,7 +52,6 @@ fn matmul(b: &Built, pe: &str, c: Range, deps: Vec<Dep>) -> Descriptor {
             out_dtype: Dtype::Bf16,
             accumulate: false,
             keep: false,
-            tile: [64, 64],
             transpose_b: false,
         },
     }
@@ -234,7 +233,7 @@ fn two_gpc_run() -> Sim {
 fn a_traced_two_gpc_run_ends_at_the_untraced_cycle() {
     let (plain, traced, seen) = both(two_gpc_run);
     assert_eq!(plain.fatal, None);
-    assert_eq!((plain.end_time, traced.end_time), (375, 375));
+    assert_eq!((plain.end_time, traced.end_time), (371, 371));
     assert_eq!(plain.events, traced.events);
     let b = built("two_gpc.yaml");
     let (root, g0, g1) = (b.nu("root"), b.nu("root.gpc0"), b.nu("root.gpc1"));
@@ -249,7 +248,7 @@ fn a_traced_two_gpc_run_ends_at_the_untraced_cycle() {
     );
     let mut r = seen.returns.clone();
     r.sort_by_key(|x| x.1);
-    assert_eq!(r, vec![(g1, 290), (g0, 346), (root, 375)]);
+    assert_eq!(r, vec![(g1, 286), (g0, 342), (root, 371)]);
     assert_eq!(seen.invokes.len(), 3);
     assert_eq!(seen.retires, 3);
     check_cycles(&traced, &seen);

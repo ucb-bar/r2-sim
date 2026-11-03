@@ -68,7 +68,13 @@ pub struct FuncOp {
     pub backend: usize,
     /// What the op does.
     pub kind: OpKind,
+    /// The output tile of the Atlas of a matmul task (the halves of its
+    /// split operands; the Atlas key `tile`); [`DEFAULT_TILE`] otherwise.
+    pub tile: [u64; 2],
 }
+
+/// The default output tile of an Atlas, `[rows, columns]`.
+pub const DEFAULT_TILE: [u64; 2] = [128, 128];
 
 /// A backend error, as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,8 +83,8 @@ pub struct FuncError(pub String);
 /// A functional backend: it applies the tasks of the FU kinds that select
 /// it, on the store. It runs on the worker thread.
 pub trait FunctionalBackend: Send {
-    /// The backend's name in the configuration (`null`, `numeric`,
-    /// `trace`) and in the thread timeline.
+    /// The backend's name in the configuration (`null`, `builtin`, or a
+    /// plug-in's) and in the thread timeline.
     fn name(&self) -> &'static str;
     /// False for a backend that writes nothing (`null`); a run whose
     /// backends all write nothing has no store and no worker thread, and a

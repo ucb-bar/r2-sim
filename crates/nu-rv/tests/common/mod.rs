@@ -115,7 +115,7 @@ pub fn image(code: &[u32], consts: &[u64]) -> Vec<u8> {
     m
 }
 
-/// A descriptor of ABI version 2.
+/// A descriptor of ABI version 3.
 pub struct Desc {
     pub opcode: u16,
     pub pe: u16,
@@ -161,25 +161,28 @@ pub fn dma(pe: u16, src: u64, to: u64, bytes: u64, deps: Vec<u64>) -> Desc {
         bound: (bytes >> 9) as u32,
         mask: u32::MAX,
         deps,
-        args: dma_args(src, to, bytes, 1, bytes as u32, 0, 0),
+        args: dma_args(src, to, bytes as u32, 1, 0, 0),
     }
 }
 
-/// The arguments of a DMA (ABI version 2): src, dst, bytes, tile (=
-/// bytes), rows, row bytes and the two strides.
-pub fn dma_args(
-    src: u64,
-    to: u64,
-    bytes: u64,
-    rows: u32,
-    row_bytes: u32,
-    ss: u32,
-    ds: u32,
-) -> Vec<u8> {
-    let mut a = words(&[src, to, bytes, bytes]);
-    for w in [rows, row_bytes, ss, ds] {
+/// The arguments of a DMA (ABI version 3, 32 bytes): src, dst, row bytes,
+/// rows and the two strides.
+pub fn dma_args(src: u64, to: u64, row_bytes: u32, rows: u32, ss: u32, ds: u32) -> Vec<u8> {
+    let mut a = words(&[src, to]);
+    for w in [row_bytes, rows, ss, ds] {
         a.extend(w.to_le_bytes());
     }
+    a
+}
+
+/// The arguments of a vector task (ABI version 3, 16 bytes): the kernel,
+/// the bytes of its block, and the block's address.
+pub fn vector_args(kernel: u16, len: u16, at: u64) -> Vec<u8> {
+    let mut a = Vec::new();
+    a.extend(kernel.to_le_bytes());
+    a.extend(len.to_le_bytes());
+    a.extend(0u32.to_le_bytes());
+    a.extend(at.to_le_bytes());
     a
 }
 
@@ -202,9 +205,10 @@ pub struct Run {
     pub abi: Abi,
 }
 
-/// Runs `imem` as the root program on `b` with the Numeric backend, after
-/// `setup` (for example initial memory). `scratch` bytes go to the root's
-/// data scratch at their offsets.
+/// Runs `imem` as the root program on `b` with the backends of the short
+/// form `builtin` (builtin for the DMA engines and the Atlas, null for the
+/// Muon), after `setup` (for example initial memory). `scratch` bytes go to
+/// the root's data scratch at their offsets.
 pub fn run_on(mut b: Built, imem: &[u8], scratch: &[(usize, Vec<u8>)], limit: u64) -> Run {
     let abi = Abi::new(&b);
     let root = NeutrinoId(0);
@@ -218,7 +222,18 @@ pub fn run_on(mut b: Built, imem: &[u8], scratch: &[(usize, Vec<u8>)], limit: u6
     }
     let tasks = Tasks::default();
     b.sim.set_tracer(Box::new(tasks.clone()));
-    b.sim.set_functional(Box::new(func::Numeric::new()));
+    let names = |n: &str| vec![n.to_string()];
+    let backends = sim_core::Backends::from_names(
+        [&names("builtin"), &names("builtin"), &names("null")],
+        |n| -> Result<Box<dyn sim_core::FunctionalBackend>, String> {
+            Ok(match n {
+                "builtin" => Box::new(func::Builtin::new()),
+                _ => Box::new(sim_core::NullBackend),
+            })
+        },
+    )
+    .expect("backends");
+    b.sim.set_backends(backends);
     b.sim.set_timeline(true);
     let p = RvProgram::root(Rc::new(abi.clone()), 0, limit);
     b.sim.spawn_named(root, "rv", move |ctx| p.run(ctx));

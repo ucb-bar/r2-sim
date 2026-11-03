@@ -74,11 +74,12 @@
 //!   `outstanding` (a DMA engine: a cap on chunks issued and not ended,
 //!   default none, r2sim spec Section 5.4.1 issue-driven chunks; another PE: chunks
 //!   requested ahead, default 1), `burst_bytes` (dma: the chunk size of
-//!   every transfer; default the descriptor's tile; with `outstanding`
+//!   every transfer; default no limit; with `outstanding`
 //!   set, a warning in [`Built::warnings`] when `(outstanding - 1) x
 //!   burst_bytes` does not cover latency x rate of the engine's paths),
 //!   `runs_per_cycle` (dma: the runs of a 2D copy, rows or pieces of rows,
-//!   that the engine starts per cycle; default 1).
+//!   that the engine starts per cycle; default 1), `tile` (tensor: the
+//!   output tile [rows, columns], default [128, 128]).
 //! * memories (scratch and dram): `wr_bytes` (a separate write port
 //!   `<mem>.wport` charged by write demands; without it `<mem>.port`
 //!   serves both directions); `banks: N` (Radiance 2 spec Section 3.1): N
@@ -763,9 +764,11 @@ struct CompSec {
     quantize: Option<String>,
     operand_reuse: Option<String>,
     acc_buffer: Option<Num>,
-    /// DMA: the chunk size of every transfer (default: the descriptor's
-    /// tile).
+    /// DMA: the chunk size of every transfer (default: no limit, a
+    /// transfer is one chunk).
     burst_bytes: Option<Num>,
+    /// Tensor: the output tile [rows, columns] (default [128, 128]).
+    tile: Option<[u64; 2]>,
     /// DMA: the runs (rows or pieces of rows of a 2D copy) the engine
     /// starts per cycle (default 1).
     runs_per_cycle: Option<u64>,
@@ -938,8 +941,8 @@ pub struct Layout {
 pub struct Built {
     /// The simulation, ready for programs.
     pub sim: Sim,
-    /// True when some subtree has `numeric` fidelity; the caller then sets
-    /// a Numeric backend.
+    /// True when some subtree has `numeric` fidelity (the subtrees whose
+    /// tasks go to the backend lists).
     pub numeric: bool,
     /// The clock of the global cycle in GHz (default 1).
     pub clock_ghz: f64,
@@ -2054,6 +2057,9 @@ impl Builder {
             }
             let utilization = || opt_rate(&c.utilization).map(|u| u.unwrap_or(Ratio::ONE));
             let clock = clock_of(&c.clock, &name)?;
+            if c.tile.is_some() && c.kind != "tensor" {
+                return err(format!("{name}: tile is a tensor key"));
+            }
             if c.burst_bytes.is_some() && c.kind != "dma" {
                 return err(format!("{name}: burst_bytes is a dma key"));
             }
@@ -2103,8 +2109,13 @@ impl Builder {
                         "row_panel" => true,
                         r => return err(format!("{name}: operand_reuse {r:?}")),
                     };
+                    let tile = c.tile.unwrap_or([128, 128]);
+                    if tile.contains(&0) {
+                        return err(format!("{name}: tile {tile:?} has a 0"));
+                    }
                     PeParams::Atlas {
                         beat: beat_of(&c.beat_bytes, &name)?,
+                        tile,
                         quantize,
                         row_panel,
                         acc_buffer: c

@@ -1,14 +1,19 @@
-//! Descriptors of ABI version 2, as an RV program builds them in its data
+//! Descriptors of ABI version 3, as an RV program builds them in its data
 //! scratch: a 24-byte header (opcode u16, pe u16, flags u16, ndeps u16,
 //! dst base u64 in granules, bound u32 in granules, mask u32), `ndeps`
 //! keys of 8 bytes, then the arguments of the opcode. All fields are
 //! little-endian; addresses in the arguments are byte addresses.
 //!
-//! Version 2: a DMA has rows, row bytes and the two strides (a 2D copy;
-//! rows x row bytes = bytes), a matmul the flag `transpose_b` (not with
-//! `b2`), and a vector task a kernel id with an argument block in the
-//! invoking program's data scratch, which the Neutrino reads with the
-//! descriptor.
+//! - DMA (32 B): src u64, dst u64, row_bytes u32, rows u32 (1 or more),
+//!   src_stride u32, dst_stride u32; the bytes are rows x row_bytes.
+//! - Matmul (40 B): a u64, b u64, a2 i32 and b2 i32 (byte offsets of the
+//!   high halves from `a` and `b`; 0: not split), lda, ldb, ldc, m, n, k
+//!   u16, types u16 (A | B << 4 | C << 8, 4 bits each), flags u16
+//!   (ACCUMULATE 1, KEEP 2, TRANSPOSE_B 4; a transposed B is not split).
+//! - Vector (16 B): kernel u16, args_bytes u16, reserved u32, args u64: a
+//!   kernel of the registry and its argument block of args_bytes (the
+//!   kernel's block size) at `args` in the invoking node's data scratch,
+//!   which the Neutrino reads with the descriptor.
 
 use nu_model::{Addr, NeutrinoId, Range};
 use sim_core::{Args, Descriptor, Dtype, OpcodeId, Rows};
@@ -26,13 +31,13 @@ pub const OP_IMEM_COPY: u16 = 5;
 pub const PE_IMEM: u16 = 0xffff;
 const FLAG_VERSIONED: u16 = 1;
 const FLAG_UNTRACKED: u16 = 2;
-const MM_ACCUMULATE: u32 = 1;
-const MM_KEEP: u32 = 2;
-const MM_TRANSPOSE_B: u32 = 4;
+const MM_ACCUMULATE: u16 = 1;
+const MM_KEEP: u16 = 2;
+const MM_TRANSPOSE_B: u16 = 4;
 const HEADER: u64 = 24;
 
 /// Bytes of the arguments of each opcode, by opcode.
-pub const ARGS_BYTES: [u64; 6] = [0, 16, 48, 72, 48, 24];
+pub const ARGS_BYTES: [u64; 6] = [0, 16, 32, 40, 16, 24];
 
 /// A decoded descriptor.
 // A transient value of the interpreter: the size difference costs nothing.
@@ -165,18 +170,17 @@ pub fn decode(
     Ok(match opcode {
         OP_JOIN => task(OpcodeId::JOIN, None, Args::Join),
         OP_DMA => {
-            let bytes = u64_at(a, 16);
-            let (count, row_bytes) = (u32_at(a, 32) as u64, u32_at(a, 36) as u64);
-            if count == 0 || count * row_bytes != bytes {
+            let (row_bytes, count) = (u32_at(a, 16) as u64, u32_at(a, 20) as u64);
+            if count == 0 {
                 return Err(format!(
-                    "descriptor at {addr:#x}: a DMA of {count} rows of {row_bytes} bytes for {bytes} bytes (rows must be 1 or more, and rows x row bytes the bytes)"
+                    "descriptor at {addr:#x}: a DMA of 0 rows (rows must be 1 or more)"
                 ));
             }
             let rows = (count > 1).then(|| Rows {
                 count,
                 bytes: row_bytes,
-                src_stride: u32_at(a, 40) as u64,
-                dst_stride: u32_at(a, 44) as u64,
+                src_stride: u32_at(a, 24) as u64,
+                dst_stride: u32_at(a, 28) as u64,
             });
             task(
                 OpcodeId::DMA,
@@ -184,89 +188,86 @@ pub fn decode(
                 Args::Dma {
                     src: Addr(u64_at(a, 0)),
                     dst: Addr(u64_at(a, 8)),
-                    bytes,
-                    tile_bytes: u64_at(a, 24),
+                    bytes: count * row_bytes,
                     rows,
                 },
             )
         }
         OP_MATMUL => {
-            let types = u32_at(a, 56);
-            let mmflags = u32_at(a, 60);
-            let opt = |x: u64| (x != 0).then_some(Addr(x));
+            let (a0, b0) = (u64_at(a, 0), u64_at(a, 8));
+            let (a2, b2) = (u32_at(a, 16) as i32, u32_at(a, 20) as i32);
+            let types = u16_at(a, 36) as u32;
+            let mmflags = u16_at(a, 38);
             let transpose_b = mmflags & MM_TRANSPOSE_B != 0;
-            if transpose_b && u64_at(a, 24) != 0 {
+            if transpose_b && b2 != 0 {
                 return Err(format!(
                     "descriptor at {addr:#x}: a matmul with transpose_b and b2"
                 ));
             }
+            // A high half at a byte offset from its low half.
+            let half = |base: u64, off: i32, name: &str| -> Result<Option<Addr>, String> {
+                if off == 0 {
+                    return Ok(None);
+                }
+                base.checked_add_signed(off as i64)
+                    .map(|x| Some(Addr(x)))
+                    .ok_or_else(|| {
+                        format!("descriptor at {addr:#x}: {name} {off} from {base:#x} overflows")
+                    })
+            };
+            let dim = |o: usize| u16_at(a, o) as u64;
             task(
                 OpcodeId::MATMUL,
                 Some(pe_of()?),
                 Args::Matmul {
-                    a: Addr(u64_at(a, 0)),
-                    b: Addr(u64_at(a, 8)),
-                    a2: opt(u64_at(a, 16)),
-                    b2: opt(u64_at(a, 24)),
-                    lda: u32_at(a, 32) as u64,
-                    ldb: u32_at(a, 36) as u64,
-                    ldc: u32_at(a, 40) as u64,
-                    m: u32_at(a, 44) as u64,
-                    n: u32_at(a, 48) as u64,
-                    k: u32_at(a, 52) as u64,
-                    in_dtype: dtype(types & 0xff)?,
-                    b_dtype: dtype((types >> 8) & 0xff)?,
-                    out_dtype: dtype((types >> 16) & 0xff)?,
+                    a: Addr(a0),
+                    b: Addr(b0),
+                    a2: half(a0, a2, "a2")?,
+                    b2: half(b0, b2, "b2")?,
+                    lda: dim(24),
+                    ldb: dim(26),
+                    ldc: dim(28),
+                    m: dim(30),
+                    n: dim(32),
+                    k: dim(34),
+                    in_dtype: dtype(types & 0xf)?,
+                    b_dtype: dtype((types >> 4) & 0xf)?,
+                    out_dtype: dtype((types >> 8) & 0xf)?,
                     accumulate: mmflags & MM_ACCUMULATE != 0,
                     keep: mmflags & MM_KEEP != 0,
-                    tile: [u16_at(a, 64) as u64, u16_at(a, 66) as u64],
                     transpose_b,
                 },
             )
         }
         OP_VECTOR => {
-            // The argument block, read with the descriptor from the data
-            // scratch.
-            let (kernel, len, at_block) = (u32_at(a, 32), u32_at(a, 36) as u64, u64_at(a, 40));
-            // The kernel is 0 (opaque, no block) or one of the registry,
-            // with a block of the registry's size.
-            let want = match kernel {
-                0 => 0,
-                k => match sim_core::kernels::by_id(k) {
-                    Some(r) => r.bytes,
-                    None => {
-                        return Err(format!(
-                            "descriptor at {addr:#x}: kernel {kernel} is not in the kernel registry"
-                        ))
-                    }
-                },
-            };
+            // A kernel of the registry with its block, read with the
+            // descriptor from the data scratch.
+            let (kernel, len, at_block) = (u16_at(a, 0) as u32, u16_at(a, 2) as u64, u64_at(a, 8));
+            let want = sim_core::kernels::by_id(kernel)
+                .ok_or_else(|| {
+                    format!(
+                        "descriptor at {addr:#x}: kernel {kernel} is not in the kernel registry"
+                    )
+                })?
+                .bytes;
             if len != want {
                 return Err(format!(
                     "descriptor at {addr:#x}: kernel {kernel} ({}) has an argument block of {len} bytes, not {want}",
                     sim_core::kernels::name(kernel).expect("a known kernel")
                 ));
             }
-            let block = if len == 0 {
-                Vec::new()
-            } else if fits_at(at_block, len) {
-                let o = (at_block - at.base) as usize;
-                scratch[o..o + len as usize].to_vec()
-            } else {
+            if !fits_at(at_block, len) {
                 return Err(format!(
                     "descriptor at {addr:#x}: the argument block [{at_block:#x}, +{len}) of kernel {kernel} is outside the own data scratch {at}"
                 ));
-            };
+            }
+            let o = (at_block - at.base) as usize;
             task(
                 OpcodeId::VECTOR,
                 Some(pe_of()?),
                 Args::Vector {
-                    ops: u64_at(a, 0),
-                    bytes_in: u64_at(a, 8),
-                    bytes_out: u64_at(a, 16),
-                    src: Some(u64_at(a, 24)).filter(|&s| s != 0).map(Addr),
                     kernel,
-                    block,
+                    block: scratch[o..o + len as usize].to_vec(),
                 },
             )
         }

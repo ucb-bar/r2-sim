@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
+from r2sim.func.kernels import opaque
+
 if TYPE_CHECKING:
     from r2sim.func.kernels import Task
     from r2sim.func.memory import Memory
@@ -119,6 +121,7 @@ def softmax_apply(t: Task, a: dict) -> None:
 
 
 KERNELS = {
+    "opaque": opaque,
     "row_stats": row_stats,
     "epilogue": epilogue,
     "softmax_stats": softmax_stats,

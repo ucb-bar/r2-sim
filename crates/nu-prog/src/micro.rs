@@ -93,8 +93,6 @@ pub struct Params {
     pub stages: usize,
     /// `tmem`: the 128 x 128 output tiles, each a chain over k.
     pub tiles: usize,
-    /// Output tile of a matmul `[rows, columns]`.
-    pub tile: [u64; 2],
     pub lane_ops: u64,
     pub bytes_out: u64,
     pub pair: String,
@@ -126,7 +124,6 @@ impl Default for Params {
             kc: 128,
             stages: 2,
             tiles: 4,
-            tile: [128, 128],
             lane_ops: 1 << 16,
             bytes_out: 0,
             pair: "same_gpc".into(),
@@ -518,7 +515,6 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             src: Addr(src),
                             dst: Addr(dst),
                             bytes: len,
-                            tile_bytes: len,
                             rows: None,
                         },
                     };
@@ -601,7 +597,6 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                                 out_dtype: Dtype::Bf16,
                                 accumulate: false,
                                 keep: false,
-                                tile: p.tile,
                                 transpose_b: false,
                             },
                         });
@@ -621,12 +616,13 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                         deps: Vec::new(),
                         label: None,
                         args: Args::Vector {
-                            ops: p.lane_ops,
-                            bytes_in: p.bytes,
-                            bytes_out: p.bytes_out,
-                            src: None,
                             kernel: 0,
-                            block: Vec::new(),
+                            block: sim_core::kernels::opaque_block(
+                                0,
+                                p.lane_ops,
+                                p.bytes,
+                                p.bytes_out,
+                            ),
                         },
                     });
                 }
@@ -793,7 +789,6 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             src: Addr(src),
                             dst: Addr(dst),
                             bytes: len,
-                            tile_bytes: len,
                             rows: None,
                         },
                     };
@@ -944,7 +939,6 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                     src: Addr(src),
                     dst: Addr(dst),
                     bytes,
-                    tile_bytes: bytes,
                     rows: None,
                 },
             };
@@ -1023,7 +1017,6 @@ pub fn build(b: &Built, p: Params) -> Result<Run, String> {
                             out_dtype: Dtype::Bf16,
                             accumulate: x > 0,
                             keep: !last,
-                            tile: [T, T],
                             transpose_b: false,
                         },
                     };

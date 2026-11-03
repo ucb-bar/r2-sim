@@ -36,7 +36,6 @@ fn dma(b: &Built, src: u64, to: u64, bytes: u64, dst: Range, mask: u32) -> Descr
             src: Addr(src),
             dst: Addr(to),
             bytes,
-            tile_bytes: bytes,
             rows: None,
         },
     }
@@ -45,7 +44,7 @@ fn dma(b: &Built, src: u64, to: u64, bytes: u64, dst: Range, mask: u32) -> Descr
 fn run_sm0(b: Built, d: Descriptor) -> Stats {
     let sm0 = b.nu("root.gpc0.sm0");
     let mut sim = b.sim;
-    sim.set_functional(Box::new(func::Numeric::new()));
+    sim.set_functional(Box::new(func::Builtin::new()));
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         let h = ctx.invoke(d).await;
         ctx.wait_unversioned(h.addr).await;
@@ -101,7 +100,7 @@ fn a_load_in_a_gap_of_an_executing_writer_is_no_race() {
         let dst = Range::from_len(base + 0x10000, 4 * G);
         let d = dma(&b, base + 0x20000, dst.base, G, dst, 0b10);
         let mut sim = b.sim;
-        sim.set_functional(Box::new(func::Numeric::new()));
+        sim.set_functional(Box::new(func::Builtin::new()));
         sim.spawn(sm0, move |ctx: NuCtx| async move {
             ctx.invoke(d).await;
             ctx.load(Addr(dst.base + off), 8).await;

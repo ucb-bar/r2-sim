@@ -42,7 +42,7 @@ def muon(name: str, at: int, length: int, **values) -> tuple[bytes, bytes]:
     descriptor and the argument block."""
     k = kernel(name)
     length = -(-length // G) * G
-    desc = header(4, at, length) + struct.pack("<QQQQIIQ", 1, 64, 64, 0, k["id"], k["bytes"], 0)
+    desc = header(4, at, length) + struct.pack("<HHIQ", k["id"], k["bytes"], 0, 0)
     return desc, block(name, **values)
 
 
@@ -246,3 +246,11 @@ def test_softmax_apply_on_each_half_one_in_place(provider):
     p, want = softmax_apply_case(provider)
     within_one_ulp(p, want, atol=1e-6 * np.abs(want).max())
     assert abs(p.astype(np.float64).sum(1) - 1).max() < 0.02
+
+
+def test_kernel_0_is_a_registry_kernel_that_writes_nothing(provider):
+    assert kernel("opaque")["id"] == 0 and kernel("opaque")["bytes"] == 24
+    r = Run(provider)
+    desc, b = muon("opaque", BASE, G, src=BASE + G, ops=100, bytes_in=64, bytes_out=64)
+    r.apply(desc, block=b)
+    assert not r.mem.any()

@@ -3,9 +3,11 @@
 //! [`Plugin::open`] opens the library with `dlopen`, finds
 //! `r2_backend_open` and checks the ABI version. `configure` passes the
 //! block table of the store, the sync-only space, the PE names by index
-//! and the backend's entry of the configuration as JSON, with the key
-//! `kernels`: the Muon kernel registry (id, name, bytes, flags, and the
-//! fields with name, type and offset). `apply` passes
+//! and the backend's entry of the configuration as JSON, with the keys
+//! `kernels` (the Muon kernel registry: id, name, bytes, flags, and the
+//! fields with name, type and offset) and `tiles` (per PE index, the
+//! output tile `[rows, columns]` of an Atlas, which gives the halves of a
+//! matmul's split operands; [128, 128] for another PE). `apply` passes
 //! each task with its descriptor bytes (a task of an RV program); a task
 //! without bytes (a task of a Rust program) is an error. `close` runs when
 //! the backend is dropped, at the end of the run. The library stays
@@ -68,8 +70,15 @@ fn dl_error() -> String {
 impl Plugin {
     /// Opens the backend `name` in the library `lib` (a file name next to
     /// the binary, or a path). `config`: the backend's entry as JSON;
-    /// `pes`: the PE names by index.
-    pub fn open(name: &str, lib: &str, config: &str, pes: Vec<String>) -> Result<Self, String> {
+    /// `pes`: the PE names by index; `tiles`: the Atlas tile of each PE
+    /// (the key `tiles`).
+    pub fn open(
+        name: &str,
+        lib: &str,
+        config: &str,
+        pes: Vec<String>,
+        tiles: &[[u64; 2]],
+    ) -> Result<Self, String> {
         let at = |msg: String| format!("backend {name} ({lib}): {msg}");
         let path = lib_path(lib);
         let cpath =
@@ -102,7 +111,7 @@ impl Plugin {
             name: Box::leak(name.to_string().into_boxed_str()),
             lib: lib.to_string(),
             backend,
-            config: CString::new(with_kernels(config).map_err(at)?)
+            config: CString::new(with_keys(config, tiles).map_err(at)?)
                 .map_err(|e| at(e.to_string()))?,
             pes: pes
                 .into_iter()
@@ -120,18 +129,24 @@ impl Plugin {
     }
 }
 
-/// The backend's entry `config` (a JSON object) with the key `kernels`.
-fn with_kernels(config: &str) -> Result<String, String> {
+/// The backend's entry `config` (a JSON object) with the keys `kernels`
+/// and `tiles`.
+fn with_keys(config: &str, tiles: &[[u64; 2]]) -> Result<String, String> {
     let mut v: serde_json::Value =
         serde_json::from_str(config).map_err(|e| format!("the configuration: {e}"))?;
     let Some(entry) = v.as_object_mut() else {
         return Err("the configuration is not a JSON object".into());
     };
-    if entry.contains_key("kernels") {
-        return Err("the configuration has the key kernels, which r2-sim sets".into());
+    for key in ["kernels", "tiles"] {
+        if entry.contains_key(key) {
+            return Err(format!(
+                "the configuration has the key {key}, which r2-sim sets"
+            ));
+        }
     }
     let kernels = serde_json::to_value(sim_core::kernels::registry()).expect("JSON");
     entry.insert("kernels".into(), kernels);
+    entry.insert("tiles".into(), serde_json::json!(tiles));
     Ok(v.to_string())
 }
 

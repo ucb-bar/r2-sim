@@ -27,43 +27,55 @@ def header(opcode, dst, length, keys=0, mask=FULL, flags=1, pe=0):
 
 
 def dma_desc(src, to, n, rows=1, row_bytes=None, src_stride=0, dst_stride=0, dst_len=None):
-    """A DMA (ABI version 2): one row of n bytes, or `rows` rows."""
+    """A DMA (ABI version 3): one row of n bytes, or `rows` rows of
+    `row_bytes` (n = rows x row_bytes)."""
     row_bytes = n if row_bytes is None else row_bytes
     return header(2, to, dst_len or max(G, n)) + struct.pack(
-        "<QQQQIIII", src, to, n, n, rows, row_bytes, src_stride, dst_stride)
+        "<QQIIII", src, to, row_bytes, rows, src_stride, dst_stride)
 
 
 def vector_desc(dst, kernel, args_bytes=0, args=0):
-    return header(4, dst, G) + struct.pack("<QQQQIIQ", 1, 64, 64, 0, kernel, args_bytes, args)
+    """A vector task (ABI version 3): the kernel, its block's size and
+    address."""
+    return header(4, dst, G) + struct.pack("<HHIQ", kernel, args_bytes, 0, args)
 
 
 def matmul_desc(a, b, c, m, n, k, *, accumulate=False, keep=False, lda=None, ldb=None,
-                transpose_b=False):
+                transpose_b=False, a2=0, b2=0, types=0):
+    """A matmul (ABI version 3); `a2`, `b2`: the byte offsets of the high
+    halves (0: not split)."""
     flags = (1 if accumulate else 0) | (2 if keep else 0) | (4 if transpose_b else 0)
-    args = struct.pack("<QQQQIIIIIIIIHH", a, b, 0, 0, lda or k, ldb or n, n, m, n, k,
-                       0, flags, 128, 128) + bytes(4)
-    return header(3, c, m * n * 2) + args
+    args = struct.pack("<QQiiHHHHHHHH", a, b, a2, b2, lda or k, ldb or n, n, m, n, k,
+                       types, flags)
+    return header(3, c, max(G, m * n * 2)) + args
 
 
 def test_the_decoder_gives_the_fields_of_the_ops():
     d = decode(dma_desc(BASE, BASE + 0x1000, 64), G, 3)
     assert d == {"kind": "dma", "pe": 3, "dst": [BASE + 0x1000, BASE + 0x1000 + G], "mask": FULL,
-                 "src": BASE, "to": BASE + 0x1000, "bytes": 64, "tile_bytes": 64, "rows": 1,
+                 "src": BASE, "to": BASE + 0x1000, "bytes": 64, "rows": 1,
                  "row_bytes": 64, "src_stride": 0, "dst_stride": 0}
+    assert len(dma_desc(BASE, BASE, 64)) == 24 + 32
     d2 = decode(dma_desc(BASE, BASE + 0x1000, 4 * 144, 4, 144, 256, 144), G, 0)
-    assert (d2["rows"], d2["row_bytes"], d2["src_stride"], d2["dst_stride"]) == (4, 144, 256, 144)
-    with pytest.raises(FuncError, match="a DMA of 3 rows of 144 bytes for 576 bytes"):
-        decode(dma_desc(BASE, BASE, 576, 3, 144), G, 0)
-    m = decode(matmul_desc(1, 2, BASE, 4, 8, 16, accumulate=True), G, None)
+    assert (d2["bytes"], d2["rows"], d2["row_bytes"], d2["src_stride"], d2["dst_stride"]) == (
+        576, 4, 144, 256, 144)
+    with pytest.raises(FuncError, match="a DMA of 0 rows"):
+        decode(dma_desc(BASE, BASE, 0, 0, 144), G, 0)
+    mm = matmul_desc(1, 2, BASE, 4, 8, 16, accumulate=True, types=1 | 1 << 4)
+    assert len(mm) == 24 + 40
+    m = decode(mm, G, None)
     assert (m["kind"], m["a"], m["b"], m["a2"], m["b2"]) == ("matmul", 1, 2, None, None)
     assert (m["lda"], m["ldb"], m["ldc"], m["m"], m["n"], m["k"]) == (16, 8, 8, 4, 8, 16)
-    assert (m["a_dtype"], m["out_dtype"], m["accumulate"], m["keep"]) == ("bf16", "bf16", True, False)
-    assert m["tile"] == [128, 128] and m["pe"] is None and not m["transpose_b"]
+    assert (m["a_dtype"], m["b_dtype"], m["out_dtype"]) == ("f32", "f32", "bf16")
+    assert (m["accumulate"], m["keep"], m["pe"], m["transpose_b"]) == (True, False, None, False)
     assert decode(matmul_desc(1, 2, BASE, 4, 8, 16, transpose_b=True), G, 0)["transpose_b"]
+    # The high halves at signed offsets.
+    s = decode(matmul_desc(0x9000, 0x1000, BASE, 4, 8, 16, a2=-0x1000, b2=0x80), G, 0)
+    assert (s["a2"], s["b2"]) == (0x8000, 0x1080)
     # Two keys between the header and the arguments.
-    v = header(4, BASE, G, keys=2) + bytes(16) + struct.pack("<QQQQIIQ", 5, 6, 7, 0, 7, 24, 0x40)
+    v = header(4, BASE, G, keys=2) + bytes(16) + struct.pack("<HHIQ", 7, 24, 0, 0x40)
     d = decode(v, G, 0)
-    assert (d["ops"], d["src"], d["kernel"], d["args_bytes"], d["args"]) == (5, None, 7, 24, 0x40)
+    assert (d["kernel"], d["args_bytes"], d["args"]) == (7, 24, 0x40)
     with pytest.raises(FuncError, match="unknown opcode 9"):
         decode(header(9, BASE, G), G, 0)
 
@@ -186,3 +198,28 @@ def test_configure_names_each_registry_kernel_without_an_implementation():
     with pytest.raises(FuncError, match=r"provider numpy has no implementation of the registry kernels "
                                         r"layer_norm \(id 9\)$"):
         Run(kernels=registry() + [extra])
+
+
+def test_the_atlas_tile_of_the_configuration_splits_the_operands(provider):
+    # A (8 x 4) split by rows and B (4 x 8) by columns over an Atlas tile of
+    # 4 x 4 (the key `tiles`, per PE index): rows 0, 1 of each tile are in
+    # the low half, rows 2, 3 in the high half (r2sim.func.ops.split_row).
+    from r2sim.func.ops import split_row
+    m = n = 8
+    k = 4
+    rng = np.random.default_rng(9)
+    a = rng.integers(-3, 4, (m, k)).astype(BF16)
+    b = rng.integers(-3, 4, (k, n)).astype(BF16)
+    lo = [r for r in range(8) if not split_row(r, 4)[0]]
+    hi = [r for r in range(8) if split_row(r, 4)[0]]
+    bl, bh = np.zeros((k, n), BF16), np.zeros((k, n), BF16)
+    bl[:, :4], bh[:, :4] = b[:, lo], b[:, hi]
+    pa, pb, pc = BASE, BASE + 0x2000, BASE + 0x4000
+    r = Run(provider, tiles=[[4, 4]])
+    r.put(pa, a[lo])
+    r.put(pa + 0x1000, a[hi])
+    r.put(pb, bl)
+    r.put(pb + 0x1000, bh)
+    r.apply(matmul_desc(pa, pb, pc, m, n, k, a2=0x1000, b2=0x1000))
+    want = (a.astype(np.float32) @ b.astype(np.float32)).astype(BF16)
+    assert np.array_equal(r.get(pc, (m, n), BF16), want)

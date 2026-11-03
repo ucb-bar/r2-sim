@@ -50,6 +50,9 @@ pub struct Knobs {
     pub dma_latency: u64,
     /// The Neutrino's local dependency-resolution latency (`c_resolve`).
     pub resolve: u64,
+    /// The DMA engine's chunk size (`burst_bytes`; `None`: a transfer is one
+    /// chunk).
+    pub dma_burst: Option<u64>,
 }
 
 impl Default for Knobs {
@@ -62,6 +65,7 @@ impl Default for Knobs {
             dma_outstanding: 1,
             dma_latency: 100,
             resolve: 0,
+            dma_burst: None,
         }
     }
 }
@@ -124,7 +128,7 @@ pub fn node(k: Knobs) -> Node {
                 links: vec![link],
                 latency: k.dma_latency,
                 masters: Vec::new(),
-                burst: None,
+                burst: k.dma_burst,
                 // Wide enough not to narrow the paths.
                 beat: 1024,
                 clock: sim_core::Ratio::ONE,
@@ -139,6 +143,7 @@ pub fn node(k: Knobs) -> Node {
             max_inflight: 1,
             max_outstanding: 1,
             params: PeParams::Atlas {
+                tile: [64, 64],
                 // Wide enough not to narrow the ports.
                 beat: 1024,
                 masters: Vec::new(),
@@ -170,8 +175,9 @@ pub fn node(k: Knobs) -> Node {
 }
 
 impl Node {
-    /// DMA of `bytes` from DRAM offset `src` to SMEM offset `dst`.
-    pub fn dma(&self, src: u64, dst: u64, bytes: u64, tile_bytes: u64) -> Descriptor {
+    /// DMA of `bytes` from DRAM offset `src` to SMEM offset `dst` (in
+    /// chunks of the engine's burst, [`Knobs::dma_burst`]).
+    pub fn dma(&self, src: u64, dst: u64, bytes: u64) -> Descriptor {
         Descriptor {
             opcode: self.dma_op,
             pe: Some(self.dma),
@@ -189,15 +195,14 @@ impl Node {
                 src: Addr(DRAM + src),
                 dst: Addr(SMEM + dst),
                 bytes,
-                tile_bytes,
                 rows: None,
             },
         }
     }
 
-    /// Square bf16 matmul of edge `e` with output tiles of edge `tile`.
-    /// A and B are at the first two deps (or C when there are none).
-    pub fn matmul(&self, c: Range, deps: Vec<Dep>, e: u64, tile: u64) -> Descriptor {
+    /// Square bf16 matmul of edge `e`, in output tiles of the Atlas (64 x
+    /// 64). A and B are at the first two deps (or C when there are none).
+    pub fn matmul(&self, c: Range, deps: Vec<Dep>, e: u64) -> Descriptor {
         let a = deps.first().map_or(c.base, |d| d.addr());
         let b = deps.get(1).map_or(a, |d| d.addr());
         Descriptor {
@@ -229,7 +234,6 @@ impl Node {
                 out_dtype: Dtype::Bf16,
                 accumulate: false,
                 keep: false,
-                tile: [tile, tile],
                 transpose_b: false,
             },
         }

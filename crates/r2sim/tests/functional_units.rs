@@ -88,41 +88,61 @@ fn pairs(v: &[(&str, &str)]) -> Vec<(String, String)> {
 #[test]
 fn the_short_forms_select_one_backend_per_kind() {
     let d = dir("short");
-    let out = run(&d, &["--functional", "numeric"]);
+    let out = run(&d, &["--functional", "builtin"]);
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let numeric = [
-        ("dma", "numeric"),
-        ("dma", "numeric"),
-        ("matmul", "numeric"),
-        ("dma", "numeric"),
+    let builtin = [
+        ("dma", "builtin"),
+        ("dma", "builtin"),
+        ("matmul", "builtin"),
+        ("dma", "builtin"),
     ];
-    assert_eq!(applies(&d), pairs(&numeric));
+    assert_eq!(applies(&d), pairs(&builtin));
     assert_eq!(c(&d), vec![0x4300; 128 * 128], "C = 128");
-    // No flag: trace for every kind; the matmul writes nothing.
+    // No flag and no section: every list null, so an image with entries in
+    // memory has no backend to go to.
     let out = run(&d, &[]);
-    assert!(out.status.success());
-    let trace = [
-        ("dma", "trace"),
-        ("dma", "trace"),
-        ("matmul", "trace"),
-        ("dma", "trace"),
-    ];
-    assert_eq!(applies(&d), pairs(&trace));
-    assert_eq!(c(&d), vec![0; 128 * 128]);
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        e.contains(
+            "--image with entries in memory (or --image-out) needs a functional backend with data"
+        ),
+        "{e}"
+    );
 }
 
 #[test]
-fn a_null_atlas_in_a_numeric_run_warns_at_the_read_of_c() {
+fn trace_is_not_a_built_in_backend() {
+    let d = dir("trace");
+    let want = "trace is not a built-in backend; a trace backend is a plug-in";
+    for args in [
+        &["--functional", "trace"][..],
+        &[
+            "--functional",
+            "builtin",
+            "--set",
+            "functional.units.dma=[trace]",
+        ],
+    ] {
+        let out = run(&d, args);
+        assert!(!out.status.success());
+        let e = String::from_utf8_lossy(&out.stderr);
+        assert!(e.contains(want), "{e}");
+    }
+}
+
+#[test]
+fn a_null_atlas_in_a_builtin_run_warns_at_the_read_of_c() {
     let d = dir("mixed");
     let out = run(
         &d,
         &[
             "--functional",
-            "numeric",
+            "builtin",
             "--set",
             "functional.units.atlas=[null]",
         ],
@@ -133,10 +153,10 @@ fn a_null_atlas_in_a_numeric_run_warns_at_the_read_of_c() {
         String::from_utf8_lossy(&out.stderr)
     );
     let mixed = [
-        ("dma", "numeric"),
-        ("dma", "numeric"),
+        ("dma", "builtin"),
+        ("dma", "builtin"),
         ("matmul", "null"),
-        ("dma", "numeric"),
+        ("dma", "builtin"),
     ];
     assert_eq!(applies(&d), pairs(&mixed));
     let stdout = String::from_utf8_lossy(&out.stdout);

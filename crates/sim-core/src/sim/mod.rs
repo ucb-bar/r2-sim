@@ -1299,13 +1299,18 @@ impl Sim {
         if matches!(p.params, crate::config::PeParams::Dma { .. }) {
             return None;
         }
-        let ops = match desc.args {
-            Args::Vector { src, .. } => [src, None, None, None],
-            Args::Matmul { a, b, a2, b2, .. } => [Some(a), Some(b), a2, b2],
-            _ => [None; 4],
-        };
-        let addrs = std::iter::once(Some(Addr(desc.dst.base))).chain(ops);
-        addrs.into_iter().flatten().find_map(|a| {
+        let mut addrs = vec![Addr(desc.dst.base)];
+        match desc.args {
+            Args::Vector { .. } => {
+                let t = crate::profile::vector_traffic(desc).ok()?;
+                addrs.extend(t.reads.iter().chain(&t.writes).map(|&(a, _)| Addr(a)));
+            }
+            Args::Matmul { a, b, a2, b2, .. } => {
+                addrs.extend([Some(a), Some(b), a2, b2].into_iter().flatten())
+            }
+            _ => {}
+        }
+        addrs.into_iter().find_map(|a| {
             self.hashes
                 .iter()
                 .find(|h| h.hash.range.contains(a))
@@ -1317,6 +1322,31 @@ impl Sim {
                     )
                 })
         })
+    }
+
+    /// The error of a Muon task whose traffic cannot be charged: an error of
+    /// its kernel's `time` (an unknown kernel, a block of the wrong size,
+    /// an overflow), or an entry whose address is in no memory block. The
+    /// message names the task's PC (an RV program's task).
+    fn vector_error(&self, desc: &Descriptor) -> Option<String> {
+        if !matches!(desc.args, Args::Vector { .. }) {
+            return None;
+        }
+        let at = desc
+            .pc
+            .map_or(String::new(), |pc| format!("the Muon task at pc {pc:#x}: "));
+        let t = match crate::profile::vector_traffic(desc) {
+            Ok(t) => t,
+            Err(e) => return Some(format!("{at}{e}")),
+        };
+        let held = |a: u64| self.memories.iter().any(|m| m.holds(Addr(a)));
+        let entries = t.reads.iter().map(|e| ("read", e));
+        entries
+            .chain(t.writes.iter().map(|e| ("write", e)))
+            .find(|(_, &(a, _))| !held(a))
+            .map(|(what, &(a, n))| {
+                format!("{at}its {what} of {n} B at {a:#x} is in no memory block")
+            })
     }
 
     /// Starts `program` on `nu` at the current time.
@@ -2308,6 +2338,10 @@ impl Sim {
             }
             OpKind::Store { .. } => 0,
         };
+        let tile = match &kind {
+            OpKind::Task(desc) => self.atlas_tile(desc.pe),
+            OpKind::Store { .. } => crate::func::DEFAULT_TILE,
+        };
         let op = FuncOp {
             seq: self.func_seq,
             time: self.now,
@@ -2315,12 +2349,22 @@ impl Sim {
             gid,
             backend,
             kind,
+            tile,
         };
         let plane = self.plane.as_mut().expect("functional plane");
         if plane.emit(op).is_err() {
             self.worker_failed();
         }
         self.func_seq
+    }
+
+    /// The output tile of the Atlas `pe` ([`crate::func::DEFAULT_TILE`] for
+    /// another PE or none).
+    pub fn atlas_tile(&self, pe: Option<PeId>) -> [u64; 2] {
+        match pe.map(|p| &self.pes[p.0 as usize].cfg.params) {
+            Some(crate::config::PeParams::Atlas { tile, .. }) => *tile,
+            _ => crate::func::DEFAULT_TILE,
+        }
     }
 
     /// A `version` names a range that `nu` owns: versions of
@@ -2337,7 +2381,8 @@ impl Sim {
 
     /// The ranges a task writes and reads, named, for the data scratch
     /// check: its `dst`, and the operands of a DMA, matmul or vector task
-    /// (a matmul operand of `rows` rows with leading dimension `ld`).
+    /// (a matmul operand of `rows` rows with leading dimension `ld`; the
+    /// read and write entries of a vector task's kernel).
     fn task_ranges(desc: &Descriptor) -> Vec<(&'static str, Range)> {
         let mut v = vec![("dst", desc.dst)];
         let span = |at: Addr, rows: u64, ld: u64, dt: crate::Dtype| {
@@ -2367,11 +2412,15 @@ impl Sim {
                     v.push(("B2", span(*b2, *k, *ldb, *b_dtype)));
                 }
             }
-            Args::Vector {
-                src: Some(src),
-                bytes_in,
-                ..
-            } => v.push(("src", Range::from_len(src.0, *bytes_in))),
+            Args::Vector { .. } => {
+                // The kernel's entries (an error of its traffic stops the
+                // run at the issue).
+                if let Ok(t) = crate::profile::vector_traffic(desc) {
+                    let range = |&(a, n): &(u64, u64)| Range::from_len(a, n);
+                    v.extend(t.reads.iter().map(|e| ("a read of the kernel", range(e))));
+                    v.extend(t.writes.iter().map(|e| ("a write of the kernel", range(e))));
+                }
+            }
             _ => {}
         }
         v
@@ -2977,7 +3026,11 @@ impl Sim {
                 return;
             }
             if n.rec(t).profile.is_none() {
-                if let Some(msg) = self.hashed_compute(pe, &n.rec(t).desc) {
+                let desc = &n.rec(t).desc;
+                if let Some(msg) = self
+                    .hashed_compute(pe, desc)
+                    .or_else(|| self.vector_error(desc))
+                {
                     let gid = n.rec(t).gid;
                     return self.fatal(nu, Some(gid), FatalError::Invalid(msg));
                 }

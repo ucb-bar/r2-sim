@@ -47,8 +47,9 @@ pub struct PeId(pub u32);
 /// demand; it carries shapes, never data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Args {
-    /// Copy `bytes` from `src` to `dst` in chunks of `tile_bytes`; with
-    /// `rows`, a 2D copy of rows at strides.
+    /// Copy `bytes` from `src` to `dst`, in chunks of the engine's
+    /// `burst_bytes` (without the key: one chunk); with `rows`, a 2D copy
+    /// of rows at strides.
     Dma {
         /// Source address (of row 0).
         src: Addr,
@@ -56,23 +57,22 @@ pub enum Args {
         dst: Addr,
         /// Bytes to copy (`rows.count x rows.bytes` for a 2D copy).
         bytes: u64,
-        /// Bytes per chunk (greater than 0).
-        tile_bytes: u64,
         /// A 2D copy: row r goes from `src + r x src_stride` to `dst + r x
         /// dst_stride`. `None`: one contiguous row of `bytes`.
         rows: Option<Rows>,
     },
     /// `C[m, n] (+)= A[m, k] * B[k, n]`, row-major with leading dimensions
-    /// in elements; C is at `dst.base`. One chunk per `tile[0] x tile[1]`
-    /// output tile over the full `k`.
+    /// in elements; C is at `dst.base`. One chunk per output tile of the
+    /// Atlas (its key `tile`, `[rows, columns]`) over the full `k`.
     ///
     /// Split operands (banked SMEM, Neutrino spec Section 4.2.2): with `a2`,
-    /// the rows of A are in two half matrices. Row `r` of A, with
-    /// `t = r / tile[0]` and `j = r % tile[0]`, is row `t * h + j` of the
-    /// matrix at `a` when `j < h = tile[0] / 2`, else row `t * h + j - h`
-    /// of the matrix at `a2`; both have leading dimension `lda`. With
-    /// `b2`, the columns of B are split in the same way over `tile[1]`
-    /// (the matrices at `b` and `b2`, leading dimension `ldb`).
+    /// the rows of A are in two half matrices. Row `r` of A, with the
+    /// Atlas tile `tile`, `t = r / tile[0]` and `j = r % tile[0]`, is row
+    /// `t * h + j` of the matrix at `a` when `j < h = tile[0] / 2`, else
+    /// row `t * h + j - h` of the matrix at `a2`; both have leading
+    /// dimension `lda`. With `b2`, the columns of B are split in the same
+    /// way over `tile[1]` (the matrices at `b` and `b2`, leading dimension
+    /// `ldb`).
     Matmul {
         /// Address of A (with `a2`: of its low half rows).
         a: Addr,
@@ -105,8 +105,6 @@ pub enum Args {
         /// Leave C in the Atlas accumulator for the next accumulate task on
         /// the same dst; without an accumulator memory, no effect.
         keep: bool,
-        /// Output tile shape `[rows, columns]`: one chunk per tile.
-        tile: [u64; 2],
         /// B is stored as an `n x k` matrix (row-major, leading dimension
         /// `ldb`) and the task uses its transpose: element (p, j) of B is
         /// at element `j x ldb + p` from `b`. Not with `b2`. No time cost.
@@ -114,22 +112,15 @@ pub enum Args {
     },
     /// No request data (`join`).
     Join,
-    /// A vector task on a Muon: `ops` lane-ops, reading `bytes_in` and
-    /// writing `bytes_out` in SMEM.
+    /// A vector task on a Muon: a kernel of the registry and its argument
+    /// block, which give the task's traffic
+    /// ([`crate::kernels::Kernel::traffic`]).
     Vector {
-        /// Lane-ops of the task.
-        ops: u64,
-        /// Bytes read, from the block that holds `src`.
-        bytes_in: u64,
-        /// Bytes written, to the block that holds `dst`.
-        bytes_out: u64,
-        /// The address the task reads; `None`: the block of `dst`.
-        src: Option<Addr>,
         /// The kernel the task runs: an id of the kernel registry; 0 is
         /// the opaque task (a time, no data).
         kernel: u32,
-        /// The kernel's argument block, read from the invoking program's
-        /// data scratch at the invoke (empty: none).
+        /// The kernel's argument block (an RV program's: read from its data
+        /// scratch at the invoke).
         block: Vec<u8>,
     },
     /// Start a program on the child Neutrino.
@@ -227,7 +218,7 @@ pub struct Descriptor {
     /// The task's dependencies: it is ready when their producers complete.
     pub deps: Vec<Dep>,
     /// Software-assigned identity of this invocation; no hardware meaning.
-    /// The tracer names tasks by it and the Trace backend keys records by it.
+    /// The tracer names tasks by it.
     pub label: Option<u64>,
     /// Opcode-specific request data.
     pub args: Args,
@@ -268,8 +259,8 @@ impl Descriptor {
         }
     }
 
-    /// A DMA on engine `pe` of `bytes` from `src` to the start of `dst`, in
-    /// one tile. The engine must belong to the owner of `dst` (a write into
+    /// A DMA on engine `pe` of `bytes` from `src` to the start of `dst`. The
+    /// engine must belong to the owner of `dst` (a write into
     /// another node's memory is a pull by its owner; Neutrino spec), unless
     /// the task is [untracked](Descriptor::untracked).
     pub fn dma(pe: PeId, src: u64, dst: Range, bytes: u64) -> Self {
@@ -281,7 +272,6 @@ impl Descriptor {
                 src: Addr(src),
                 dst: Addr(dst.base),
                 bytes,
-                tile_bytes: bytes,
                 rows: None,
             },
         )
@@ -290,7 +280,7 @@ impl Descriptor {
     /// A matmul on the Atlas `pe`: C (`m` x `n`, at the start of `c`) = A
     /// (`m` x `k` at `a`) B (`k` x `n` at `b`), all of type `dtype`,
     /// row-major with leading dimensions `k`, `n` and `n`; no
-    /// accumulation, C not kept; output tiles of at most 128 x 128.
+    /// accumulation, C not kept.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul(
         pe: PeId,
@@ -322,29 +312,30 @@ impl Descriptor {
                 out_dtype: dtype,
                 accumulate: false,
                 keep: false,
-                tile: [m.min(128), n.min(128)],
                 transpose_b: false,
             },
         )
     }
 
-    /// A vector task on the Muon `pe` of `ops` lane-ops that reads
-    /// `bytes_in` (from `dst` unless [`Descriptor::with_src`]) and writes
-    /// `bytes_out` to `dst`.
+    /// A vector task on the Muon `pe` of the opaque kernel: `ops` lane-ops,
+    /// reading `bytes_in` (from `dst` unless [`Descriptor::with_src`]) and
+    /// writing `bytes_out` to `dst`.
     pub fn vector(pe: PeId, dst: Range, ops: u64, bytes_in: u64, bytes_out: u64) -> Self {
         Self::task(
             OpcodeId::VECTOR,
             pe,
             dst,
             Args::Vector {
-                ops,
-                bytes_in,
-                bytes_out,
-                src: None,
                 kernel: 0,
-                block: Vec::new(),
+                block: crate::kernels::opaque_block(0, ops, bytes_in, bytes_out),
             },
         )
+    }
+
+    /// A vector task on the Muon `pe` of kernel `kernel` with the argument
+    /// block `block`.
+    pub fn muon(pe: PeId, dst: Range, kernel: u32, block: Vec<u8>) -> Self {
+        Self::task(OpcodeId::VECTOR, pe, dst, Args::Vector { kernel, block })
     }
 
     /// Sets the dependencies.
@@ -357,22 +348,6 @@ impl Descriptor {
     /// consumers name an address).
     pub fn unversioned(mut self) -> Self {
         self.versioned = false;
-        self
-    }
-
-    /// A DMA's chunk size in bytes.
-    pub fn with_tile_bytes(mut self, n: u64) -> Self {
-        if let Args::Dma { tile_bytes, .. } = &mut self.args {
-            *tile_bytes = n;
-        }
-        self
-    }
-
-    /// A matmul's output tile, `[rows, columns]`.
-    pub fn with_tile(mut self, rows: u64, cols: u64) -> Self {
-        if let Args::Matmul { tile, .. } = &mut self.args {
-            *tile = [rows, cols];
-        }
         self
     }
 
@@ -412,10 +387,11 @@ impl Descriptor {
         self
     }
 
-    /// A vector task's source address.
+    /// The source address of an opaque vector task (the field `src` of its
+    /// block).
     pub fn with_src(mut self, src: u64) -> Self {
-        if let Args::Vector { src: s, .. } = &mut self.args {
-            *s = Some(Addr(src));
+        if let Args::Vector { kernel: 0, block } = &mut self.args {
+            block[..8].copy_from_slice(&src.to_le_bytes());
         }
         self
     }
@@ -474,18 +450,16 @@ impl Descriptor {
     }
 
     /// Bytes of the descriptor in an `Invoke` message: its size in the
-    /// Neutrino ABI (version 2), a 24-byte header (opcode, PE, flags,
+    /// Neutrino ABI (version 3), a 24-byte header (opcode, PE, flags,
     /// dependency count, `dst` base, bound and mask), 8 per dependency, and
-    /// the arguments (DMA 48, matmul 72, vector 32 or 40 with `src`, plus
+    /// the arguments (DMA 32, matmul 40, vector 4 (kernel and size) plus
     /// its argument block, spawn 16, IMEM copy 24, join 0). The label is
     /// not sent.
     pub fn wire_bytes(&self) -> u64 {
         let args = match &self.args {
-            Args::Dma { .. } => 48,
-            Args::Matmul { .. } => 72,
-            Args::Vector { src, block, .. } => {
-                32 + if src.is_some() { 8 } else { 0 } + block.len() as u64
-            }
+            Args::Dma { .. } => 32,
+            Args::Matmul { .. } => 40,
+            Args::Vector { block, .. } => 4 + block.len() as u64,
             Args::Join => 0,
             Args::Spawn { .. } => 16,
             Args::ImemCopy { .. } => 24,
@@ -941,7 +915,8 @@ impl ProfileRegistry {
     }
 }
 
-/// DMA: one transfer chunk per `tile_bytes` (or per burst); its hops in
+/// DMA: one transfer chunk per burst of the engine (without `burst_bytes`:
+/// one chunk); its hops in
 /// route order are the source port, the fabric route from the source
 /// block to the engine, the engine's extra links, the route from the
 /// engine to the destination block (each over the engine's master bus
@@ -955,7 +930,6 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         src,
         dst,
         bytes,
-        tile_bytes,
         rows,
     } = desc.args
     else {
@@ -972,10 +946,9 @@ pub(crate) fn dma_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     else {
         panic!("dma opcode on PE {}", node.pe.name);
     };
-    // The engine's burst, when set, is the chunk size: a fabric
-    // transaction, whatever the program's tile.
-    let tile_bytes = burst.unwrap_or(tile_bytes);
-    assert!(tile_bytes > 0, "dma with tile_bytes 0");
+    // The engine's burst, when set, is the chunk size (a fabric
+    // transaction); without it a transfer has no tile limit.
+    let tile_bytes = burst.unwrap_or(bytes.max(1));
     // The chunk loop is arithmetic (r2sim spec Section 5.5): the
     // block and route half of a side are looked up only when its address
     // leaves the block's run (a block or a hash granule), and a chunk
@@ -1156,7 +1129,7 @@ fn runs_2d(
     chunks
 }
 
-/// Atlas matmul: one chunk per output tile; tensor ops on the array and
+/// Atlas matmul: one chunk per output tile of the Atlas; tensor ops on the array and
 /// operand plus C bytes on SMEM. With one SMEM port (`smem_port`), all
 /// bytes are on that port. On a banked SMEM (`smem_port` is `None`), each
 /// operand and C range of the chunk charges the ports of the blocks it
@@ -1179,7 +1152,6 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         out_dtype,
         accumulate,
         keep,
-        tile,
         ..
     } = desc.args
     else {
@@ -1187,6 +1159,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     };
     let PeParams::Atlas {
         array,
+        tile,
         smem_port,
         smem_wport,
         utilization,
@@ -1504,24 +1477,28 @@ pub(crate) fn request_leg(topo: &Topology, pe: &PeConfig, m: &MemBlock) -> Cycle
     topo.best_path(masters, &m.attach).map_or(0, |p| p.latency)
 }
 
-/// Muon vector task: one chunk; lane-ops on the vector resource at the
-/// configured utilization, plus the task's bytes on the port of the block
-/// that holds `dst` and on the route to it, after the fixed overhead and
-/// the longer path latency: the input path is the latency of the block
-/// that holds `src` (its bank on a banked memory; 2026-10-21) plus the
-/// route's, the output path the route's only (a write pays no block
-/// latency).
-pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
-    let Args::Vector {
-        ops,
-        bytes_in,
-        bytes_out,
-        src,
-        ..
-    } = desc.args
-    else {
+/// The traffic of the Muon task `desc` from its kernel and argument block
+/// (the kernel registry, [`crate::kernels::Kernel::traffic`]).
+pub fn vector_traffic(desc: &Descriptor) -> Result<crate::kernels::Traffic, String> {
+    let Args::Vector { kernel, ref block } = desc.args else {
         panic!("vector op with args {:?}", desc.args);
     };
+    let k = crate::kernels::by_id(kernel)
+        .ok_or_else(|| format!("kernel {kernel} is not in the kernel registry"))?;
+    k.traffic(block, desc.dst.base)
+}
+
+/// Muon vector task: one chunk. The kernel's traffic
+/// ([`vector_traffic`]) gives the lane-ops, on the vector resource at the
+/// configured utilization, and per read (write) entry the bytes from (to)
+/// the block that holds its address: on the route between the block and
+/// the Muon and on the block's port (a banked block: the banks of the
+/// entry's range); the entries of one block add up. The latency is the
+/// fixed overhead plus the longest path of the entries: a read pays its
+/// request's trip to the block, the block's latency and the route's (as a
+/// DMA's fill and a load do; 2026-10-21), a write the route's only.
+pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
+    let traffic = vector_traffic(desc).unwrap_or_else(|e| panic!("{e}"));
     let PeParams::Muon {
         vector,
         ref masters,
@@ -1532,59 +1509,73 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     else {
         panic!("vector opcode on PE {}", node.pe.name);
     };
-    // The blocks it reads and writes: the SM's SMEM over lbus, a remote
-    // range over the SM's data bus. bytes_in are reads, bytes_out writes;
-    // a resource on both routes is charged once for both.
-    let mut v = Demand::work(vector, ops);
+    let mut v = Demand::work(vector, traffic.ops);
     v.utilization = utilization;
     let mut demand = vec![v];
     let mut latency = 0;
     let mut routes = [None; 2];
-    let out_block = node.memory(Addr(desc.dst.base));
-    let in_block = src.map_or(out_block, |a| node.memory(a));
-    for (block, bytes, to) in [(in_block, bytes_in, false), (out_block, bytes_out, true)] {
-        let (from, dest): (&[AttachId], &[AttachId]) = if to {
-            (masters, &block.attach)
-        } else {
-            (&block.attach, masters)
-        };
-        let route = node
-            .topology
-            .best_path(from, dest)
-            .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
-        // A read pays its request's trip to the source block and the
-        // block's latency, as a DMA's fill and a load do (2026-10-21); a
-        // task that reads nothing has no input path.
-        let block_latency = if to || bytes == 0 {
-            0
-        } else {
-            request_leg(node.topology, node.pe, block) + block.load_latency
-        };
-        latency = latency.max(block_latency + route.latency);
+    for (entries, to) in [(&traffic.reads, false), (&traffic.writes, true)] {
         let dir = if to { Dir::Write } else { Dir::Read };
-        routes[to as usize] = node
-            .topology
-            .best_pair(from, dest)
-            .map(|(from, to)| RouteUse {
-                from,
-                to,
-                bytes,
-                dir,
-            });
-        for r in route.resources_for(dir) {
-            demand.push(Demand::new(*r, bytes, dir));
+        // The entries by block, in order of first use: (block, bytes, the
+        // entries' ranges).
+        let mut blocks: Vec<(usize, u64, Vec<Range>)> = Vec::new();
+        for &(addr, bytes) in entries {
+            let b = node
+                .memories
+                .iter()
+                .position(|m| m.holds(Addr(addr)))
+                .unwrap_or_else(|| panic!("address {addr:#x} is in no memory block"));
+            match blocks.iter_mut().find(|x| x.0 == b) {
+                Some(x) => {
+                    x.1 += bytes;
+                    x.2.push(Range::from_len(addr, bytes));
+                }
+                None => blocks.push((b, bytes, vec![Range::from_len(addr, bytes)])),
+            }
         }
-        // A banked block: the bytes spread over the banks of the range
-        // (r2sim spec Section 6.3); otherwise the block's port.
-        let base = if to {
-            desc.dst.base
-        } else {
-            src.map_or(desc.dst.base, |a| a.0)
-        };
-        if block.banked && bytes > 0 {
-            spread(node, Range::from_len(base, bytes), bytes, dir, &mut demand);
-        } else {
-            demand.push(Demand::new(block.port_for(dir), bytes, dir));
+        let mut widest = 0;
+        for (b, bytes, ranges) in blocks {
+            let block = &node.memories[b];
+            let (from, dest): (&[AttachId], &[AttachId]) = if to {
+                (masters, &block.attach)
+            } else {
+                (&block.attach, masters)
+            };
+            let route = node
+                .topology
+                .best_path(from, dest)
+                .unwrap_or_else(|| panic!("{}: no route to {}", node.pe.name, block.name));
+            let block_latency = if to {
+                0
+            } else {
+                request_leg(node.topology, node.pe, block) + block.load_latency
+            };
+            latency = latency.max(block_latency + route.latency);
+            // The tracer draws the route of the block with the most bytes.
+            if bytes > widest {
+                widest = bytes;
+                routes[to as usize] =
+                    node.topology
+                        .best_pair(from, dest)
+                        .map(|(from, to)| RouteUse {
+                            from,
+                            to,
+                            bytes,
+                            dir,
+                        });
+            }
+            for r in route.resources_for(dir) {
+                demand.push(Demand::new(*r, bytes, dir));
+            }
+            // A banked block: the bytes spread over the banks of each range
+            // (r2sim spec Section 6.3); otherwise the block's port.
+            if block.banked {
+                for r in ranges {
+                    spread(node, r, r.len(), dir, &mut demand);
+                }
+            } else {
+                demand.push(Demand::new(block.port_for(dir), bytes, dir));
+            }
         }
     }
     for d in demand.iter_mut().filter(|d| d.dir != Dir::Work) {
@@ -1736,14 +1727,6 @@ device:
         let hashes: Vec<&AddressHash> = sim.hashes().collect();
         let routes = TransferRoutes::build(&pes, sim.memories(), &hashes, sim.topology());
         let smem = b.memory("root.sm0.smem").base;
-        let node = NodeConfig {
-            pe: sim.pe_config(pe_id),
-            pe_id,
-            routes: &routes,
-            memories: sim.memories(),
-            topology: sim.topology(),
-            acc: AccFlags::default(),
-        };
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
         let mut rnd = |n: u64| {
             x = x
@@ -1785,9 +1768,21 @@ device:
                     src: Addr(src),
                     dst: Addr(dst),
                     bytes,
-                    tile_bytes: tile,
                     rows: None,
                 },
+            };
+            // The engine's burst is the chunk size.
+            let mut pe = sim.pe_config(pe_id).clone();
+            if let PeParams::Dma { burst, .. } = &mut pe.params {
+                *burst = Some(tile);
+            }
+            let node = NodeConfig {
+                pe: &pe,
+                pe_id,
+                routes: &routes,
+                memories: sim.memories(),
+                topology: sim.topology(),
+                acc: AccFlags::default(),
             };
             let p = dma_profile(&desc, &node);
             let want = by_lookup(

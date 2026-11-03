@@ -13,7 +13,7 @@ use serde_json::Value;
 const NULL32: u32 = u32::MAX;
 const ENCODER: &str = "../nu-rv/tests/fixtures/rv/encoder.bin";
 /// The images in encoder.bin by size: (bytes, offset in encoder.bin).
-const IMAGES: [(u64, usize); 3] = [(16_496, 0), (16_176, 248), (13_392, 2_944)];
+const IMAGES: [(u64, usize); 3] = [(16_128, 0), (15_808, 248), (13_024, 2_944)];
 
 fn u32_at(r: &[u8], o: usize) -> u32 {
     u32::from_le_bytes(r[o..o + 4].try_into().unwrap())

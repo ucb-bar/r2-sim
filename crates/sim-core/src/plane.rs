@@ -301,7 +301,7 @@ impl Functional {
             if null {
                 mark(&mut self.marks, store, op, desc);
             } else if !self.marks.granules.is_empty() {
-                for (addr, len) in reads(desc) {
+                for (addr, len) in reads(desc, op.tile) {
                     check(&mut self.marks, g, op, addr, len);
                 }
                 unmark(&mut self.marks, g, &desc.dst, Some(desc));
@@ -370,10 +370,10 @@ fn check(m: &mut NullMarks, g: u64, op: &FuncOp, addr: u64, len: u64) {
 }
 
 /// The byte ranges that a task reads: the source rows of a DMA; A, B (by
-/// its stored shape), and C when it accumulates, of a matmul (row by
-/// row); [`src`, `src` + `bytes_in`) of a Muon task (`src` is the base of
-/// `dst` when the task has none).
-fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
+/// its stored shape, with the halves of split operands by the Atlas tile
+/// `tile`), and C when it accumulates, of a matmul (row by row); the read
+/// entries of a Muon task's kernel (the registry's `time`).
+fn reads(desc: &Descriptor, tile: [u64; 2]) -> Vec<(u64, u64)> {
     match desc.args {
         Args::Dma {
             src, bytes, rows, ..
@@ -398,7 +398,6 @@ fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
             b_dtype,
             out_dtype,
             accumulate,
-            tile,
             transpose_b,
             ..
         } => {
@@ -441,9 +440,9 @@ fn reads(desc: &Descriptor) -> Vec<(u64, u64)> {
             }
             out
         }
-        Args::Vector { src, bytes_in, .. } => {
-            vec![(src.map_or(desc.dst.base, |s| s.0), bytes_in)]
-        }
+        Args::Vector { .. } => crate::profile::vector_traffic(desc)
+            .map(|t| t.reads)
+            .unwrap_or_default(),
         _ => Vec::new(),
     }
 }

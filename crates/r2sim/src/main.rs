@@ -1,7 +1,7 @@
 //! `r2sim run --config C --program P [options]` (see `USAGE`).
 //! `r2sim kernels` prints the Muon kernel registry as JSON.
 //!
-//! Runs program P on configuration C in timing mode with the Trace backend
+//! Runs program P on configuration C in timing mode with the `null` backend
 //! (`--functional` selects another; `--image` loads a memory image).
 //! It prints a summary to stdout and, with `--stats OUT`, writes the run as
 //! JSON to OUT. `--trace-out DIR` writes the tracer files;

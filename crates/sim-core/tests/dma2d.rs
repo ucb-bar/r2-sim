@@ -50,7 +50,7 @@ fn copy(runs_per_cycle: u64, src_stride: u64, dst_stride: u64) -> (Stats, Vec<u8
     }
     let mut sim = b.sim;
     sim.set_timeline(true);
-    sim.set_functional(Box::new(func::Numeric::new()));
+    sim.set_functional(Box::new(func::Builtin::new()));
     let data: Vec<u8> = (0..32 * src_stride).map(|i| (i % 251) as u8).collect();
     sim.init_memory(Addr(src), data);
     sim.spawn(root, move |ctx: NuCtx| async move {

@@ -24,8 +24,7 @@ fn names(n: &[&str]) -> Vec<String> {
 fn make(name: &str) -> Result<Box<dyn FunctionalBackend>, String> {
     Ok(match name {
         "null" => Box::new(NullBackend),
-        "numeric" => Box::new(func::Numeric::new()),
-        "trace" => Box::new(func::Trace::new()),
+        "builtin" => Box::new(func::Builtin::new()),
         n => return Err(format!("unknown backend {n:?}")),
     })
 }
@@ -37,9 +36,9 @@ fn lists(dma: &[&str], atlas: &[&str], muon: &[&str]) -> Result<Backends, String
 
 #[test]
 fn the_unit_lists_share_one_instance_per_backend() {
-    let b = lists(&["numeric", "null"], &["numeric"], &["null"]).unwrap();
+    let b = lists(&["builtin", "null"], &["builtin"], &["null"]).unwrap();
     let got: Vec<&str> = b.list.iter().map(|x| x.name()).collect();
-    assert_eq!(got, ["numeric", "null"]);
+    assert_eq!(got, ["builtin", "null"]);
     assert_eq!(
         (
             b.units.dma.clone(),
@@ -52,9 +51,9 @@ fn the_unit_lists_share_one_instance_per_backend() {
 
 #[test]
 fn a_bad_list_names_its_key() {
-    let e = lists(&["numeric"], &["foo"], &["null"]).err().unwrap();
+    let e = lists(&["builtin"], &["foo"], &["null"]).err().unwrap();
     assert_eq!(e, "functional.units.atlas: unknown backend \"foo\"");
-    let e = lists(&["numeric"], &["numeric"], &[]).err().unwrap();
+    let e = lists(&["builtin"], &["builtin"], &[]).err().unwrap();
     assert_eq!(e, "functional.units.muon: an empty list");
 }
 
@@ -68,7 +67,7 @@ fn matmul(
     acc: (bool, bool),
     deps: Vec<nu_model::Dep>,
 ) -> Descriptor {
-    let mut d = n.matmul(c, deps, E, E).with_acc(acc.0, acc.1);
+    let mut d = n.matmul(c, deps, E).with_acc(acc.0, acc.1);
     if let Args::Matmul { a, b, .. } = &mut d.args {
         (*a, *b) = (Addr(SMEM), Addr(SMEM + MAT));
     }
@@ -78,7 +77,7 @@ fn matmul(
 
 /// A DMA of C into `to` (an SMEM offset) that depends on version `v` of C.
 fn copy_c(n: &Node, c: Range, to: u64, v: u64) -> Descriptor {
-    let mut d = n.dma(0, to, MAT, MAT).with_deps(vec![ver(c, v)]);
+    let mut d = n.dma(0, to, MAT).with_deps(vec![ver(c, v)]);
     if let Args::Dma { src, .. } = &mut d.args {
         *src = Addr(c.base);
     }
@@ -106,8 +105,8 @@ fn run(n: Node, backends: Backends, second: usize, tasks: Vec<Descriptor>) -> St
 
 #[test]
 fn a_matmul_chain_on_two_backends_stops_the_run() {
-    // Atlas list [numeric, trace]: the second task of the chain goes to
-    // trace, while numeric holds the partial sums.
+    // Atlas list [builtin, null]: the second task of the chain goes to
+    // null, while builtin holds the partial sums.
     let n = node(Knobs::default());
     let c = smem(4 * MAT, MAT);
     let tasks = vec![
@@ -115,14 +114,14 @@ fn a_matmul_chain_on_two_backends_stops_the_run() {
         matmul(&n, c, 2, (true, true), vec![ver(c, 1)]),
         matmul(&n, c, 3, (true, false), vec![ver(c, 2)]),
     ];
-    let b = lists(&["numeric"], &["numeric", "trace"], &["null"]).unwrap();
+    let b = lists(&["builtin"], &["builtin", "null"], &["null"]).unwrap();
     let s = run(n, b, 1, tasks);
     let f = s.fatal.expect("an error at the switch");
     let FatalError::Invalid(msg) = &f.error else {
         panic!("{f:?}");
     };
     assert!(
-        msg.contains("chain") && msg.contains("trace") && msg.contains("numeric"),
+        msg.contains("chain") && msg.contains("null") && msg.contains("builtin"),
         "{msg}"
     );
 }
@@ -137,7 +136,7 @@ fn null_reads(s: &Stats) -> Vec<&sim_core::WarningRec> {
 
 #[test]
 fn a_read_of_null_output_warns_once_per_range() {
-    // Atlas list [null, numeric]: the matmul writes C on null; two DMAs
+    // Atlas list [null, builtin]: the matmul writes C on null; two DMAs
     // read C: one warning, at the first.
     let n = node(Knobs::default());
     let c = smem(4 * MAT, MAT);
@@ -146,7 +145,7 @@ fn a_read_of_null_output_warns_once_per_range() {
         copy_c(&n, c, 6 * MAT, 1),
         copy_c(&n, c, 7 * MAT, 1),
     ];
-    let b = lists(&["numeric"], &["null", "numeric"], &["null"]).unwrap();
+    let b = lists(&["builtin"], &["null", "builtin"], &["null"]).unwrap();
     let s = run(n, b, 0, tasks);
     assert_eq!(s.fatal, None);
     let reads = null_reads(&s);
@@ -163,7 +162,7 @@ fn a_read_of_null_output_warns_once_per_range() {
 
 #[test]
 fn a_write_by_a_computing_backend_removes_the_mark() {
-    // The matmul on null writes C, a matmul on numeric (the test
+    // The matmul on null writes C, a matmul on builtin (the test
     // selection) writes C again, and a DMA reads C: no warning.
     let n = node(Knobs::default());
     let c = smem(4 * MAT, MAT);
@@ -172,7 +171,7 @@ fn a_write_by_a_computing_backend_removes_the_mark() {
         matmul(&n, c, 2, (false, false), vec![ver(c, 1)]),
         copy_c(&n, c, 6 * MAT, 2),
     ];
-    let b = lists(&["numeric"], &["null", "numeric"], &["null"]).unwrap();
+    let b = lists(&["builtin"], &["null", "builtin"], &["null"]).unwrap();
     let s = run(n, b, 0, tasks);
     assert_eq!(s.fatal, None);
     assert!(null_reads(&s).is_empty(), "{:?}", s.warnings);
@@ -180,7 +179,7 @@ fn a_write_by_a_computing_backend_removes_the_mark() {
 
 #[test]
 fn a_muon_task_that_reads_null_output_warns() {
-    // Atlas list [null], Muon list [trace]: the matmul writes C on null; a
+    // Atlas list [null], Muon list [builtin]: the matmul writes C on null; a
     // Muon task reads [src, src + bytes_in) = C (one warning), another
     // reads its own dst when it has no src (none: nothing wrote it).
     let mut n = node(Knobs::default());
@@ -211,7 +210,7 @@ fn a_muon_task_that_reads_null_output_warns() {
         .with_deps(vec![ver(c, 1)]);
     let own = Descriptor::vector(muon, smem(10 * MAT, MAT), 1024, MAT, MAT);
     let tasks = vec![matmul(&n, c, 1, (false, false), vec![]), reader, own];
-    let b = lists(&["numeric"], &["null"], &["trace"]).unwrap();
+    let b = lists(&["builtin"], &["null"], &["builtin"]).unwrap();
     let s = run(n, b, 0, tasks);
     assert_eq!(s.fatal, None);
     let reads = null_reads(&s);

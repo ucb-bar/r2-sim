@@ -107,7 +107,6 @@ fn dma(b: Built, nu: &str, src: u64, dst: u64, bytes: u64) -> Stats {
             src: Addr(src),
             dst: Addr(dst),
             bytes,
-            tile_bytes: bytes,
             rows: None,
         },
     };
@@ -290,7 +289,7 @@ fn a_store_through_a_hash_link_is_one_piece_per_granule() {
 
 /// The Atlas of `atlas_node` (a 4096 MAC/cycle bf16 array) on an SMEM of
 /// four 16 KiB banks of 64 B/cycle per port.
-const ATLAS: &str = "        - {name: atlas, type: tensor, rate: {bf16: 4096}, quantize: none, master: [$this.lbus]}";
+const ATLAS: &str = "        - {name: atlas, type: tensor, rate: {bf16: 4096}, quantize: none, tile: [64, 64], master: [$this.lbus]}";
 
 fn atlas_node(fabric: &str, mems: &str) -> Built {
     let sets = [
@@ -336,7 +335,6 @@ fn atlas_mm(b: Built, a: u64, a2: Option<u64>, bb: u64, b2: Option<u64>, c: u64)
             out_dtype: sim_core::Dtype::Bf16,
             accumulate: false,
             keep: false,
-            tile: [64, 64],
             transpose_b: false,
         },
     };
@@ -415,7 +413,6 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
             out_dtype: sim_core::Dtype::Bf16,
             accumulate: false,
             keep: false,
-            tile: [64, 64],
             transpose_b: false,
         },
     };
@@ -446,12 +443,8 @@ fn a_compute_pe_does_not_use_a_hashed_range() {
         deps: vec![],
         label: None,
         args: Args::Vector {
-            ops: 64,
-            bytes_in: 1024,
-            bytes_out: 1024,
-            src: Some(Addr(0x10_1000)),
             kernel: 0,
-            block: Vec::new(),
+            block: sim_core::kernels::opaque_block(0x10_1000, 64, 1024, 1024),
         },
     };
     let mut sim = b.sim;
@@ -491,12 +484,8 @@ fn a_muon_task_spreads_over_the_banks_of_its_range() {
         deps: vec![],
         label: None,
         args: Args::Vector {
-            ops: 64,
-            bytes_in: 8192,
-            bytes_out: 1024,
-            src: Some(Addr(smem + 0x3000)),
             kernel: 0,
-            block: Vec::new(),
+            block: sim_core::kernels::opaque_block(smem + 0x3000, 64, 8192, 1024),
         },
     };
     let mut sim = b.sim;

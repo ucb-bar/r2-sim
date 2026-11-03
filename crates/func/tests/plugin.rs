@@ -135,7 +135,11 @@ fn dma_bytes(src: u64, dst: u64, n: u64) -> Vec<u8> {
     b.extend((dst / 512).to_le_bytes());
     b.extend(1u32.to_le_bytes()); // bound in granules
     b.extend(u32::MAX.to_le_bytes()); // mask
-    for x in [src, dst, n, n] {
+                                      // The arguments (ABI version 3): src, dst, row bytes, rows, strides.
+    for x in [src, dst] {
+        b.extend(x.to_le_bytes());
+    }
+    for x in [n as u32, 1, 0, 0] {
         b.extend(x.to_le_bytes());
     }
     b
@@ -166,10 +170,10 @@ fn dma_op(seq: u64, src: u64, dst: u64, n: u64, bytes: Vec<u8>) -> FuncOp {
                 src: Addr(src),
                 dst: Addr(dst),
                 bytes: n,
-                tile_bytes: n,
                 rows: None,
             },
         }),
+        tile: sim_core::func::DEFAULT_TILE,
     }
 }
 
@@ -177,7 +181,7 @@ fn dma_op(seq: u64, src: u64, dst: u64, n: u64, bytes: Vec<u8>) -> FuncOp {
 fn plugin(config: &str) -> Result<Plugin, String> {
     let lib = test_lib();
     let pes = vec!["root.dma".to_string(), "root.atlas".to_string()];
-    Plugin::open("test", lib.to_str().unwrap(), config, pes)
+    Plugin::open("test", lib.to_str().unwrap(), config, pes, &[[128, 128]; 2])
 }
 
 fn temp(name: &str) -> PathBuf {
@@ -218,8 +222,10 @@ fn configure_passes_the_kernel_registry() {
         serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
     std::fs::remove_file(out).unwrap();
     let k = &cfg["kernels"];
-    assert_eq!(k.as_array().unwrap().len(), 4);
-    let e = &k[1];
+    assert_eq!(k.as_array().unwrap().len(), 5);
+    assert_eq!((&k[0]["id"], &k[0]["name"]), (&0.into(), &"opaque".into()));
+    assert!(k[0].get("time").is_none());
+    let e = &k[2];
     assert_eq!(
         (&e["id"], &e["name"], &e["bytes"]),
         (&2.into(), &"epilogue".into(), &80.into())
@@ -282,12 +288,12 @@ fn errors_of_configure_and_apply_name_the_backend_and_the_library() {
 
 #[test]
 fn a_missing_library_or_symbol_is_an_error() {
-    let e = Plugin::open("py", "/nonexistent/libx.so", "{}", vec![])
+    let e = Plugin::open("py", "/nonexistent/libx.so", "{}", vec![], &[])
         .err()
         .unwrap();
     assert!(e.starts_with("backend py (/nonexistent/libx.so): "), "{e}");
     assert!(e.contains("No such file"), "{e}");
-    let e = Plugin::open("m", "libm.so.6", "{}", vec![]).err();
+    let e = Plugin::open("m", "libm.so.6", "{}", vec![], &[]).err();
     // A file name is looked up next to the binary: not there.
     assert!(e.is_some());
     // The C library, which has no r2_backend_open: its path from dladdr.
@@ -298,7 +304,9 @@ fn a_missing_library_or_symbol_is_an_error() {
             .to_string_lossy()
             .into_owned()
     };
-    let e = Plugin::open("c", &libc_path, "{}", vec![]).err().unwrap();
+    let e = Plugin::open("c", &libc_path, "{}", vec![], &[])
+        .err()
+        .unwrap();
     assert!(e.contains("no symbol r2_backend_open"), "{e}");
 }
 
@@ -335,6 +343,7 @@ fn the_argument_block_of_a_muon_task_reaches_the_plugin() {
         gid: Some(77),
         backend: 0,
         kind: OpKind::Task(d),
+        tile: sim_core::func::DEFAULT_TILE,
     };
     p.apply(&op, &mut m).unwrap();
     drop(p);

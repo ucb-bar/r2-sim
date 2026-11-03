@@ -38,7 +38,7 @@ fn the_record_of_the_root() {
     assert_eq!(r.len(), 1);
     assert_eq!(
         (r[0].at, r[0].entry, r[0].name.as_str()),
-        (0x148, 0x2a, "hello")
+        (0x140, 0x2a, "hello")
     );
 }
 
@@ -83,11 +83,11 @@ fn hello_makes_its_four_tasks() {
     let rv = common::run(HELLO, &[]);
     assert_eq!(rv.stats.fatal, None);
     assert_eq!(rv.tasks.len(), 4);
-    // The toolchain's source map: the two loads at 0x96, the matmul at
-    // 0xf0, the copy back at 0x138.
+    // The toolchain's source map: the two loads at 0x92, the matmul at
+    // 0xe4, the copy back at 0x124.
     let mut pcs: Vec<_> = rv.tasks.iter().map(|t| t.pc.unwrap()).collect();
     pcs.sort();
-    assert_eq!(pcs, [0x96, 0x96, 0xf0, 0x138]);
+    assert_eq!(pcs, [0x92, 0x92, 0xe4, 0x124]);
     let task = |want: &Descriptor| {
         rv.tasks
             .iter()
@@ -95,10 +95,10 @@ fn hello_makes_its_four_tasks() {
             .unwrap_or_else(|| panic!("no task writes {:?}", want.dst))
     };
     for (want, pc) in [
-        (&load_a, 0x96),
-        (&load_b, 0x96),
-        (&mm, 0xf0),
-        (&back, 0x138),
+        (&load_a, 0x92),
+        (&load_b, 0x92),
+        (&mm, 0xe4),
+        (&back, 0x124),
     ] {
         let got = task(want);
         assert_eq!(key(got), key(want));

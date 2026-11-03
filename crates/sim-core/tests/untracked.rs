@@ -41,7 +41,6 @@ fn dma(b: &Built, pe: &str, src: u64, dst: u64, bytes: u64, label: u64) -> Descr
             src: Addr(src),
             dst: Addr(dst),
             bytes,
-            tile_bytes: bytes,
             rows: None,
         },
     }
@@ -280,7 +279,7 @@ fn an_untracked_dma_writes_another_nodes_memory_in_the_functional_plane() {
     );
     let d = dma(&b, "root.gpc0.sm0.dma", s0, s1 + 0x1000, 512, 1);
     let mut sim = b.sim;
-    sim.set_functional(Box::new(func::Numeric::new()));
+    sim.set_functional(Box::new(func::Builtin::new()));
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         let pattern: Vec<u8> = (0..512).map(|i| (i * 7 % 251) as u8).collect();
         ctx.store(Addr(s0), pattern.clone()).await;

@@ -56,7 +56,6 @@ fn mm(b: &Built, (a, bb, c): (u64, u64, u64), accumulate: bool, keep: bool) -> D
             out_dtype: Dtype::Bf16,
             accumulate,
             keep,
-            tile: [T, T],
             transpose_b: false,
         },
     }
@@ -165,7 +164,6 @@ fn the_tmem_access_rules_stop_the_run() {
             src: Addr(bank(b, 2)),
             dst: Addr(to),
             bytes: 4096,
-            tile_bytes: 4096,
             rows: None,
         },
     };

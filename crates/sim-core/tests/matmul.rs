@@ -14,8 +14,8 @@ const KB8: u64 = 8192;
 fn matmul_end_to_end() {
     let n = node(Knobs::default());
     let (a, b, c) = (smem(0, KB8), smem(KB8, KB8), smem(2 * KB8, KB8));
-    let (da, db) = (n.dma(0, 0, KB8, KB8), n.dma(KB8, KB8, KB8, KB8));
-    let mm = n.matmul(c, vec![v1(a), v1(b)], 64, 64);
+    let (da, db) = (n.dma(0, 0, KB8), n.dma(KB8, KB8, KB8));
+    let mm = n.matmul(c, vec![v1(a), v1(b)], 64);
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.invoke(da).await;
@@ -64,8 +64,11 @@ fn matmul_end_to_end() {
 }
 
 fn two_dmas(k: Knobs, bytes: u64, tile: u64) -> (Stats, sim_core::ResourceId) {
-    let n = node(k);
-    let (da, db) = (n.dma(0, 0, bytes, tile), n.dma(bytes, bytes, bytes, tile));
+    let n = node(Knobs {
+        dma_burst: Some(tile),
+        ..k
+    });
+    let (da, db) = (n.dma(0, 0, bytes), n.dma(bytes, bytes, bytes));
     let (a, b) = (smem(0, bytes), smem(bytes, bytes));
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
@@ -107,9 +110,10 @@ fn two_dmas_on_one_link_interleave_by_chunk() {
 fn one_dma_last_end(outstanding: u32) -> u64 {
     let n = node(Knobs {
         dma_outstanding: outstanding,
+        dma_burst: Some(2048),
         ..Knobs::default()
     });
-    let d = n.dma(0, 0, KB8, 2048);
+    let d = n.dma(0, 0, KB8);
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.invoke(d).await;
@@ -140,9 +144,9 @@ fn full_scoreboard_stalls_invoke_until_issue() {
         ..Knobs::default()
     });
     let (a, c) = (smem(0, KB8), smem(2 * KB8, KB8));
-    let da = n.dma(0, 0, KB8, KB8);
-    let mm = n.matmul(c, vec![v1(a)], 64, 64);
-    let db = n.dma(KB8, KB8, KB8, KB8);
+    let da = n.dma(0, 0, KB8);
+    let mm = n.matmul(c, vec![v1(a)], 64);
+    let db = n.dma(KB8, KB8, KB8);
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.invoke(da).await;
@@ -171,9 +175,9 @@ fn join_fans_in() {
     });
     let (a, b, c) = (smem(0, KB8), smem(KB8, KB8), smem(2 * KB8, KB8));
     let j = sync(0);
-    let (da, db) = (n.dma(0, 0, KB8, KB8), n.dma(KB8, KB8, KB8, KB8));
+    let (da, db) = (n.dma(0, 0, KB8), n.dma(KB8, KB8, KB8));
     let join = sim_core::Descriptor::join(j, vec![v1(a), v1(b)]);
-    let mut mm = n.matmul(c, vec![], 64, 64);
+    let mut mm = n.matmul(c, vec![], 64);
     mm.deps = vec![Dep::Unversioned(j.base)];
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
@@ -199,7 +203,7 @@ fn same_base_different_bound_is_fatal() {
     // Two live versioned ranges at one base address with different bounds
     // are a software error (Neutrino spec Section 7.2, Rule N7.3).
     let n = node(Knobs::default());
-    let (d1, d2) = (n.dma(0, 0, KB8, KB8), n.dma(0, 0, 4096, 4096));
+    let (d1, d2) = (n.dma(0, 0, KB8), n.dma(0, 0, 4096));
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.invoke(d1).await;
@@ -257,9 +261,9 @@ fn wait_on_a_range_nobody_produces_is_reported() {
 fn unordered_writers_warn() {
     let n = node(Knobs::default());
     // Two unversioned writers of one range with no order between them.
-    let (mut d1, mut d2) = (n.dma(0, 0, KB8, KB8), n.dma(0, 0, 4096, 4096));
+    let (mut d1, mut d2) = (n.dma(0, 0, KB8), n.dma(0, 0, 4096));
     (d1.versioned, d2.versioned) = (false, false);
-    let mut mm = n.matmul(smem(2 * KB8, KB8), vec![], 64, 64);
+    let mut mm = n.matmul(smem(2 * KB8, KB8), vec![], 64);
     mm.deps = vec![Dep::Unversioned(smem(0, 1024).base)];
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
@@ -283,7 +287,7 @@ fn an_unversioned_signal_is_found_after_its_producer_completed() {
     let n = node(Knobs::default());
     let (j, c) = (sync(0), smem(2 * KB8, KB8));
     let join = sim_core::Descriptor::join(j, vec![]);
-    let mut mm = n.matmul(c, vec![], 64, 64);
+    let mut mm = n.matmul(c, vec![], 64);
     mm.deps = vec![Dep::Unversioned(j.base)];
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
@@ -317,7 +321,7 @@ fn vreset_all_clears_the_callers_table() {
         ..Knobs::default()
     });
     let (a, b) = (smem(0, KB8), smem(KB8, KB8));
-    let (da, db) = (n.dma(0, 0, KB8, KB8), n.dma(0, KB8, KB8, KB8));
+    let (da, db) = (n.dma(0, 0, KB8), n.dma(0, KB8, KB8));
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.version(a.base, 41).await;
@@ -346,11 +350,7 @@ fn version_and_vreset_reset_the_counter() {
         ..Knobs::default()
     });
     let a = smem(0, KB8);
-    let (d1, d2, d3) = (
-        n.dma(0, 0, KB8, KB8),
-        n.dma(0, 0, KB8, KB8),
-        n.dma(0, 0, KB8, KB8),
-    );
+    let (d1, d2, d3) = (n.dma(0, 0, KB8), n.dma(0, 0, KB8), n.dma(0, 0, KB8));
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.version(a.base, 41).await;
@@ -375,7 +375,7 @@ fn version_and_vreset_reset_the_counter() {
 fn a_full_version_table_is_fatal_for_a_local_invoke() {
     // Version capacity 16: the 17th versioned range stops the run.
     let n = node(Knobs::default());
-    let ds: Vec<_> = (0..17).map(|i| n.dma(0, i * 512, 512, 512)).collect();
+    let ds: Vec<_> = (0..17).map(|i| n.dma(0, i * 512, 512)).collect();
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         for d in ds {
@@ -399,7 +399,7 @@ fn program_return_keeps_the_version_table() {
     // The version table resets at a program start (hierarchy.rs), not at a
     // return.
     let n = node(Knobs::default());
-    let da = n.dma(0, 0, KB8, KB8);
+    let da = n.dma(0, 0, KB8);
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         let h = ctx.invoke(da).await;
@@ -418,8 +418,8 @@ fn full_pending_is_fatal_for_a_local_caller() {
         ..Knobs::default()
     });
     // Two consumers of ranges that nobody has invoked yet.
-    let c1 = n.matmul(smem(2 * KB8, KB8), vec![v1(smem(0, 512))], 64, 64);
-    let c2 = n.matmul(smem(3 * KB8, KB8), vec![v1(smem(512, 512))], 64, 64);
+    let c1 = n.matmul(smem(2 * KB8, KB8), vec![v1(smem(0, 512))], 64);
+    let c2 = n.matmul(smem(3 * KB8, KB8), vec![v1(smem(512, 512))], 64);
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.invoke(c1).await;
@@ -436,8 +436,8 @@ fn full_pending_is_fatal_for_a_local_caller() {
 fn timeline_can_be_turned_off() {
     let n = node(Knobs::default());
     let (a, c) = (smem(0, KB8), smem(2 * KB8, KB8));
-    let da = n.dma(0, 0, KB8, KB8);
-    let mm = n.matmul(c, vec![v1(a)], 64, 64);
+    let da = n.dma(0, 0, KB8);
+    let mm = n.matmul(c, vec![v1(a)], 64);
     let mut sim = n.sim;
     sim.set_timeline(false);
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
@@ -457,8 +457,8 @@ fn range_dep_on_versioned_data(check: bool) -> Stats {
     // pending entry over a range that a completed task wrote.
     let n = node(Knobs::default());
     let (a, c) = (smem(0, KB8), smem(2 * KB8, KB8));
-    let da = n.dma(0, 0, KB8, KB8);
-    let mut mm = n.matmul(c, vec![], 64, 64);
+    let da = n.dma(0, 0, KB8);
+    let mut mm = n.matmul(c, vec![], 64);
     mm.deps = vec![Dep::Unversioned(a.base)];
     let mut sim = n.sim;
     sim.set_zero_time(true);
@@ -528,8 +528,8 @@ fn a_versioned_consumer_after_its_producer_completed_resolves() {
     // consumer names (A, 1) and (B, 1), which the version table resolves.
     let n = node(Knobs::default());
     let (a, b, c) = (smem(0, KB8), smem(KB8, KB8), smem(2 * KB8, KB8));
-    let (da, db) = (n.dma(0, 0, KB8, KB8), n.dma(KB8, KB8, KB8, KB8));
-    let mm = n.matmul(c, vec![v1(a), v1(b)], 64, 64);
+    let (da, db) = (n.dma(0, 0, KB8), n.dma(KB8, KB8, KB8));
+    let mm = n.matmul(c, vec![v1(a), v1(b)], 64);
     let mut sim = n.sim;
     sim.set_zero_time(true);
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
@@ -547,8 +547,8 @@ fn a_versioned_consumer_after_its_producer_completed_resolves() {
 fn consumer_first_raises_no_late_consumer_warning() {
     let n = node(Knobs::default());
     let (a, c) = (smem(0, KB8), smem(2 * KB8, KB8));
-    let da = n.dma(0, 0, KB8, KB8);
-    let mm = n.matmul(c, vec![v1(a)], 64, 64);
+    let da = n.dma(0, 0, KB8);
+    let mm = n.matmul(c, vec![v1(a)], 64);
     let mut sim = n.sim;
     sim.set_zero_time(true);
     sim.set_late_consumer_check(true);
@@ -569,7 +569,7 @@ fn quantized_b_operand_scales_smem_bytes_not_macs() {
     // cycles, culprit smem.
     let n = node(Knobs::default());
     let c = smem(0, KB8);
-    let mut mm = n.matmul(c, vec![], 64, 64);
+    let mut mm = n.matmul(c, vec![], 64);
     if let sim_core::Args::Matmul { b_dtype, .. } = &mut mm.args {
         *b_dtype = sim_core::Dtype::Mxfp4;
     }
@@ -592,7 +592,7 @@ fn row_panel_reads_a_once_per_row() {
     // 128 B/cycle; with a row panel the second tile skips A: 128 cycles.
     let n = node(Knobs::default());
     let c = smem(0, 2 * KB8);
-    let mut mm = n.matmul(c, vec![], 64, 64);
+    let mut mm = n.matmul(c, vec![], 64);
     if let sim_core::Args::Matmul {
         n: nn, ldb, ldc, ..
     } = &mut mm.args
@@ -631,11 +631,11 @@ fn an_accumulator_buffer_keeps_c_across_a_chain() {
     let run = |buffer: u64| {
         let n = node(Knobs::default());
         let c = smem(0, KB8);
-        let mut first = n.matmul(c, vec![], 64, 64);
+        let mut first = n.matmul(c, vec![], 64);
         if let sim_core::Args::Matmul { keep, .. } = &mut first.args {
             *keep = true;
         }
-        let mut second = n.matmul(c, vec![v1(c)], 64, 64);
+        let mut second = n.matmul(c, vec![v1(c)], 64);
         if let sim_core::Args::Matmul { accumulate, .. } = &mut second.args {
             *accumulate = true;
         }
@@ -668,8 +668,8 @@ fn resolution_latency_delays_ready_and_wait_wake() {
         ..Knobs::default()
     });
     let (a, b, c) = (smem(0, KB8), smem(KB8, KB8), smem(2 * KB8, KB8));
-    let (da, db) = (n.dma(0, 0, KB8, KB8), n.dma(KB8, KB8, KB8, KB8));
-    let mm = n.matmul(c, vec![v1(a), v1(b)], 64, 64);
+    let (da, db) = (n.dma(0, 0, KB8), n.dma(KB8, KB8, KB8));
+    let mm = n.matmul(c, vec![v1(a), v1(b)], 64);
     let mut sim = n.sim;
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {
         ctx.invoke(da).await;
@@ -692,11 +692,12 @@ fn zero_time_mode_ignores_the_resolution_latency() {
     // completes: neither the ready nor the wait wake takes time.
     let n = node(Knobs {
         resolve: 100,
+        dma_burst: Some(64),
         ..Knobs::default()
     });
     let (a, b, c) = (smem(0, KB8), smem(KB8, KB8), smem(2 * KB8, KB8));
-    let (da, db) = (n.dma(0, 0, KB8, 64), n.dma(KB8, KB8, KB8, 64));
-    let mm = n.matmul(c, vec![v1(a), v1(b)], 64, 64);
+    let (da, db) = (n.dma(0, 0, KB8), n.dma(KB8, KB8, KB8));
+    let mm = n.matmul(c, vec![v1(a), v1(b)], 64);
     let mut sim = n.sim;
     sim.set_zero_time(true);
     sim.spawn(n.nu, move |ctx: sim_core::NuCtx| async move {

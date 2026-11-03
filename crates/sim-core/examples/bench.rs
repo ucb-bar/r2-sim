@@ -108,6 +108,7 @@ fn main() {
                 max_inflight: 1,
                 max_outstanding: 1,
                 params: PeParams::Atlas {
+                    tile: [64, 64],
                     // Wide enough not to narrow the ports.
                     beat: 1024,
                     masters: Vec::new(),
@@ -156,7 +157,6 @@ fn main() {
                             src: Addr((g * 8192) % (SPAN / 2)),
                             dst: Addr(a.base),
                             bytes: 8192,
-                            tile_bytes: 2048,
                             rows: None,
                         },
                     })
@@ -191,7 +191,6 @@ fn main() {
                             out_dtype: Dtype::Bf16,
                             accumulate: false,
                             keep: false,
-                            tile: [64, 64],
                             transpose_b: false,
                         },
                     })

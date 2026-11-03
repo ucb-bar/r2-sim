@@ -1,6 +1,6 @@
 //! The memory image (`--image`, `--image-out`) on configs/2p-smem.yaml with the
-//! Numeric backend: every kind of entry loads and reads back, and an entry
-//! outside a numeric memory block is an error.
+//! builtin backend: every kind of entry loads and reads back, and an entry
+//! outside a memory block with data is an error.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,7 +29,7 @@ fn run(d: &Path, toml: &str) -> std::process::Output {
     Command::new(R2SIM)
         .args(["run", "--config"])
         .arg(root.join("../../configs/2p-smem.yaml"))
-        .args(["--program", "rv", "--functional", "numeric", "--image"])
+        .args(["--program", "rv", "--functional", "builtin", "--image"])
         .arg(d.join("image.toml"))
         .arg("--image-out")
         .arg(d.join("out.safetensors"))

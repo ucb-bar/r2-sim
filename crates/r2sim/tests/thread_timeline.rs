@@ -1,5 +1,5 @@
 //! `--thread-timeline`: the wall-clock records of the timing thread and
-//! the functional worker for the hello image, with the numeric backend.
+//! the functional worker for the hello image, with the builtin backend.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -60,7 +60,8 @@ fn check(records: &[Value]) {
         (128.into(), 128.into())
     );
     // The timing thread runs the event loop, then waits for the worker to
-    // apply the ops left, at the last cycle.
+    // apply the ops left, at the last cycle (hello's end, golden row
+    // hello).
     let control: Vec<&Value> = records
         .iter()
         .filter(|r| field(r, "thread") == "control")
@@ -70,12 +71,12 @@ fn check(records: &[Value]) {
     assert_eq!(field(last, "state"), "finish_wait");
     assert_eq!(
         (last["cycle"].clone(), last["seq"].clone()),
-        (1905.into(), 4.into())
+        (1839.into(), 4.into())
     );
 }
 
 #[test]
-fn the_numeric_backend_records_both_threads() {
-    let records = timeline("numeric");
+fn the_builtin_backend_records_both_threads() {
+    let records = timeline("builtin");
     check(&records);
 }

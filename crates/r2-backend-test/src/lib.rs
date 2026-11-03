@@ -148,13 +148,15 @@ unsafe extern "C" fn apply(
             writeln!(f, " args {}", hex(args))
         };
     }
-    // A DMA: the header is 24 bytes and 8 per key; the arguments are src,
-    // dst, bytes (a contiguous copy).
+    // A DMA (ABI version 3): the header is 24 bytes and 8 per key; the
+    // arguments are src, dst, row bytes and rows (copied as one contiguous
+    // run of row bytes x rows).
     if desc.len() >= 24 && u16::from_le_bytes([desc[0], desc[1]]) == 2 {
         let keys = u16::from_le_bytes([desc[6], desc[7]]) as usize;
         let a = &desc[24 + 8 * keys..];
         let word = |o: usize| u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
-        let (src, dst, n) = (word(0), word(8), word(16));
+        let half = |o: usize| u32::from_le_bytes(a[o..o + 4].try_into().unwrap()) as u64;
+        let (src, dst, n) = (word(0), word(8), half(16) * half(20));
         let m = s.memory.as_ref().unwrap();
         let (from, to) = (r2_backend::at(m, src, n), r2_backend::at(m, dst, n));
         if !from.is_null() && !to.is_null() {

@@ -66,7 +66,6 @@ fn copies(b: Built, nu: &str, pe: &str, src: u64, dst: u64, bytes: u64, n: u64) 
                 src: Addr(src + i * bytes),
                 dst: Addr(dst + i * bytes),
                 bytes,
-                tile_bytes: bytes,
                 rows: None,
             },
         })
@@ -218,7 +217,7 @@ fn a_load_through_the_link_uses_the_pool() {
     let sm0 = b.nu("root.sm0");
     let hbm = b.memory("root.hbm").base;
     let mut sim = b.sim;
-    sim.set_functional(Box::new(func::Numeric::new()));
+    sim.set_functional(Box::new(func::Builtin::new()));
     sim.spawn(sm0, move |ctx: NuCtx| async move {
         ctx.load(Addr(hbm), 512).await;
     });

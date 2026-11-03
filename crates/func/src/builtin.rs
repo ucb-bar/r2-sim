@@ -1,4 +1,4 @@
-//! The `Numeric` backend.
+//! The `builtin` backend.
 
 use std::collections::HashMap;
 
@@ -14,26 +14,33 @@ fn err<T>(msg: String) -> Result<T, FuncError> {
     Err(FuncError(msg))
 }
 
-/// Executes tasks on the store: DMA copies and GEMM. Muon vector tasks are
-/// opaque (no kernel yet) and write nothing.
+/// Executes tasks on the store: DMA copies and GEMM. A Muon task of the
+/// opaque kernel writes nothing; the other kernels are not built in.
 ///
 /// A GEMM is output stationary, as in the Python plane: the partial C of a
 /// chain stays in the accumulator of its Atlas (fp32, keyed by the PE and
 /// the C base) while the tasks keep it, and is written once.
 #[derive(Default)]
-pub struct Numeric {
+pub struct Builtin {
     /// The partials held in the Atlas accumulators, by (PE, C base):
     /// `m x n` row-major fp32.
     acc: HashMap<(Option<PeId>, u64), Vec<f32>>,
 }
 
-impl Numeric {
+impl Builtin {
     /// Builds a backend with no partial sums.
     pub fn new() -> Self {
         Self::default()
     }
 
-    fn task(&mut self, desc: &Descriptor, mem: &mut Store) -> Result<(), FuncError> {
+    /// One task; `tile`: the output tile of a matmul's Atlas (the halves of
+    /// split operands).
+    fn task(
+        &mut self,
+        desc: &Descriptor,
+        tile: [u64; 2],
+        mem: &mut Store,
+    ) -> Result<(), FuncError> {
         match &desc.args {
             // An IMEM_COPY moves bytes of the control plane: no data here.
             Args::Join | Args::Spawn { .. } | Args::ImemCopy { .. } => Ok(()),
@@ -61,12 +68,11 @@ impl Numeric {
                 keep,
                 a2,
                 b2,
-                tile,
                 transpose_b,
             } => {
                 for dt in [in_dtype, b_dtype, out_dtype] {
                     if !matches!(dt, Dtype::Bf16 | Dtype::F32) {
-                        return err(format!("numeric matmul on {dt:?} operands"));
+                        return err(format!("builtin matmul on {dt:?} operands"));
                     }
                 }
                 let c = desc.dst.base;
@@ -161,7 +167,7 @@ fn opaque(kernel: u32) -> Result<(), FuncError> {
     match kernel {
         0 => Ok(()),
         k => err(format!(
-            "Muon kernel {k}: the numeric backend has no Muon kernels"
+            "Muon kernel {k}: the builtin backend has no Muon kernels"
         )),
     }
 }
@@ -242,14 +248,14 @@ fn encode(v: &[f32], dt: Dtype) -> Vec<u8> {
     out
 }
 
-impl FunctionalBackend for Numeric {
+impl FunctionalBackend for Builtin {
     fn name(&self) -> &'static str {
-        "numeric"
+        "builtin"
     }
 
     fn apply(&mut self, op: &FuncOp, mem: &mut Store) -> Result<(), FuncError> {
         match &op.kind {
-            OpKind::Task(desc) => self.task(desc, mem),
+            OpKind::Task(desc) => self.task(desc, op.tile, mem),
             OpKind::Store { addr, bytes } => mem.write(addr.0, bytes),
         }
     }

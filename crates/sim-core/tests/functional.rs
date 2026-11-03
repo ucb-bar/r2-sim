@@ -1,4 +1,4 @@
-//! The functional plane with the Numeric backend: functional check mode,
+//! The functional plane with the builtin backend: functional check mode,
 //! the Option 2 sync protocol, stores, races, and worker errors.
 
 mod common;
@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use common::{node, smem, v1, Knobs, DRAM, SMEM};
-use func::{bf16_to_f32, f32_to_bf16, Numeric};
+use func::{bf16_to_f32, f32_to_bf16, Builtin};
 use nu_model::{Addr, Range};
 use sim_core::{
     Args, Descriptor, FatalError, FuncError, FuncOp, FunctionalBackend, NuCtx, OpKind, PeConfig,
@@ -58,10 +58,10 @@ fn matmul_numeric(zero_time: bool) -> (u64, Vec<u8>, Vec<u8>, Vec<u8>) {
     let (am, bm) = (matrix(1), matrix(2));
     let n = node(Knobs::default());
     let (a, b, c) = (smem(0, MAT), smem(MAT, MAT), smem(2 * MAT, MAT));
-    let (da, db) = (n.dma(0, 0, MAT, MAT), n.dma(MAT, MAT, MAT, MAT));
-    let mm = n.matmul(c, vec![v1(a), v1(b)], E, E);
+    let (da, db) = (n.dma(0, 0, MAT), n.dma(MAT, MAT, MAT));
+    let mm = n.matmul(c, vec![v1(a), v1(b)], E);
     let mut sim = n.sim;
-    sim.set_functional(Box::new(Numeric::new()));
+    sim.set_functional(Box::new(Builtin::new()));
     sim.set_zero_time(zero_time);
     sim.init_memory(Addr(DRAM), bytes(&am));
     sim.init_memory(Addr(DRAM + MAT), bytes(&bm));
@@ -111,7 +111,7 @@ fn timing_mode_with_numeric_gives_the_same_c() {
 fn store_then_load_round_trips_through_the_worker() {
     let n = node(Knobs::default());
     let mut sim = n.sim;
-    sim.set_functional(Box::new(Numeric::new()));
+    sim.set_functional(Box::new(Builtin::new()));
     let data: Vec<u8> = (0..=255u8).collect();
     let got = Rc::new(RefCell::new(Vec::new()));
     let got2 = got.clone();
@@ -146,9 +146,9 @@ fn load_with_the_null_backend_is_fatal() {
 fn racy(check: RaceCheck) -> sim_core::Stats {
     let n = node(Knobs::default());
     let x = smem(0, MAT);
-    let (d1, d2) = (n.dma(0, 0, MAT, MAT), n.dma(MAT, 0, MAT, MAT));
+    let (d1, d2) = (n.dma(0, 0, MAT), n.dma(MAT, 0, MAT));
     let mut sim = n.sim;
-    sim.set_functional(Box::new(Numeric::new()));
+    sim.set_functional(Box::new(Builtin::new()));
     sim.set_race_check(check);
     sim.spawn(n.nu, move |ctx: NuCtx| async move {
         ctx.invoke(d1).await;
@@ -185,8 +185,8 @@ fn racy_load_can_be_a_warning() {
     assert_eq!(s.loads.len(), 1);
 }
 
-/// Numeric, with a delay on every matmul op.
-struct Slow(Numeric);
+/// Builtin, with a delay on every matmul op.
+struct Slow(Builtin);
 
 impl FunctionalBackend for Slow {
     fn name(&self) -> &'static str {
@@ -206,9 +206,9 @@ impl FunctionalBackend for Slow {
 fn load_does_not_wait_for_unrelated_ops() {
     let n = node(Knobs::default());
     let x = smem(0, MAT);
-    let dx = n.dma(0, 0, MAT, MAT);
+    let dx = n.dma(0, 0, MAT);
     let mut mms: Vec<Descriptor> = (0..8)
-        .map(|i| n.matmul(smem((4 + i) * MAT, MAT), vec![], E, E))
+        .map(|i| n.matmul(smem((4 + i) * MAT, MAT), vec![], E))
         .collect();
     let mut sim = n.sim;
     // A second tensor PE that runs 8 matmuls at once.
@@ -219,6 +219,7 @@ fn load_does_not_wait_for_unrelated_ops() {
             max_inflight: 8,
             max_outstanding: 1,
             params: PeParams::Atlas {
+                tile: [64, 64],
                 // Wide enough not to narrow the ports.
                 beat: 1024,
                 masters: Vec::new(),
@@ -236,7 +237,7 @@ fn load_does_not_wait_for_unrelated_ops() {
     for d in &mut mms {
         d.pe = Some(wide);
     }
-    sim.set_functional(Box::new(Slow(Numeric::new())));
+    sim.set_functional(Box::new(Slow(Builtin::new())));
     let pattern: Vec<u8> = (0..MAT).map(|i| (i % 251) as u8).collect();
     sim.init_memory(Addr(DRAM), pattern.clone());
     let got = Rc::new(RefCell::new(Vec::new()));
@@ -267,13 +268,13 @@ fn load_does_not_wait_for_unrelated_ops() {
 fn worker_error_stops_the_run_with_the_task() {
     let n = node(Knobs::default());
     let c = smem(2 * MAT, MAT);
-    let mut mm = n.matmul(c, vec![], E, E);
+    let mut mm = n.matmul(c, vec![], E);
     // A leading dimension that makes C overrun its dst.
     if let Args::Matmul { ldc, .. } = &mut mm.args {
         *ldc = 2 * E;
     }
     let mut sim = n.sim;
-    sim.set_functional(Box::new(Numeric::new()));
+    sim.set_functional(Box::new(Builtin::new()));
     sim.spawn(n.nu, move |ctx: NuCtx| async move {
         ctx.invoke(mm).await;
         ctx.wait(c.base, 1).await;

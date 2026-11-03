@@ -76,7 +76,6 @@ fn run(steps: &[Step]) -> Stats {
                     src: Addr(src),
                     dst: Addr(dst),
                     bytes,
-                    tile_bytes: bytes,
                     rows: None,
                 },
             };
