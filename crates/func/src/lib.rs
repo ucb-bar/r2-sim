@@ -1,4 +1,4 @@
-//! Functional backends (r2sim spec Section 3.1).
+//! Functional backends (r2sim spec Section 3.2).
 //!
 //! * [`Builtin`]: executes tasks on the store of the functional plane
 //!   (DMA copy, GEMM).

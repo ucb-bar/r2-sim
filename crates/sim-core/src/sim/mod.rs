@@ -2275,7 +2275,7 @@ impl Sim {
         }
     }
 
-    /// A functional sync point (r2sim spec Section 3.4).
+    /// A functional sync point (r2sim spec Section 3.10).
     fn load(&mut self, nu: NeutrinoId, addr: Addr, len: u64) {
         let range = Range::from_len(addr.0, len);
         // Race check in the owner's tables (a debug check with no cost): a

@@ -410,7 +410,7 @@ impl MemBlock {
     }
 }
 
-/// What the timing plane does with a racy load (r2sim spec Section 3.4): a load of a
+/// What the timing plane does with a racy load (r2sim spec Section 3.10): a load of a
 /// range that a task writes while it is issued and not done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RaceCheck {
