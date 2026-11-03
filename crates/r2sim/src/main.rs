@@ -47,7 +47,6 @@ fn parse(argv: &[String]) -> Result<Options, String> {
         match k.as_str() {
             "--config" => a.config = Some(val()?.into()),
             "--program" => a.program = Some(val()?),
-            "--params" => a.params = Some(val()?.into()),
             "--param" => a.overrides.push(val()?),
             "--functional" => a.functional = Some(val()?.parse()?),
             "--image" => a.image = Some(val()?.into()),

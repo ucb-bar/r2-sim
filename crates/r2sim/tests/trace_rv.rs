@@ -1,7 +1,6 @@
 //! The raw trace 1.10 of RV programs (trace-raw.md): the `pc` of each
 //! task, the `image` of each program, the manifest's `images`, and the
-//! instruction DMAs and data scratch ports in the manifest. A Rust
-//! program's dump has none of them.
+//! instruction DMAs and data scratch ports in the manifest.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -198,42 +197,6 @@ fn the_three_level_dump() {
         (mem["path"].as_str(), mem["type"].as_str()),
         (Some("root.scratch"), Some("nu_scratch"))
     );
-    ids_resolve(&d, &m);
-}
-
-#[test]
-fn a_rust_program_has_no_pc_image_or_images() {
-    // A micro-benchmark: two SMs copy into their gpc's DRAM.
-    let d = dir("micro");
-    let m = run(
-        &d,
-        &[
-            "--program",
-            "micro",
-            "--param",
-            "mode=untracked",
-            "--param",
-            "sms=2",
-        ],
-    );
-    assert_eq!(m["version"], serde_json::json!([1, 11]));
-    assert!(m.get("images").is_none());
-    for t in records(&d, "tasks", 120) {
-        assert_eq!(u32_at(&t, 112), NULL32);
-    }
-    for p in records(&d, "programs", 32) {
-        assert_eq!(u32_at(&p, 12), NULL32);
-    }
-    let res = m["resources"].as_array().unwrap();
-    assert!(!res.iter().any(|r| {
-        let n = r["name"].as_str().unwrap();
-        n.ends_with(".idma") || n.ends_with(".scratch.port")
-    }));
-    assert!(!m["pes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|p| p["type"] == "idma"));
     ids_resolve(&d, &m);
 }
 

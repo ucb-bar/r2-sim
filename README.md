@@ -39,8 +39,10 @@ An RV program is an image of the Neutrino ABI: RV64IMC code with the
 `nu.*` instructions, which invoke task descriptors (Neutrino
 specification, Sections 4 and 5). The README in
 [crates/nu-rv/tests/fixtures/rv/](crates/nu-rv/tests/fixtures/rv/)
-describes the test images and their sources. The programs `kernels` and
-`micro` calibrate the model against measurements on a card.
+describes the test images and their sources. The calibration programs,
+which compare the model with measurements on a card, are the RV programs
+calib-micro and calib-kernels of r2-toolchain (examples/calib-micro and
+examples/calib-kernels).
 
 `pixi run test` runs the tests.
 

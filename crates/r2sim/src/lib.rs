@@ -20,7 +20,7 @@ use serde::Serialize;
 use sim_core::{build_config_file, Built, FatalError, ProfileRegistry, SimWarning, Stats};
 
 /// The command line.
-pub const USAGE: &str = "usage: r2sim run --config C --program P [--params F] [--param k=v]... \
+pub const USAGE: &str = "usage: r2sim run --config C --program rv [--param args=NAME] [--param limit=N] \
 [--functional null|builtin|python] [--image FILE.toml] [--image-out FILE.safetensors] [--stats OUT] [--timeline] [--thread-timeline FILE.jsonl] [--quantize tile|none] \
 [--cocharge longest|own] [--flow readyvalid|ticket] [--phase-stats] [--operand-reuse none|row_panel] [--acc-buffer BYTES] [--set PATH=VALUE ...] [--trace-out DIR [--bin CYCLES] [--window A:B] [--node PATH]] [--trace-raw DIR [--trace-zstd] [--trace-config FILE]] [--no-diagnostics]
        r2sim kernels: prints the Muon kernel registry as JSON (the key kernels of a plug-in's configuration)";
@@ -119,10 +119,8 @@ fn backends(
 pub struct Options {
     /// `--config`: the configuration file.
     pub config: Option<PathBuf>,
-    /// `--program`: `rv` or a program of `nu_prog::launch` ([`run`]).
+    /// `--program`: `rv` ([`run`]).
     pub program: Option<String>,
-    /// `--params`: the program's parameter file (TOML).
-    pub params: Option<PathBuf>,
     /// `--param key=value`: parameter overrides.
     pub overrides: Vec<String>,
     /// `--functional`: the functional backend (default: the lists of the
@@ -319,27 +317,28 @@ struct Out<'a> {
     /// Resources chunks queued on, by share of start delay.
     delays: Vec<(String, f64)>,
     resources: Vec<ResourceOut>,
-    /// A micro-benchmark's measured quantities (absent for the other
-    /// programs, so their JSON does not change).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    micro: Option<serde_json::Value>,
-    /// A kernel sequence's per-kernel record (absent for the other
-    /// programs).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kernels: Option<serde_json::Value>,
     stats: &'a Stats,
 }
 
-/// Runs the program `o.program` (a program of `nu_prog::launch`) on the
-/// configuration `o.config` and writes the outputs that `o` asks for.
+/// Runs the program `o.program` (`rv`: the RV program in the root's
+/// IMEM) on the configuration `o.config` and writes the outputs that `o`
+/// asks for.
 pub fn run(o: &Options) -> Result<(), String> {
     let a = o;
     let cfg_path = a.config.clone().ok_or(USAGE)?;
     let program = a.program.clone().ok_or(USAGE)?;
-    let params_text = match &a.params {
-        Some(p) => std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
-        None => String::new(),
-    };
+    match program.as_str() {
+        "rv" => {}
+        "micro" | "kernels" => {
+            return Err(format!(
+                "--program {program}: the Rust calibration programs are removed; their \
+                 replacements are the RV programs calib-micro and calib-kernels of \
+                 r2-toolchain (examples/calib-micro, examples/calib-kernels), run with \
+                 --program rv and their image"
+            ))
+        }
+        p => return Err(format!("unknown program {p:?} (rv)")),
+    }
     let mut b = build_config_file(&cfg_path, &a.sets, ProfileRegistry::with_builtins())
         .map_err(|e| format!("{}: {e}", cfg_path.display()))?;
     for w in &b.warnings {
@@ -352,18 +351,14 @@ pub fn run(o: &Options) -> Result<(), String> {
         .neutrino_config(nu_model::NeutrinoId(0))
         .tables
         .granule;
-    // Before the launch: the kernel sequences read the Atlas knobs.
+    // The Atlas knobs before the launch.
     if let Some(on) = a.row_panel {
         b.sim.set_atlas_row_panel(on);
     }
     if let Some(bytes) = a.acc_buffer {
         b.sim.set_atlas_acc_buffer(bytes);
     }
-    let launch = if program == "rv" {
-        rv_launch(a, &b)?
-    } else {
-        nu_prog::launch(&program, &b, &params_text, &a.overrides)?
-    };
+    let launch = rv_launch(a, &b)?;
     let cfg = cfg_path.display().to_string();
     execute(a, b, launch, &cfg, program, granule)
 }
@@ -405,9 +400,7 @@ fn execute(
     let driver_scalar = format!("{home_path}.scalar");
     // The tracer export needs the timeline, the marks and the resource logs.
     let tracing = a.trace_out.is_some();
-    // A micro-benchmark measures from the task timeline.
-    b.sim
-        .set_timeline(a.timeline || tracing || launch.micro.is_some());
+    b.sim.set_timeline(a.timeline || tracing);
     b.sim.set_marks(a.phase_stats || tracing);
     b.sim.set_log(tracing);
     if a.no_diagnostics {
@@ -452,9 +445,7 @@ fn execute(
     };
     // An RV run makes its lazy resources (instruction DMAs, data scratch
     // ports) now, so that the raw trace lists them with fixed ids.
-    if program == "rv" {
-        b.sim.make_core_resources();
-    }
+    b.sim.make_core_resources();
     let (blocks, sync_only) = (b.sim.functional_blocks(), b.sim.sync_only_ranges().to_vec());
     // The PE names by index, after the lazy PEs of an RV run.
     let mut pes = Vec::new();
@@ -495,7 +486,6 @@ fn execute(
             let run = traceraw::RunInfo {
                 config: cfg.to_string(),
                 program: program.clone(),
-                params_file: a.params.as_ref().map(|p| p.display().to_string()),
                 params: a.overrides.clone(),
                 overrides: a.sets.iter().chain(&a.model_flags).cloned().collect(),
                 granule,
@@ -526,14 +516,6 @@ fn execute(
     }
     // The process backend's child exits here.
     drop(backend);
-    let micro = launch
-        .micro
-        .as_ref()
-        .map(|r| nu_prog::micro::result(&r.borrow(), &stats));
-    let kernels = launch
-        .kernels
-        .as_ref()
-        .map(|r| nu_prog::kernels::result(&r.borrow(), &stats));
     // No program reports phases: the phase rows of the raw summary and
     // of the tracer files are empty.
     if let Some((dir, out)) = &raw {
@@ -665,8 +647,6 @@ fn execute(
         culprits,
         delays,
         resources: res,
-        micro,
-        kernels,
         stats: &stats_out,
     };
     print_summary(&out, &stats, &nodes);

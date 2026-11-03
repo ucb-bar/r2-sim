@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from . import style
 from .data import Trace
 
-# One color per task kind of the kernels program in Gantt charts
+# One color per task kind of the label scheme (nu_prog::label) in Gantt charts
 # (Okabe-Ito, fixed); other kinds are gray.
 KIND_COLORS = {
     "load": style.OKABE_ITO["orange"],

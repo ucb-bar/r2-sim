@@ -448,7 +448,6 @@ pub fn opts(
 pub struct RunInfo {
     pub config: String,
     pub program: String,
-    pub params_file: Option<String>,
     /// `--param key=value` overrides.
     pub params: Vec<String>,
     /// `--set PATH=VALUE` configuration overrides, then the other flags
@@ -629,9 +628,6 @@ pub struct RawTracer {
     charges: bool,
     messages: bool,
     deps_on: bool,
-    /// A run of RV programs: the label of a Muon task is its kernel and
-    /// flags ([`sim_core::kernels::label`]).
-    kernel_labels: bool,
 }
 
 /// A running program: (name string id, spawn gid, start, index of its
@@ -802,7 +798,6 @@ impl RawTracer {
             charges,
             messages,
             deps_on: f.keeps("deps"),
-            kernel_labels: run.program == "rv",
         };
         Ok((t, out))
     }
@@ -1262,10 +1257,10 @@ impl Tracer for RawTracer {
             pe,
             opcode: d.opcode.0,
             version: e.version.map(|v| v as u32),
+            // The label of a Muon task is its kernel and flags
+            // (`sim_core::kernels::label`).
             label: match &d.args {
-                Args::Vector { kernel, block, .. } if self.kernel_labels => {
-                    Some(sim_core::kernels::label(*kernel, block))
-                }
+                Args::Vector { kernel, block } => Some(sim_core::kernels::label(*kernel, block)),
                 _ => d.label,
             },
             dst_base: d.dst.base,
@@ -2196,7 +2191,7 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         "version": [1, 11],
         "run": {
             "config": run.config, "program": run.program,
-            "params": {"file": run.params_file, "overrides": run.params},
+            "params": {"file": null, "overrides": run.params},
             "overrides": run.overrides,
             "sim_commit": sim_commit(), "clock_ghz": b.clock_ghz, "granule": run.granule,
             "created": now_utc(),
@@ -2207,31 +2202,14 @@ fn manifest(b: &Built, run: &RunInfo, unlimited: &HashMap<Link, u16>, f: &Filter
         "links": link_rows, "memories": mem_rows, "resources": res_rows,
         "opcodes": sim.profiles().names().collect::<Vec<_>>(),
         "message_kinds": MESSAGE_KINDS,
-        "label": if run.program == "rv" { kernel_label_schema() } else { program_label_schema() },
+        "label": kernel_label_schema(),
     })
 }
 
-/// The label schema of the Rust programs (`nu_prog::label`).
-fn program_label_schema() -> Value {
-    let kinds: Vec<&str> = (0..nu_prog::label::KINDS)
-        .map(nu_prog::label::kind_name)
-        .collect();
-    json!({
-        "fields": [
-            {"name": "kind", "shift": 56, "bits": 8, "enum": kinds},
-            {"name": "step", "shift": 48, "bits": 8},
-            {"name": "layer", "shift": 40, "bits": 8},
-            {"name": "unit", "shift": 32, "bits": 8},
-            {"name": "idx", "shift": 0, "bits": 32},
-        ],
-        "format": "{kind} s{step} l{layer} u{unit} #{idx}",
-    })
-}
-
-/// The label schema of an RV run, from the kernel registry: the kernel of
-/// a Muon task by name in the field `kind` (0: `opaque`; the name of the
-/// first field of the Rust programs' schema), and one bit per flag of the
-/// registry, shown as `+name` when set. The other tasks have no label.
+/// The label schema of a run, from the kernel registry: the kernel of a
+/// Muon task by name in the field `kind` (0: `opaque`; the field r2-vis
+/// colors the timeline by), and one bit per flag of the registry, shown as
+/// `+name` when set. The other tasks have no label.
 fn kernel_label_schema() -> Value {
     use sim_core::kernels;
     let top = kernels::registry().iter().map(|k| k.id).max().unwrap_or(0);

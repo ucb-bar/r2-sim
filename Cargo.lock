@@ -159,10 +159,7 @@ name = "nu-prog"
 version = "0.1.0"
 dependencies = [
  "nu-model",
- "serde",
- "serde_json",
  "sim-core",
- "toml",
 ]
 
 [[package]]

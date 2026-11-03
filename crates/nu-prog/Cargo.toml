@@ -1,6 +1,6 @@
 [package]
 name = "nu-prog"
-description = "Neutrino program library: the calibration programs (micro-benchmarks and kernel sequences)"
+description = "Neutrino program library: a program ready to spawn and the task label scheme"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,6 @@ license.workspace = true
 [dependencies]
 nu-model = { path = "../nu-model" }
 sim-core = { path = "../sim-core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.9"
 
 [lints]
 workspace = true

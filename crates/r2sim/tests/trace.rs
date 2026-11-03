@@ -1,6 +1,7 @@
 //! The tracer export (--trace-out) and the raw trace dump (--trace-raw)
-//! on the tiny config: a micro-benchmark stream in which each of the three
-//! SMs reads 128 KiB from the HBM.
+//! on the RV fixture three-level.bin on configs/2p-smem.yaml: the device
+//! starts a program on each cluster, which starts a matmul program on each
+//! of its four SMs.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -14,38 +15,24 @@ fn gunzip(p: PathBuf) -> String {
     s
 }
 
-/// The arguments of the stream on the tiny config.
-const TINY: &[&str] = &[
+/// The arguments of the three-level run.
+const THREE: &[&str] = &[
     "run",
     "--config",
-    "crates/nu-prog/tests/configs/tiny.yaml",
+    "configs/2p-smem.yaml",
     "--program",
-    "micro",
-    "--param",
-    "mode=stream",
-    "--param",
-    "l2=root.hbm",
-    "--param",
-    "dram=root.hbm",
-    "--param",
-    "mem=dram",
-    "--param",
-    "sms=3",
-    "--param",
-    "bytes=131072",
-    "--param",
-    "chunk=4096",
-    "--param",
-    "inflight=2",
+    "rv",
+    "--image",
+    "crates/nu-rv/tests/fixtures/rv/three-level.toml",
 ];
 
-/// Runs the tiny stream with `extra` arguments; returns the --stats JSON.
-fn run_tiny(dir: &std::path::Path, extra: &[&str]) -> serde_json::Value {
+/// Runs three-level with `extra` arguments; returns the --stats JSON.
+fn run_three(dir: &std::path::Path, extra: &[&str]) -> serde_json::Value {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let stats = dir.join("run.json");
     let out = Command::new(env!("CARGO_BIN_EXE_r2sim"))
         .current_dir(&root)
-        .args(TINY)
+        .args(THREE)
         .args(extra)
         .arg("--stats")
         .arg(&stats)
@@ -65,8 +52,8 @@ fn trace_raw_writes_whole_records_that_match_the_stats() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let (plain, packed) = (tmp.join("plain"), tmp.join("zstd"));
-    let j = run_tiny(&tmp, &["--trace-raw", plain.to_str().unwrap()]);
-    run_tiny(
+    let j = run_three(&tmp, &["--trace-raw", plain.to_str().unwrap()]);
+    run_three(
         &tmp,
         &["--trace-raw", packed.to_str().unwrap(), "--trace-zstd"],
     );
@@ -80,26 +67,24 @@ fn trace_raw_writes_whole_records_that_match_the_stats() {
     assert_eq!(summary["end_time"], j["end_time"]);
     // No program reports phases; the key stays, an empty list.
     assert_eq!(summary["phases"], serde_json::json!([]));
-    // Each node gives its Neutrino's table sizes (tiny_sm.yaml for an SM):
+    // Each node gives its Neutrino's table sizes (sm-smem.yaml for an SM).
     let sm1 = manifest["nodes"]
         .as_array()
         .unwrap()
         .iter()
         .find(|n| n["path"] == "root.gpc0.sm1")
         .unwrap();
-    // Set in the file; versions and inbound_invokes take their defaults.
     for (k, v) in [
-        ("scoreboard", 64),
-        ("execution", 64),
-        ("pending", 16),
-        ("inbound_refs", 16),
-        ("outbound_deps", 16),
-        ("outbound_invokes", 16),
+        ("scoreboard", 128),
+        ("execution", 256),
+        ("pending", 256),
+        ("versions", 256),
+        ("inbound_refs", 128),
+        ("inbound_invokes", 64),
+        ("outbound_deps", 128),
+        ("outbound_invokes", 32),
     ] {
         assert_eq!(sm1["neutrino"][k], v, "{k}");
-    }
-    for k in ["versions", "inbound_invokes"] {
-        assert!(sm1["neutrino"][k].as_u64().unwrap() > 0, "{k}");
     }
     for (stem, size) in [
         ("tasks", 120),
@@ -161,8 +146,8 @@ fn trace_raw_filters_keep_the_subtree_and_the_window() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let (all, part) = (tmp.join("all"), tmp.join("part"));
-    run_tiny(&tmp, &["--trace-raw", all.to_str().unwrap()]);
-    run_tiny(
+    run_three(&tmp, &["--trace-raw", all.to_str().unwrap()]);
+    run_three(
         &tmp,
         &[
             "--trace-raw",
@@ -172,7 +157,7 @@ fn trace_raw_filters_keep_the_subtree_and_the_window() {
             "--set",
             "trace.nodes=[root.gpc0.sm1]",
             "--set",
-            "trace.window=[2000, 6000]",
+            "trace.window=[500, 1500]",
         ],
     );
     let manifest: serde_json::Value =
@@ -181,7 +166,7 @@ fn trace_raw_filters_keep_the_subtree_and_the_window() {
     assert_eq!(manifest["filters"]["partial"], true);
     assert_eq!(
         manifest["filters"]["window"],
-        serde_json::json!([2000, 6000])
+        serde_json::json!([500, 1500])
     );
     assert!(!part.join("charges.bin").exists());
     let sm1 = manifest["nodes"]
@@ -212,7 +197,7 @@ fn trace_raw_filters_keep_the_subtree_and_the_window() {
     // window.
     let mut want: Vec<_> = tasks(&all)
         .into_iter()
-        .filter(|t| t.1 == sm1 && t.2 < 6000 && t.3 > 2000)
+        .filter(|t| t.1 == sm1 && t.2 < 1500 && t.3 > 500)
         .collect();
     let mut got = tasks(&part);
     want.sort();
@@ -233,7 +218,7 @@ fn trace_out_writes_consistent_files() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     let dir = tmp.to_str().unwrap();
-    let j = run_tiny(&tmp, &["--bin", "1000", "--trace-out", dir]);
+    let j = run_three(&tmp, &["--bin", "1000", "--trace-out", dir]);
     // One task row per task, header aside.
     let tasks = gunzip(tmp.join("tasks.csv.gz"));
     assert_eq!(
@@ -283,11 +268,9 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
                 "--config",
                 "configs/2p-smem.yaml",
                 "--program",
-                "micro",
-                "--param",
-                "mode=untracked",
-                "--param",
-                "sms=2",
+                "rv",
+                "--image",
+                "crates/nu-rv/tests/fixtures/rv/hello.toml",
                 "--set",
                 set,
             ])
@@ -326,28 +309,156 @@ fn set_overrides_a_config_value_and_rejects_a_bad_path() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("nothing matches"));
 }
 
+/// RV64 encodings of the few instructions of an untracked program.
+mod rv {
+    pub const T0: u32 = 5;
+    pub const T1: u32 = 6;
+    pub const A0: u32 = 10;
+    fn i(op: u32, f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
+        ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | op
+    }
+    /// `ld rd, CONST + 8 k(x0)`: constant `k`.
+    pub fn k(rd: u32, k: i32) -> u32 {
+        i(0x03, 3, rd, 0, super::CONST as i32 + 8 * k)
+    }
+    pub fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
+        let imm = imm as u32 & 0xfff;
+        ((imm >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((imm & 0x1f) << 7) | 0x23
+    }
+    fn nu(f3: u32, rd: u32, rs1: u32) -> u32 {
+        (rs1 << 15) | (f3 << 12) | (rd << 7) | 0x0b
+    }
+    pub fn invoke(rd: u32, rs1: u32) -> u32 {
+        nu(0, rd, rs1)
+    }
+    /// `nu.wait x0`: the fence.
+    pub fn fence() -> u32 {
+        nu(1, 0, 0)
+    }
+    pub fn exit() -> u32 {
+        nu(5, 0, 0)
+    }
+}
+
+/// The IMEM offset of the constants.
+const CONST: usize = 0x400;
+
+/// An IMEM image: the trap word at 0, `code` from 4, the constants at
+/// [`CONST`], and the root record (entry 4, ABI version 3) after them.
+fn imem(code: &[u32], consts: &[u64]) -> Vec<u8> {
+    let mut m = vec![0u8; 0x800];
+    for (i, w) in code.iter().enumerate() {
+        m[4 + 4 * i..8 + 4 * i].copy_from_slice(&w.to_le_bytes());
+    }
+    for (i, v) in consts.iter().enumerate() {
+        m[CONST + 8 * i..CONST + 8 * i + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let r = 0x700;
+    m[r..r + 8].copy_from_slice(&4u64.to_le_bytes());
+    m[r + 8..r + 12].copy_from_slice(&sim_core::abi::VERSION.to_le_bytes());
+    m[r + 24..r + 32].copy_from_slice(b"untrackd");
+    m[r + 56..r + 60].copy_from_slice(b"root");
+    m
+}
+
+/// A root with a DMA engine, an HBM, a buffer and a sync-only range (its
+/// data scratch at the end of it).
+const UNTRACKED_CONFIG: &str = "global:
+  neutrino_granule: 512
+  address: {fields: [{name: sm, bits: 2}], offset_bits: 24}
+device:
+  name: root
+  fabric:
+    - {name: sbus}
+    - {name: cbus, control: true}
+  memory:
+    - {name: hbm, type: dram, addr: [[0x200000, 0x400000]], bw_bytes: 64, latency: 50, slave: $this.sbus}
+    - {name: buf, type: scratch, addr: [[0x40000, 0x80000]], bw_bytes: 64, slave: $this.sbus}
+    - {name: sync, type: sync, addr: [[0xE00000, 0xF00000]]}
+  compute:
+    - {name: dma, type: dma, latency: 4, master: [$this.sbus]}
+  neutrino: {}
+";
+
 #[test]
 fn trace_raw_flags_untracked_tasks() {
-    // micro mode=untracked on configs/2p-smem.yaml: two SMs each copy 64 KiB
-    // into their gpc's DRAM in four untracked DMA tasks, fence, and signal
-    // the device with a join. The DMA records have flags bit 0, version,
-    // queued and sent null, and nu = src_nu (the invoking SM).
+    // On a root with a DMA engine, an HBM and a buffer, the root copies four
+    // 16 KiB pieces of the buffer into the HBM as untracked DMA tasks on its
+    // own engine, fences, and exits. The DMA records have flags bit 0,
+    // version, queued and sent null, and nu = src_nu (the invoking root).
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("trace_untracked");
     let _ = std::fs::remove_dir_all(&tmp);
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let config = tmp.join("root.yaml");
+    std::fs::write(&config, UNTRACKED_CONFIG).unwrap();
+    let b = sim_core::build_config_file::<&str>(
+        &config,
+        &[],
+        sim_core::ProfileRegistry::with_builtins(),
+    )
+    .unwrap();
+    let abi = nu_rv::Abi::new(&b);
+    let me = &abi.node(nu_model::NeutrinoId(0));
+    let scratch = me.scratch.clone().unwrap().base;
+    let pe = me.pes.iter().position(|&p| p == b.pe("root.dma")).unwrap() as u16;
+    let (smem, hbm) = (b.memory("root.buf").base, b.memory("root.hbm").base);
+    // A descriptor (ABI version 3): the header (opcode 2, untracked flag
+    // 2, dst in 512 B granules) and the DMA's 32 bytes of arguments.
+    let piece = 16384u64;
+    let desc = |i: u64| {
+        let (src, dst) = (smem + i * piece, hbm + i * piece);
+        let mut v = Vec::new();
+        v.extend(2u16.to_le_bytes());
+        v.extend(pe.to_le_bytes());
+        v.extend(2u16.to_le_bytes());
+        v.extend(0u16.to_le_bytes());
+        v.extend((dst >> 9).to_le_bytes());
+        v.extend(((piece >> 9) as u32).to_le_bytes());
+        v.extend(u32::MAX.to_le_bytes());
+        v.extend(src.to_le_bytes());
+        v.extend(dst.to_le_bytes());
+        for w in [piece as u32, 1, 0, 0] {
+            v.extend(w.to_le_bytes());
+        }
+        v
+    };
+    // The constants: the four descriptors' words, then their addresses in
+    // the data scratch (64 B apart from scratch + 0x100).
+    let mut consts: Vec<u64> = Vec::new();
+    for i in 0..4 {
+        consts.extend(
+            desc(i)
+                .chunks(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap())),
+        );
+    }
+    let words = consts.len() / 4;
+    let at = consts.len() as i32;
+    consts.extend((0..4).map(|i| scratch + 0x100 + 64 * i));
+    let mut code = Vec::new();
+    for i in 0..4 {
+        code.push(rv::k(rv::T0, at + i as i32));
+        for w in 0..words {
+            code.push(rv::k(rv::T1, (i * words + w) as i32));
+            code.push(rv::sd(rv::T1, rv::T0, 8 * w as i32));
+        }
+        code.push(rv::invoke(rv::A0, rv::T0));
+    }
+    code.extend([rv::fence(), rv::exit()]);
+    std::fs::write(tmp.join("untracked.bin"), imem(&code, &consts)).unwrap();
+    std::fs::write(
+        tmp.join("image.toml"),
+        "[[entry]]\nimem = \"root\"\nbin = \"untracked.bin\"\n",
+    )
+    .unwrap();
+    let raw = tmp.join("raw");
     let out = Command::new(env!("CARGO_BIN_EXE_r2sim"))
-        .current_dir(&root)
-        .args([
-            "run",
-            "--config",
-            "configs/2p-smem.yaml",
-            "--program",
-            "micro",
-        ])
-        .args(["--param", "mode=untracked", "--param", "sms=2"])
-        .args(["--param", "placement=spread", "--param", "bytes=65536"])
-        .args(["--param", "chunk=16384", "--trace-raw"])
-        .arg(&tmp)
+        .args(["run", "--config"])
+        .arg(&config)
+        .args(["--program", "rv", "--image"])
+        .arg(tmp.join("image.toml"))
+        .arg("--trace-raw")
+        .arg(&raw)
         .output()
         .unwrap();
     assert!(
@@ -356,10 +467,10 @@ fn trace_raw_flags_untracked_tasks() {
         String::from_utf8_lossy(&out.stderr)
     );
     let manifest: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(tmp.join("manifest.json")).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(raw.join("manifest.json")).unwrap()).unwrap();
     let layout = manifest["records"]["tasks"].as_array().unwrap();
     assert_eq!(layout[17], serde_json::json!(["flags", "u32"]));
-    let b = std::fs::read(tmp.join("tasks.bin")).unwrap();
+    let b = std::fs::read(raw.join("tasks.bin")).unwrap();
     assert_eq!(b.len() % 120, 0);
     let u32_at = |r: &[u8], o: usize| u32::from_le_bytes(r[o..o + 4].try_into().unwrap());
     let u64_at = |r: &[u8], o: usize| u64::from_le_bytes(r[o..o + 8].try_into().unwrap());
@@ -375,6 +486,6 @@ fn trace_raw_flags_untracked_tasks() {
         }
         assert_eq!(u32_at(r, 108), u32::MAX, "dst_mask: a plain range");
     }
-    // 8 DMA tasks; 2 joins and 4 spawns.
-    assert_eq!((untracked, tracked), (8, 6));
+    // The four untracked DMA tasks, and no other task.
+    assert_eq!((untracked, tracked), (4, 0));
 }
