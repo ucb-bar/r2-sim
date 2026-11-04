@@ -27,7 +27,11 @@
 #   the exact shapes, as the Rust `kernels` program did when it gave each
 #   matmul a tile of its own shape.
 # * muon: the 128 CUDA cores as a 128-lane vector unit (125 fp32 FMA per
-#   cycle measured); overhead 20 cycles per task (not measured).
+#   cycle measured); overhead 20 cycles per task (not measured). Up to 32
+#   tasks in flight: the SM interleaves the warps of its resident CTAs, so
+#   the fixed latency of one task (its kernel's `latency`) overlaps the
+#   work of the others, while their work shares the unit. The calibration
+#   program's CTAs per SM bound the tasks in flight.
 # * dma: the SM's bulk copy engine (TMA). Latency 208 cycles, the one
 #   calibrated parameter of the copy path: a 1 KiB copy from the L2 takes
 #   the card's 550 cycles. The TMA unit's own time; the request's way to
@@ -56,7 +60,7 @@ compute:
      quantize: none, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
   - {name: atlas3, type: tensor, rate: {bf16: 128, fp8: 256, mxfp4: 512},
      quantize: none, operand_reuse: none, acc_buffer: 0, master: [$this.lbus]}
-  - {name: muon, type: vector, rate: {lane_op: 128}, overhead: 20, master: [$this.lbus, $this.smsbus]}
+  - {name: muon, type: vector, rate: {lane_op: 128}, overhead: 20, inflight: 32, master: [$this.lbus, $this.smsbus]}
   - {name: dma, type: dma, latency: 208, inflight: 8, beat_bytes: 32, master: [$this.lbus, $this.smsbus]}
 neutrino: {scoreboard: 128, pending: 256, execution: 256, versions: 256, inbound_refs: 128, inbound_invokes: 64, outbound_deps: 128, outbound_invokes: 32,
            c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}
