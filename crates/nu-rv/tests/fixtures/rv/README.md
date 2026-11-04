@@ -174,7 +174,7 @@ fn probe2(_: &Args) {
         ops: N * N,
         bytes_in: BYTES as u32,
         bytes_out: 0,
-        reserved: 0,
+        latency: 0,
     };
     let o = desc::muon(sm::PE_MUON, dst(out, BYTES), &op).with_deps([key(out, 1)]);
     unsafe { insn::invoke(o.addr()) };

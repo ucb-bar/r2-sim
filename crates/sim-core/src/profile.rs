@@ -1498,9 +1498,10 @@ pub fn vector_traffic(desc: &Descriptor) -> Result<crate::kernels::Traffic, Stri
 /// the block that holds its address: on the route between the block and
 /// the Muon and on the block's port (a banked block: the banks of the
 /// entry's range); the entries of one block add up. The latency is the
-/// fixed overhead plus the longest path of the entries: a read pays its
-/// request's trip to the block, the block's latency and the route's (as a
-/// DMA's fill and a load do; 2026-10-21), a write the route's only.
+/// Muon's overhead, plus the kernel's fixed latency (no resource), plus
+/// the longest path of the entries: a read pays its request's trip to the
+/// block, the block's latency and the route's (as a DMA's fill and a load
+/// do; 2026-10-21), a write the route's only.
 pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     let traffic = vector_traffic(desc).unwrap_or_else(|e| panic!("{e}"));
     let PeParams::Muon {
@@ -1590,7 +1591,7 @@ pub(crate) fn vector_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             demand,
             transfer: None,
             rate: Ratio::ONE,
-            latency: overhead + latency,
+            latency: overhead + traffic.latency + latency,
             routes,
         }],
         holds: Vec::new(),

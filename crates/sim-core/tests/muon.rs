@@ -7,6 +7,12 @@ use nu_model::Range;
 use sim_core::{build_config, kernels, Built, Descriptor, NuCtx, ProfileRegistry, Stats};
 
 fn node(hbm_latency: u64) -> Built {
+    node_with(hbm_latency, "")
+}
+
+/// The node with `muon` (YAML keys with a trailing comma) added to the
+/// Muon's entry.
+fn node_with(hbm_latency: u64, muon: &str) -> Built {
     let text = format!(
         "global:
   neutrino_granule: 512
@@ -32,7 +38,7 @@ device:
         - {{name: smem, type: scratch, addr: [[0x0, 0x10000]], bw_bytes: 1024, latency: 5, slave: [$this.lbus, $this.smsbus]}}
         - {{name: sync, type: sync, addr: [[0xF00000, 0x1000000]]}}
       compute:
-        - {{name: muon, type: vector, rate: {{lane_op: 64}}, master: [$this.lbus, $this.smsbus]}}
+        - {{name: muon, type: vector, rate: {{lane_op: 64}}, {muon} master: [$this.lbus, $this.smsbus]}}
       neutrino: {{c_invoke: 0, c_base: 0, c_dep: 0, c_word: 0}}
 "
     );
@@ -214,4 +220,64 @@ fn an_entry_in_no_memory_block_stops_the_run_and_names_the_pc() {
             "the Muon task at pc 0x40: its read of 512 B at 0x300000 is in no memory block".into()
         )
     );
+}
+
+/// Runs one opaque task per (ops, latency) on sm0's Muon, all issued at
+/// once (independent, each to its own 1 KiB of the SMEM, no memory
+/// traffic), on the node with `muon`; per task, its chunk's end minus the
+/// first issue.
+fn opaque_ends(muon: &str, tasks: &[(u64, u64)]) -> Vec<u64> {
+    let b = node_with(0, muon);
+    let sm0 = b.nu("root.sm0");
+    let smem = b.memory("root.sm0.smem").base;
+    let ds: Vec<Descriptor> = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, &(ops, latency))| {
+            Descriptor::muon(
+                b.pe("root.sm0.muon"),
+                Range::from_len(smem + OUT + i as u64 * 1024, 1024),
+                0,
+                block(0, &[("ops", ops), ("latency", latency)]),
+            )
+            .unversioned()
+        })
+        .collect();
+    let mut sim = b.sim;
+    sim.set_timeline(true);
+    sim.spawn(sm0, move |ctx: NuCtx| async move {
+        let mut hs = Vec::new();
+        for d in ds {
+            hs.push(ctx.invoke(d).await);
+        }
+        for h in hs {
+            ctx.wait_unversioned(h.addr).await;
+        }
+    });
+    let s = sim.run();
+    assert_eq!(s.fatal, None);
+    let start = s.tasks.iter().filter_map(|t| t.issue).min().unwrap();
+    s.tasks.iter().map(|t| t.chunks[0].end - start).collect()
+}
+
+/// The fixed latency of the tests, and the work of a task: 64 lane-ops
+/// per cycle.
+const L: u64 = 300;
+const W: u64 = 40;
+
+#[test]
+fn the_latency_of_an_opaque_task_adds_its_cycles() {
+    let with = opaque_ends("", &[(W * 64, L)]);
+    let without = opaque_ends("", &[(W * 64, 0)]);
+    assert_eq!(with[0] - without[0], L);
+    // Ops 0: the task ends after its latency, plus the Muon's overhead.
+    assert_eq!(opaque_ends("", &[(0, L)]), [L]);
+    assert_eq!(opaque_ends("overhead: 25,", &[(0, L)]), [25 + L]);
+}
+
+#[test]
+fn the_latencies_of_tasks_in_flight_overlap_and_their_work_does_not() {
+    let two = [(W * 64, L), (W * 64, L)];
+    assert_eq!(opaque_ends("inflight: 2,", &two), [L + W, L + 2 * W]);
+    assert_eq!(opaque_ends("inflight: 1,", &two), [L + W, 2 * L + 2 * W]);
 }

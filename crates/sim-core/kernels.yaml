@@ -13,6 +13,9 @@
 # `time` gives the traffic of a task from its block:
 # - `ops`: the lane operations, the sum of the terms. A term is an
 #   expression, or {expr, if: NAME} / {expr, unless: NAME}.
+# - `latency`: the task's fixed latency in cycles, the sum of the terms (as
+#   `ops`). It uses no resource: the task starts its work after it, as
+#   after the Muon's `overhead`.
 # - `reads`, `writes`: per entry {field, bytes, if?, unless?}: `bytes`
 #   bytes read from (written to) the memory block that holds the address
 #   in the u64 field `field`; `dst` (or an address of 0) is the base of the
@@ -26,17 +29,18 @@
   name: opaque
   summary: a task with a time and no data
   semantics: |
-    Writes nothing. The block gives the time of the task: ops lane
-    operations, bytes_in bytes read from src, bytes_out bytes written to
-    the destination.
+    Writes nothing. The block gives the time of the task: a fixed latency
+    of latency cycles, then ops lane operations, bytes_in bytes read from
+    src and bytes_out bytes written to the destination.
   fields:
     - [src, u64, "read: the address that the task reads; 0: the destination"]
     - [ops, u32, "the lane operations"]
     - [bytes_in, u32, "the bytes read from src"]
     - [bytes_out, u32, "the bytes written to the destination"]
-    - [reserved, u32, "0"]
+    - [latency, u32, "the fixed latency in cycles (no resource); 0: none"]
   time:
     ops: [ops]
+    latency: [latency]
     reads:
       - {field: src, bytes: bytes_in}
     writes:

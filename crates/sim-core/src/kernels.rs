@@ -3,10 +3,11 @@
 //!
 //! The registry is a YAML list of kernels: `id`, `name`, `summary`,
 //! `semantics`, optional `flags` (name: bit of the field `flags`), `fields`
-//! (name, type, meaning) and `time` (the traffic of a task from its block:
-//! [`time`]). The fields of an argument block are in order, in C layout
-//! with no implicit padding: each field starts where the one before it
-//! ends, at a multiple of its size. A block is a multiple of 8 bytes.
+//! (name, type, meaning) and `time` (the traffic and the fixed latency of a
+//! task from its block: [`time`]). The fields of an argument block are in
+//! order, in C layout with no implicit padding: each field starts where the
+//! one before it ends, at a multiple of its size. A block is a multiple of
+//! 8 bytes.
 //! Kernel 0 (`opaque`) is listed: it writes nothing, and its block gives
 //! its time.
 //!
@@ -233,10 +234,10 @@ pub fn label(id: u32, block: &[u8]) -> u64 {
     id as u64 | (flags as u64) << 32
 }
 
-/// The argument block of the opaque kernel (id 0): the task reads
-/// `bytes_in` at `src` (0: its destination), does `ops` lane operations and
-/// writes `bytes_out` to its destination. A value that does not fit the
-/// block's u32 fields is a program error (panic).
+/// The argument block of the opaque kernel (id 0) with latency 0: the task
+/// reads `bytes_in` at `src` (0: its destination), does `ops` lane
+/// operations and writes `bytes_out` to its destination. A value that does
+/// not fit the block's u32 fields is a program error (panic).
 pub fn opaque_block(src: u64, ops: u64, bytes_in: u64, bytes_out: u64) -> Vec<u8> {
     let u32_of = |name: &str, v: u64| {
         u32::try_from(v)

@@ -235,6 +235,7 @@ fn traffic(id: u32, values: &[(&str, u64)], dst: u64) -> Traffic {
 fn t(ops: u64, reads: &[(u64, u64)], writes: &[(u64, u64)]) -> Traffic {
     Traffic {
         ops,
+        latency: 0,
         reads: reads.to_vec(),
         writes: writes.to_vec(),
     }
@@ -256,6 +257,43 @@ fn the_traffic_of_the_opaque_kernel_is_its_block() {
     assert_eq!(traffic(0, &v0, DST), t(500, &[(DST, 256)], &[(DST, 128)]));
     // No bytes: no entry.
     assert_eq!(traffic(0, &[("ops", 7)], DST), t(7, &[], &[]));
+    // The field latency is the task's fixed latency.
+    assert_eq!(
+        traffic(0, &[("ops", 7), ("latency", 300)], DST),
+        Traffic {
+            latency: 300,
+            ..t(7, &[], &[])
+        }
+    );
+}
+
+#[test]
+fn the_latency_of_a_task_is_the_sum_of_its_terms() {
+    let f = "[[n, u32, x], [flags, u32, x]]";
+    let yaml = one(
+        5,
+        "k",
+        f,
+        "  flags: {A: 1}\n  time: {latency: [n * 2 + 10, {expr: 100, if: A}, {expr: 7, unless: n}]}\n",
+    );
+    let k = &kernels::parse(&yaml).unwrap()[0];
+    let at = |n: u32, flags: u32| {
+        let b: Vec<u8> = [n.to_le_bytes(), flags.to_le_bytes()].concat();
+        let t = k.traffic(&b, DST).unwrap();
+        (t.ops, t.latency)
+    };
+    assert_eq!(at(3, 0), (0, 16));
+    assert_eq!(at(3, 1), (0, 116), "the term of flag A");
+    assert_eq!(at(0, 1), (0, 117), "the term unless n");
+    // An unknown field in a term is an error at load.
+    bad(
+        &one(5, "k", f, "  time: {latency: [{expr: m, if: n}]}\n"),
+        "k (id 5): time: unknown field m in \"m\"",
+    );
+    bad(
+        &one(5, "k", f, "  time: {latency: [{expr: 1, if: B}]}\n"),
+        "time: B is neither a flag of the kernel nor a field of the block",
+    );
 }
 
 #[test]

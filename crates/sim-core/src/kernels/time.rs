@@ -3,6 +3,9 @@
 //!
 //! - `ops`: a list of terms, each an expression or `{expr, if: NAME}` /
 //!   `{expr, unless: NAME}`; the lane operations are their sum.
+//! - `latency`: a list of terms as `ops`; the task's fixed latency in
+//!   cycles is their sum. It uses no resource: the task's chunk starts its
+//!   work after it (as after the Muon's `overhead`).
 //! - `reads`, `writes`: lists of `{field, bytes, if?, unless?}`: `bytes`
 //!   bytes at the address in the u64 field `field` of the block, or at the
 //!   base of the task's destination for `dst` (when the block has no field
@@ -25,6 +28,8 @@ use super::{Field, FieldType, Kernel};
 pub(super) struct TimeEntry {
     #[serde(default)]
     ops: Vec<TermEntry>,
+    #[serde(default)]
+    latency: Vec<TermEntry>,
     #[serde(default)]
     reads: Vec<AccessEntry>,
     #[serde(default)]
@@ -78,11 +83,12 @@ struct AccessEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Time {
     pub ops: Vec<Term>,
+    pub latency: Vec<Term>,
     pub reads: Vec<Access>,
     pub writes: Vec<Access>,
 }
 
-/// A term of the lane operations.
+/// A term of the lane operations or of the latency.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Term {
     pub expr: Expr,
@@ -186,11 +192,12 @@ impl Cond {
     }
 }
 
-/// The traffic of one task: its lane operations, and (address, bytes) per
-/// read and per write.
+/// The traffic of one task: its lane operations, its fixed latency in
+/// cycles, and (address, bytes) per read and per write.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Traffic {
     pub ops: u64,
+    pub latency: u64,
     pub reads: Vec<(u64, u64)>,
     pub writes: Vec<(u64, u64)>,
 }
@@ -289,11 +296,8 @@ fn access(e: &AccessEntry, kernel: &Kernel) -> Result<Access, String> {
     })
 }
 
-/// The section `e` of `kernel` (its fields and flags parsed).
-pub(super) fn compile(e: &TimeEntry, kernel: &Kernel) -> Result<Time, String> {
-    let ops = e
-        .ops
-        .iter()
+fn terms(l: &[TermEntry], kernel: &Kernel) -> Result<Vec<Term>, String> {
+    l.iter()
         .map(|t| {
             Ok(match t {
                 TermEntry::Plain(text) => Term {
@@ -306,14 +310,19 @@ pub(super) fn compile(e: &TimeEntry, kernel: &Kernel) -> Result<Time, String> {
                 },
             })
         })
-        .collect::<Result<_, String>>()?;
+        .collect()
+}
+
+/// The section `e` of `kernel` (its fields and flags parsed).
+pub(super) fn compile(e: &TimeEntry, kernel: &Kernel) -> Result<Time, String> {
     let list = |l: &[AccessEntry]| {
         l.iter()
             .map(|a| access(a, kernel))
             .collect::<Result<Vec<_>, String>>()
     };
     Ok(Time {
-        ops,
+        ops: terms(&e.ops, kernel)?,
+        latency: terms(&e.latency, kernel)?,
         reads: list(&e.reads)?,
         writes: list(&e.writes)?,
     })
@@ -343,15 +352,20 @@ impl Kernel {
             })
         };
         let on = |c: &Option<Cond>| c.as_ref().is_none_or(|c| c.holds(block));
-        let mut ops = 0u64;
-        for t in self.time.ops.iter().filter(|t| on(&t.cond)) {
-            ops = ops.checked_add(eval(&t.expr)?).ok_or_else(|| {
-                format!(
-                    "kernel {} (id {}): time: the ops overflow u64",
-                    self.name, self.id
-                )
-            })?;
-        }
+        let sum = |list: &[Term], what: &str| -> Result<u64, String> {
+            let mut total = 0u64;
+            for t in list.iter().filter(|t| on(&t.cond)) {
+                total = total.checked_add(eval(&t.expr)?).ok_or_else(|| {
+                    format!(
+                        "kernel {} (id {}): time: the sum of the {what} terms overflows u64",
+                        self.name, self.id
+                    )
+                })?;
+            }
+            Ok(total)
+        };
+        let ops = sum(&self.time.ops, "ops")?;
+        let latency = sum(&self.time.latency, "latency")?;
         let entries = |list: &[Access]| -> Result<Vec<(u64, u64)>, String> {
             let mut out = Vec::new();
             for a in list.iter().filter(|a| on(&a.cond)) {
@@ -374,6 +388,7 @@ impl Kernel {
         };
         Ok(Traffic {
             ops,
+            latency,
             reads: entries(&self.time.reads)?,
             writes: entries(&self.time.writes)?,
         })
