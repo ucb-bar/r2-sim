@@ -1,8 +1,8 @@
 //! The dispatch of the functional plane: the backend lists of the FU
-//! kinds, and the detection of fidelity switches (a matmul chain on two
+//! kinds, and the detection of backend switches (a matmul chain on two
 //! backends, and a read of the output of a `null` task). The node of
-//! `common`; a test selection rule forces the switches, which the fixed
-//! rule never makes.
+//! `common`; the lists of the FU kinds and a test selection rule make the
+//! switches (the fixed rule never splits a matmul chain).
 
 mod common;
 

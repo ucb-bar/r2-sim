@@ -2,19 +2,20 @@
 //!
 //! Each FU kind (`dma`, `atlas`, `muon`) has a list of backends; every
 //! backend works on one [`Store`]. At the issue of a task the timing thread
-//! selects its backend ([`Dispatch`]): `null` when the Neutrino that owns
-//! the task is in a subtree of fidelity null, else the first backend of
-//! the list of the task's FU kind. The op carries the index; the worker
-//! applies it with that backend ([`Functional`]). A Neutrino store writes
-//! the store directly.
+//! selects its backend ([`Dispatch`]): the first backend of the list of
+//! the task's FU kind. The op carries the index; the worker applies it
+//! with that backend ([`Functional`]). A Neutrino store writes the store
+//! directly.
 //!
-//! The dispatch detects fidelity switches:
+//! The dispatch detects backend switches:
 //! * a matmul of an open chain (an Atlas PE and a C base, opened by a
 //!   matmul with `keep`) on another backend than the one that holds its
-//!   partial sums stops the run;
+//!   partial sums stops the run (only a selection rule of a test,
+//!   [`SelectFn`], makes this switch);
 //! * a task on a backend that is not `null` that reads a range that a
 //!   `null` task wrote last gets a warning ([`NullRead`]), once per range
-//!   of a `null` task; a later write by such a task removes the mark.
+//!   of a `null` task (lists such as `atlas: [null]` with `dma: [builtin]`
+//!   make this switch); a later write by such a task removes the mark.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -311,12 +312,12 @@ impl Functional {
     }
 }
 
-/// Records that the `null` task `op` wrote the granules of its `dst` that
-/// hold data.
+/// Records that the `null` task `op` wrote the granules of its `dst` (a
+/// `dst` outside one block of the store: none).
 fn mark(m: &mut NullMarks, store: &Store, op: &FuncOp, desc: &Descriptor) {
     let g = store.granule();
     let dst = desc.held();
-    if !store.has_data(dst.span.base, dst.span.len()) {
+    if !store.in_block(dst.span.base, dst.span.len()) {
         return;
     }
     for i in dst.span.base / g..dst.span.bound.div_ceil(g) {
@@ -448,7 +449,7 @@ fn reads(desc: &Descriptor, tile: [u64; 2]) -> Vec<(u64, u64)> {
 }
 
 /// The timing thread's side of the dispatch: the backend lists, the index
-/// of `null`, the fidelity of each Neutrino and the open matmul chains.
+/// of `null` and the open matmul chains.
 pub(crate) struct Dispatch {
     units: Units,
     null: usize,
@@ -482,21 +483,16 @@ impl Dispatch {
         (d, backends.list, null)
     }
 
-    /// The backend of a task of a Neutrino whose subtree is `numeric`. An
-    /// error when a matmul of an open chain goes to another backend than
-    /// the one that holds the chain.
-    pub(crate) fn select(&mut self, numeric: bool, desc: &Descriptor) -> Result<usize, String> {
+    /// The backend of a task. An error when a matmul of an open chain goes
+    /// to another backend than the one that holds the chain.
+    pub(crate) fn select(&mut self, desc: &Descriptor) -> Result<usize, String> {
         let Some(kind) = FuKind::of(&desc.args) else {
             return Ok(self.null);
         };
         if self.names.is_empty() {
             return Ok(0);
         }
-        let mut b = if numeric {
-            self.units.of(kind)[0]
-        } else {
-            self.null
-        };
+        let mut b = self.units.of(kind)[0];
         if let Some(f) = &self.select {
             b = f(desc, b);
         }

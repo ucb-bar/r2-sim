@@ -14,7 +14,6 @@ fn node(lat: u64, link: &str) -> Built {
   address: {{fields: [{{name: sm, bits: 2}}], offset_bits: 24}}
 device:
   name: root
-  fidelity: numeric
   fabric:
     - {{name: sbus}}
     - {{name: cbus, control: true}}

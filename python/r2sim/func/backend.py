@@ -69,10 +69,10 @@ class Backend:
 
 def create(text: str) -> Backend:
     """The backend of the configuration `text` (JSON): `blocks` (base, size,
-    ptr, name; ptr 0 for a block of a null subtree), `sync_only`,
+    ptr, name), `sync_only`,
     `granule`, `pes` and `config`."""
     c = json.loads(text)
-    blocks = [Block(b["base"], b["size"], over(b["ptr"], b["size"]) if b["ptr"] else None,
-                    b["name"]) for b in c["blocks"]]
+    blocks = [Block(b["base"], b["size"], over(b["ptr"], b["size"]), b["name"])
+              for b in c["blocks"]]
     memory = Memory(blocks, [tuple(r) for r in c["sync_only"]], c["granule"])
     return Backend(memory, c["pes"], c["config"])

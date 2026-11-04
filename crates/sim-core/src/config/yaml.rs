@@ -61,8 +61,8 @@
 //!   load or store piece, that passes through it ends at the next
 //!   multiple of it: the source address bounds the read half of the
 //!   route and the source port, the destination address the write half.
-//! * nodes: `fidelity` (null | numeric; inherited; the root defaults to
-//!   null).
+//! * nodes: `fidelity` is removed (an error at load): the section
+//!   `functional` selects the backends.
 //! * `neutrino`: every key of [`NeutrinoConfig`] (`scoreboard`, `execution`, `pending`,
 //!   `versions` (default 256), `inbound_refs`, `inbound_invokes`, `outbound_deps`, `outbound_invokes`,
 //!   `issue_headroom` (default: the node's number of compute elements), `t_retry`,
@@ -563,7 +563,14 @@ struct NodeSec {
     neutrino: Option<NuSec>,
     #[serde(default)]
     children: Vec<NodeSec>,
-    fidelity: Option<String>,
+    /// Removed: present (with any value, `null` too) is an error at load.
+    #[serde(default, deserialize_with = "present")]
+    fidelity: bool,
+}
+
+/// True for a key that is present, whatever its value.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Value::deserialize(d).map(|_| true)
 }
 
 #[derive(Deserialize)]
@@ -947,9 +954,6 @@ pub struct Layout {
 pub struct Built {
     /// The simulation, ready for programs.
     pub sim: Sim,
-    /// True when some subtree has `numeric` fidelity (the subtrees whose
-    /// tasks go to the backend lists).
-    pub numeric: bool,
     /// The clock of the global cycle in GHz (default 1).
     pub clock_ghz: f64,
     /// The fabric parts' names and kinds.
@@ -1112,8 +1116,8 @@ struct PendingCache {
 }
 
 /// A node still to build: its section, its parent (id and name), its
-/// address field values and its parent's fidelity.
-type Pending<'a> = (&'a NodeSec, Option<(NeutrinoId, String)>, Vec<u64>, bool);
+/// address field values.
+type Pending<'a> = (&'a NodeSec, Option<(NeutrinoId, String)>, Vec<u64>);
 
 struct Builder {
     file: File,
@@ -1179,7 +1183,6 @@ impl Builder {
             total_bits,
             built: Built {
                 sim,
-                numeric: false,
                 clock_ghz,
                 layout: Layout::default(),
                 warnings: Vec::new(),
@@ -1250,13 +1253,13 @@ impl Builder {
                 compute: Vec::new(),
                 neutrino: None,
                 children: Vec::new(),
-                fidelity: None,
+                fidelity: false,
             },
         );
         // Parents before children, in configuration order.
-        let mut stack: Vec<Pending> = vec![(&root, None, Vec::new(), false)];
-        while let Some((sec, parent, fields, parent_numeric)) = stack.pop() {
-            let (nu, path, numeric) = self.node(sec, parent.as_ref(), &fields, parent_numeric)?;
+        let mut stack: Vec<Pending> = vec![(&root, None, Vec::new())];
+        while let Some((sec, parent, fields)) = stack.pop() {
+            let (nu, path) = self.node(sec, parent.as_ref(), &fields)?;
             let max = self
                 .file
                 .global
@@ -1270,7 +1273,7 @@ impl Builder {
             for (i, c) in sec.children.iter().enumerate().rev() {
                 let mut f = fields.clone();
                 f.push(i as u64 + 1);
-                stack.push((c, Some((nu, path.clone())), f, numeric));
+                stack.push((c, Some((nu, path.clone())), f));
             }
         }
         let mut caches = Vec::new();
@@ -1408,14 +1411,13 @@ impl Builder {
         }
     }
 
-    /// Adds node `sec` under `parent`; returns its id, name and fidelity.
+    /// Adds node `sec` under `parent`; returns its id and name.
     fn node(
         &mut self,
         sec: &NodeSec,
         parent: Option<&(NeutrinoId, String)>,
         fields: &[u64],
-        parent_numeric: bool,
-    ) -> Result<(NeutrinoId, String, bool), ConfigError> {
+    ) -> Result<(NeutrinoId, String), ConfigError> {
         let af = &self.file.global.address;
         if fields.len() > af.fields.len() {
             return err(format!(
@@ -1438,13 +1440,11 @@ impl Builder {
             }
         }
         let own = Range::from_len(base, 1u64 << af.offset_bits);
-        let numeric = match sec.fidelity.as_deref() {
-            None => parent_numeric,
-            Some("numeric") => true,
-            Some("null") => false,
-            Some(f) => return err(format!("{path}: unknown fidelity {f:?}")),
-        };
-        self.built.numeric |= numeric;
+        if sec.fidelity {
+            return err(format!(
+                "{path}: the key fidelity was removed; the section functional selects the backends"
+            ));
+        }
         // Owned ranges and the sync-only space.
         let mut owned = Vec::new();
         let mut sync = None;
@@ -1731,7 +1731,7 @@ impl Builder {
                 self.built.sim.set_link_wr(index, ab_wr, ba_wr);
             }
             if let Some(h) = hash {
-                self.built.sim.add_hash(index, nu, numeric, h);
+                self.built.sim.add_hash(index, nu, h);
             }
         }
         if parent.is_some() && upward != [true; 2] {
@@ -1739,10 +1739,9 @@ impl Builder {
                 "{path}: a child needs a data link and a control link to its parent's buses"
             ));
         }
-        self.built.sim.set_fidelity(nu, numeric);
-        self.memories(sec, &path, ppath, nu, own.base, numeric)?;
+        self.memories(sec, &path, ppath, nu, own.base)?;
         self.compute(sec, &path, ppath, nu)?;
-        Ok((nu, path, numeric))
+        Ok((nu, path))
     }
 
     fn memories(
@@ -1752,7 +1751,6 @@ impl Builder {
         ppath: Option<&str>,
         nu: NeutrinoId,
         base: u64,
-        numeric: bool,
     ) -> Result<(), ConfigError> {
         for m in &sec.memory {
             let name = format!("{path}.{}", m.name);
@@ -1784,7 +1782,7 @@ impl Builder {
                 ));
             }
             if banked {
-                self.banked(m, &name, path, ppath, nu, base, numeric)?;
+                self.banked(m, &name, path, ppath, nu, base)?;
                 continue;
             }
             let Some(bw) = &m.bw_bytes else {
@@ -1818,7 +1816,6 @@ impl Builder {
                     self.mems.push(PendingMem {
                         kind: mem_kind(&m.kind),
                         block: MemBlock {
-                            numeric,
                             wport,
                             block: block_of(&m.block_bytes, &name)?,
                             ..MemBlock::plain(name, nu, range, port, m.latency)
@@ -1944,7 +1941,6 @@ impl Builder {
         ppath: Option<&str>,
         nu: NeutrinoId,
         base: u64,
-        numeric: bool,
     ) -> Result<(), ConfigError> {
         let banks = m.banks.unwrap_or(1);
         let [[a, b]] = m.addr.as_slice() else {
@@ -2002,7 +1998,6 @@ impl Builder {
             self.mems.push(PendingMem {
                 kind: mem_kind(&m.kind),
                 block: MemBlock {
-                    numeric,
                     banked: true,
                     wport,
                     block: block_of(&pick(&o.block_bytes, &m.block_bytes), &bname)?,

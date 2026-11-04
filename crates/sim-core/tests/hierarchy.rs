@@ -15,7 +15,7 @@
 
 use nu_model::{Addr, Dep, Range};
 use sim_core::{
-    build_config_file, Args, Blocked, Built, Descriptor, Dtype, FatalError, NuCtx, ProfileRegistry,
+    build_config_file, Args, Built, Descriptor, Dtype, FatalError, NuCtx, ProfileRegistry,
     ResourceId, Stats,
 };
 
@@ -135,7 +135,6 @@ fn config_builds_owners_and_paths() {
     );
     // Up to the device: two links.
     assert_eq!(topo.path(sm1, b.nu("root")).latency, 30);
-    assert!(!b.numeric);
 }
 
 /// SM1 produces X (a matmul); SM0 consumes X by a remote dep. `delay`
@@ -428,9 +427,7 @@ fn dma_between_sms_charges_both_bridges_and_two_crossbar_ports() {
 
 #[test]
 fn remote_load_charges_the_path_twice_in_latency() {
-    // Numeric fidelity for the whole tree, inherited from the device.
-    let b = two_sm(&["root.fidelity=numeric"]);
-    assert!(b.numeric);
+    let b = built();
     let sm0 = b.nu("root.gpc0.sm0");
     let src = b.memory("root.gpc0.sm1.smem").base;
     let mut sim = b.sim;
@@ -513,16 +510,19 @@ fn remote_wait_blocks_until_ready() {
 }
 
 #[test]
-fn null_fidelity_rejects_a_load() {
-    let b = built();
-    let sm0 = b.nu("root.gpc0.sm0");
-    let src = b.memory("root.gpc0.sm1.smem").base;
-    let mut sim = b.sim;
-    sim.set_functional(Box::new(func::Builtin::new()));
-    sim.spawn(sm0, move |ctx: NuCtx| async move {
-        ctx.load(Addr(src), 64).await;
-    });
-    let s = sim.run();
-    assert!(matches!(s.fatal.unwrap().error, FatalError::Func { .. }));
-    assert!(!s.unfinished.contains(&(sm0, Blocked::Wait)));
+fn the_removed_key_fidelity_is_an_error_at_load() {
+    // On the device and on a node below it; the message names the section
+    // that replaces it.
+    for set in ["root.fidelity=numeric", "root.gpc0.fidelity=null"] {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/configs/two_sm.yaml");
+        let e = build_config_file(&path, &[set], ProfileRegistry::with_builtins())
+            .err()
+            .expect("rejected")
+            .0;
+        assert!(
+            e.contains("the key fidelity was removed; the section functional selects the backends"),
+            "{e}"
+        );
+    }
 }

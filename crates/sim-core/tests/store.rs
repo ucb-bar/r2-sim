@@ -1,37 +1,31 @@
-//! The memory store of the functional plane: one mapping per block that
-//! holds data, a lookup by global address, zero for bytes that no op
-//! wrote, no effect for a write into the sync-only space, and no data in a
-//! block of a null subtree.
+//! The memory store of the functional plane: one mapping per block, a
+//! lookup by global address, zero for bytes that no op wrote, and no
+//! effect for a write into the sync-only space.
 
 use nu_model::{Dst, NeutrinoId, Range, FULL_MASK};
 use sim_core::{MemBlock, ResourceId, Store};
 
-/// A block `[base, base + size)` named `name`; `numeric` false for a block
-/// of a null subtree.
-fn block(name: &str, base: u64, size: u64, numeric: bool) -> MemBlock {
-    MemBlock {
-        numeric,
-        ..MemBlock::plain(
-            name.into(),
-            NeutrinoId(0),
-            Range::from_len(base, size),
-            ResourceId(0),
-            0,
-        )
-    }
+/// A block `[base, base + size)` named `name`.
+fn block(name: &str, base: u64, size: u64) -> MemBlock {
+    MemBlock::plain(
+        name.into(),
+        NeutrinoId(0),
+        Range::from_len(base, size),
+        ResourceId(0),
+        0,
+    )
 }
 
-/// Two 1 MiB blocks with data (listed out of order, one of them twice), a
-/// null block between them, and the sync-only space at the start of the
-/// second.
+/// Three 1 MiB blocks (listed out of order, one of them twice), and the
+/// sync-only space at the start of the last.
 fn store() -> Store {
     let mib = 1 << 20;
     Store::new(
         &[
-            block("hi", 4 * mib, mib, true),
-            block("lo", mib, mib, true),
-            block("null", 2 * mib, mib, false),
-            block("hi", 4 * mib, mib, true),
+            block("hi", 4 * mib, mib),
+            block("lo", mib, mib),
+            block("mid", 2 * mib, mib),
+            block("hi", 4 * mib, mib),
         ],
         &[Range::from_len(4 * mib, 0x1000)],
         512,
@@ -45,7 +39,7 @@ fn the_blocks_are_sorted_by_base_and_found_by_address() {
     let names: Vec<&str> = s.blocks().iter().map(|b| b.name.as_str()).collect();
     assert_eq!(
         names,
-        ["lo", "null", "hi"],
+        ["lo", "mid", "hi"],
         "sorted, and a block listed twice is one"
     );
     s.write(0x10_0010, &[1, 2, 3]).unwrap();
@@ -81,22 +75,13 @@ fn a_write_into_the_sync_only_space_has_no_effect() {
 }
 
 #[test]
-fn a_null_block_has_no_data() {
+fn a_dma_between_two_blocks_copies() {
     let mut s = store();
-    assert!(s.is_null(0x20_0000, 16));
-    // A write has no effect, a read is an error.
-    s.write(0x20_0000, &[1, 2]).unwrap();
-    let e = s.read(0x20_0000, 2).unwrap_err();
-    assert!(e.0.contains("null-fidelity"), "{}", e.0);
-    // A DMA from it copies nothing; a DMA into it writes nothing.
-    s.write(0x10_0000, &[7; 16]).unwrap();
     let dst = |r: Range| Dst {
         span: r,
         mask: FULL_MASK,
     };
-    let into = Range::from_len(0x10_1000, 512);
-    s.dma(&dst(into), 0x20_0000, 0x10_1000, 16, None).unwrap();
-    assert_eq!(s.read(0x10_1000, 16).unwrap(), vec![0; 16]);
+    s.write(0x10_0000, &[7; 16]).unwrap();
     s.dma(
         &dst(Range::from_len(0x20_0000, 512)),
         0x10_0000,
@@ -105,8 +90,9 @@ fn a_null_block_has_no_data() {
         None,
     )
     .unwrap();
-    // A DMA between blocks with data copies.
-    s.dma(&dst(into), 0x10_0000, 0x10_1000, 16, None).unwrap();
+    assert_eq!(s.read(0x20_0000, 16).unwrap(), vec![7; 16]);
+    let into = Range::from_len(0x10_1000, 512);
+    s.dma(&dst(into), 0x20_0000, 0x10_1000, 16, None).unwrap();
     assert_eq!(s.read(0x10_1000, 16).unwrap(), vec![7; 16]);
 }
 

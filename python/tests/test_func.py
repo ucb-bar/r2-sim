@@ -12,15 +12,15 @@ from r2sim.func.plane import Plane
 BF16 = ml_dtypes.bfloat16
 FULL = 0xFFFFFFFF
 G = 512
-MEM = 0x100000  # a numeric block [1 MiB, 2 MiB)
-NULL = 0x200000  # a null-fidelity block [2 MiB, 3 MiB)
-SYNC = (0x1F0000, 0x200000)  # the sync-only top of the numeric block
+MEM = 0x100000  # a block [1 MiB, 2 MiB)
+HI = 0x200000  # a second block [2 MiB, 3 MiB)
+SYNC = (0x1F0000, 0x200000)  # the sync-only top of the first block
 
 
 @pytest.fixture
 def plane(provider) -> Plane:
-    # The null block first: the memory sorts the blocks by base.
-    return Plane(Memory.owned([(NULL, MEM, False), (MEM, MEM, True)], [SYNC], G),
+    # The second block first: the memory sorts the blocks by base.
+    return Plane(Memory.owned([(HI, MEM), (MEM, MEM)], [SYNC], G),
                  provider=provider)
 
 
@@ -70,7 +70,7 @@ def test_an_access_outside_all_blocks_is_an_error(plane):
     with pytest.raises(FuncError, match="not inside one memory block"):
         plane.memory.read(MEM - 4, 4)
     with pytest.raises(FuncError, match="not inside one memory block"):
-        plane.memory.write(NULL + MEM, b"x")
+        plane.memory.write(HI + MEM, b"x")
 
 
 def test_sync_only_writes_are_ignored(plane):
@@ -78,15 +78,9 @@ def test_sync_only_writes_are_ignored(plane):
     assert plane.memory.read(SYNC[0], 8) == bytes(8)
 
 
-def test_a_null_block_drops_writes_and_rejects_reads(plane):
-    plane.memory.write(NULL, b"\x01")
-    with pytest.raises(FuncError, match="null-fidelity"):
-        plane.memory.read(NULL, 1)
-
-
 def test_an_access_across_two_blocks_is_an_error(plane):
     with pytest.raises(FuncError, match="not inside one memory block"):
-        plane.memory.read(NULL - 4, 8)
+        plane.memory.read(HI - 4, 8)
 
 
 def test_dma_copies_the_bytes(plane):
@@ -95,9 +89,9 @@ def test_dma_copies_the_bytes(plane):
     assert plane.memory.read(MEM + 0x8000, 1024) == b"abcdefgh" * 128
 
 
-def test_dma_from_a_null_block_copies_nothing(plane):
-    plane.memory.write(MEM + 0x8000, b"x" * 16)
-    plane.task(dma(NULL, MEM + 0x8000, 16))
+def test_dma_between_two_blocks_copies(plane):
+    plane.memory.write(HI, b"x" * 16)
+    plane.task(dma(HI, MEM + 0x8000, 16))
     assert plane.memory.read(MEM + 0x8000, 16) == b"x" * 16
 
 

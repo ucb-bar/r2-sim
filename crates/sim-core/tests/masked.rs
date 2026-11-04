@@ -56,7 +56,7 @@ fn run_sm0(b: Built, d: Descriptor) -> Stats {
 fn the_ownership_check_covers_the_whole_span() {
     // The task holds only the last granule of sm0's SMEM (mask 0), but its
     // span of 4 granules runs past the SMEM, where nothing is owned.
-    let b = two_sm(&["root.fidelity=numeric"]);
+    let b = two_sm(&[]);
     let smem = b.memory("root.gpc0.sm0.smem");
     let dst = Range::from_len(smem.bound - G, 4 * G);
     let d = dma(&b, smem.base, smem.bound - G, G, dst, 0);
@@ -69,13 +69,13 @@ fn the_functional_plane_checks_the_held_granules() {
     // dst holds granules 0 and 2 of a span of 4 (mask 0b10) at 64 KiB in
     // sm0's SMEM. Writing granule 2 is inside; writing granule 1, in the
     // span but in a gap, is outside.
-    let b = two_sm(&["root.fidelity=numeric"]);
+    let b = two_sm(&[]);
     let base = b.memory("root.gpc0.sm0.smem").base;
     let dst = Range::from_len(base + 0x10000, 4 * G);
     let ok = dma(&b, base, dst.base + 2 * G, G, dst, 0b10);
     let s = run_sm0(b, ok);
     assert_eq!(s.fatal, None);
-    let b = two_sm(&["root.fidelity=numeric"]);
+    let b = two_sm(&[]);
     let bad = dma(&b, base, dst.base + G + 8, 16, dst, 0b10);
     let s = run_sm0(b, bad);
     match s.fatal.expect("fatal").error {
@@ -94,7 +94,7 @@ fn a_load_in_a_gap_of_an_executing_writer_is_no_race() {
     // A long DMA writes granules 0 and 2 (mask 0b10). A load of granule 1
     // while it executes is no race; a load of granule 2 is.
     for (off, race) in [(G, false), (2 * G, true)] {
-        let b = two_sm(&["root.fidelity=numeric"]);
+        let b = two_sm(&[]);
         let sm0 = b.nu("root.gpc0.sm0");
         let base = b.memory("root.gpc0.sm0.smem").base;
         let dst = Range::from_len(base + 0x10000, 4 * G);

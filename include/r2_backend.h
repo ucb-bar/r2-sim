@@ -18,8 +18,7 @@
 typedef struct {
     uint64_t base;    /* the global byte address of the first byte */
     uint64_t size;    /* the bytes of the block */
-    uint8_t *ptr;     /* the bytes of the block in the r2-sim process; NULL
-                         for a block of a null subtree (no data) */
+    uint8_t *ptr;     /* the bytes of the block in the r2-sim process */
     const char *name; /* for example "root.gpc0.hbm" */
 } r2_block;
 
@@ -39,8 +38,7 @@ typedef struct {
     size_t sync_only_count;
 } r2_memory;
 
-/* The bytes [addr, addr + len), or NULL when they are not in one block or
-   the block has no data. */
+/* The bytes [addr, addr + len), or NULL when they are not in one block. */
 static inline uint8_t *r2_at(const r2_memory *m, uint64_t addr, uint64_t len) {
     size_t lo = 0, hi = m->count;
     while (lo < hi) { /* the first block with base > addr */

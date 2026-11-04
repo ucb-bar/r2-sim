@@ -319,9 +319,6 @@ pub struct MemBlock {
     /// The block's attachments to the buses it is a slave on; fabric
     /// routes to it end at one of them (none: no fabric, an empty route).
     pub attach: Vec<crate::topology::AttachId>,
-    /// False in a `null`-fidelity subtree: the store keeps no data there
-    /// (writes are dropped and reads are errors).
-    pub numeric: bool,
     /// The block's contiguous range.
     pub range: Range,
     /// The block's addresses: the decomposition of `range`.
@@ -356,7 +353,6 @@ impl MemBlock {
             name,
             owner,
             attach: Vec::new(),
-            numeric: true,
             range,
             sets: AddressSet::decompose(&range),
             banked: false,

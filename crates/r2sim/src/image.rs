@@ -42,11 +42,11 @@
 //! `at` is a memory of the configuration by its dotted name, or
 //! `<node path>.scratch` for the data scratch of a node, with an optional
 //! `+offset` (decimal or `0x` hex). File paths are relative to the image
-//! file. Every byte of an entry must lie in a memory block or hash range
-//! of numeric fidelity, outside the sync-only space; or in the data
-//! scratch or the IMEM of its node. The image loads through the functional
-//! backend's host write before the run; IMEM and data scratch bytes go to
-//! the control plane.
+//! file. Every byte of an entry must lie in a memory block or hash range,
+//! outside the sync-only space; or in the data scratch or the IMEM of its
+//! node. An entry in memory needs a functional backend that keeps data.
+//! The image loads through the functional backend's host write before the
+//! run; IMEM and data scratch bytes go to the control plane.
 //!
 //! After the run, `--image-out` reads every named entry back into one
 //! safetensors file (an ELF entry gives one `U8` tensor per segment,
@@ -435,7 +435,7 @@ fn convert(data: &[u8], from: Dtype, to: Dtype) -> Result<Vec<u8>, String> {
 }
 
 /// Splits `r` into pieces, each inside one functional block. Every byte
-/// must be in a numeric block and outside the sync-only space.
+/// must be in a block and outside the sync-only space.
 fn pieces(blocks: &[MemBlock], sync_only: &[Range], r: Range) -> Result<Vec<Range>, String> {
     if let Some(s) = sync_only.iter().find(|s| s.overlaps(&r)) {
         return Err(format!("{r} overlaps the sync-only range {s}"));
@@ -448,9 +448,6 @@ fn pieces(blocks: &[MemBlock], sync_only: &[Range], r: Range) -> Result<Vec<Rang
             .filter(|b| b.range.base <= a && a < b.range.bound)
             .min_by_key(|b| b.range.len())
             .ok_or_else(|| format!("{r}: byte {a:#x} is in no memory block"))?;
-        if !b.numeric {
-            return Err(format!("{r}: byte {a:#x} is in a null-fidelity block"));
-        }
         let z = b.range.bound.min(r.bound);
         out.push(Range { base: a, bound: z });
         a = z;

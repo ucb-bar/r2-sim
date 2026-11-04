@@ -284,7 +284,6 @@ struct HashLink {
     #[allow(dead_code)]
     link: usize,
     owner: NeutrinoId,
-    numeric: bool,
     hash: AddressHash,
 }
 
@@ -364,7 +363,7 @@ pub struct Sim {
     hop_buf: Vec<PathHop>,
 
     /// Hash links (Radiance 2 spec Section 3.3): fabric link index, owner,
-    /// fidelity, rule.
+    /// rule.
     hashes: Vec<HashLink>,
     profiles: ProfileRegistry,
     /// The functional plane before the run; it moves into `plane` at the
@@ -374,8 +373,6 @@ pub struct Sim {
     select: Option<SelectFn>,
     /// The selection of the backend of each task (from the start).
     dispatch: Option<Dispatch>,
-    /// False for a Neutrino in a subtree of fidelity null (default true).
-    numeric: Vec<bool>,
     plane: Option<FuncPlane>,
     /// Host writes applied to the backend before the run.
     init: Vec<(Addr, Vec<u8>)>,
@@ -454,7 +451,6 @@ impl Sim {
             setup: Some(Setup::Backends(Backends::one(Box::new(NullBackend)))),
             select: None,
             dispatch: None,
-            numeric: Vec::new(),
             plane: None,
             init: Vec::new(),
             track_writers: false,
@@ -585,19 +581,9 @@ impl Sim {
 
     /// Replaces the fixed selection rule of the backends: `f` gets the task
     /// and the backend the rule selects, and returns the backend to use.
-    /// For tests of the detection of fidelity switches.
+    /// For tests of the detection of backend switches.
     pub fn set_selection(&mut self, f: SelectFn) {
         self.select = Some(f);
-    }
-
-    /// Sets the fidelity of the subtree of `nu`: false for null (its tasks
-    /// use the `null` backend).
-    pub fn set_fidelity(&mut self, nu: NeutrinoId, numeric: bool) {
-        let i = nu.0 as usize;
-        if self.numeric.len() <= i {
-            self.numeric.resize(i + 1, true);
-        }
-        self.numeric[i] = numeric;
     }
 
     /// Messages one hop stage holds per protocol class (default 1).
@@ -1084,10 +1070,13 @@ impl Sim {
     pub fn functional_blocks(&self) -> Vec<MemBlock> {
         let mut stores = self.memories.clone();
         for h in &self.hashes {
-            stores.push(MemBlock {
-                numeric: h.numeric,
-                ..MemBlock::plain(String::new(), h.owner, h.hash.range, ResourceId(0), 0)
-            });
+            stores.push(MemBlock::plain(
+                String::new(),
+                h.owner,
+                h.hash.range,
+                ResourceId(0),
+                0,
+            ));
         }
         stores
     }
@@ -1278,13 +1267,8 @@ impl Sim {
 
     /// Adds the address rewrite of fabric link `link` (Radiance 2 spec Section 3.3), whose
     /// node `owner` owns its linear range.
-    pub fn add_hash(&mut self, link: usize, owner: NeutrinoId, numeric: bool, hash: AddressHash) {
-        self.hashes.push(HashLink {
-            link,
-            owner,
-            numeric,
-            hash,
-        });
+    pub fn add_hash(&mut self, link: usize, owner: NeutrinoId, hash: AddressHash) {
+        self.hashes.push(HashLink { link, owner, hash });
     }
 
     /// The hash links' rules.
@@ -2324,15 +2308,14 @@ impl Sim {
     }
 
     /// Emits one functional op and returns its seq. A task op goes to the
-    /// backend that the dispatch selects; a fidelity switch inside a
+    /// backend that the dispatch selects; a backend switch inside a
     /// matmul chain stops the run.
     fn emit(&mut self, nu: NeutrinoId, gid: Option<u64>, kind: OpKind) -> u64 {
         self.func_seq += 1;
         let backend = match &kind {
             OpKind::Task(desc) => {
-                let numeric = self.numeric.get(nu.0 as usize).copied().unwrap_or(true);
                 let d = self.dispatch.as_mut().expect("dispatch");
-                match d.select(numeric, desc) {
+                match d.select(desc) {
                     Ok(b) => b,
                     Err(msg) => {
                         self.fatal(nu, gid, FatalError::Invalid(msg));

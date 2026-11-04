@@ -16,7 +16,6 @@ global:
     offset_bits: 24
 device:
   name: root
-  fidelity: numeric
   fabric:
     - {{name: sbus}}
     - {{name: cbus, control: true}}

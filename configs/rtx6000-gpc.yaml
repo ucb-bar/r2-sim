@@ -16,7 +16,6 @@
 #   latency 54 as the data link.
 # * No copy engine: SM transfers are the SMs' own (rtx6000-sm.yaml).
 
-fidelity: numeric
 fabric:
   - {name: clsbus, topology: xbar, bw_bytes: 512, beat_bytes: 32}
   - {name: clcbus, topology: xbar, bw_bytes: 64, control: true}

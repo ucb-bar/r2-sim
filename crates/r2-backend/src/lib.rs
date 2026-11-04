@@ -20,7 +20,7 @@ pub struct Block {
     pub base: u64,
     /// The bytes of the block.
     pub size: u64,
-    /// The bytes of the block; null for a block of a null subtree.
+    /// The bytes of the block in the r2-sim process.
     pub ptr: *mut u8,
     /// The block's name, NUL-terminated.
     pub name: *const c_char,
@@ -124,7 +124,7 @@ pub unsafe fn set_err(err: *mut c_char, len: usize, msg: &str) {
 }
 
 /// The bytes `[addr, addr + len)` of `memory`, or null when they are not
-/// in one block or the block has no data (`r2_at`).
+/// in one block (`r2_at`).
 ///
 /// # Safety
 /// `memory` must describe a valid block table.

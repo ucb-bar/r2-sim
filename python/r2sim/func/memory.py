@@ -1,8 +1,7 @@
 """The memory of the functional plane, as a backend plug-in sees it: the
 blocks of r2-sim's store, each a NumPy array of bytes over the block's
 memory (no copy), sorted by base. An access lies inside one block; a write
-into the sync-only space has no effect; a block of a null subtree has no
-array: a read from it is an error and a write to it has no effect."""
+into the sync-only space has no effect."""
 
 from __future__ import annotations
 
@@ -48,12 +47,11 @@ class Dst:
 
 @dataclass
 class Block:
-    """One memory block: its global base, its size, its bytes (None for a
-    block of a null subtree) and its name."""
+    """One memory block: its global base, its size, its bytes and its name."""
 
     base: int
     size: int
-    data: np.ndarray | None
+    data: np.ndarray
     name: str
 
 
@@ -72,12 +70,12 @@ class Memory:
         self.granule = max(int(granule), 1)
 
     @classmethod
-    def owned(cls, blocks: list[tuple[int, int, bool]], sync_only: list[tuple[int, int]],
+    def owned(cls, blocks: list[tuple[int, int]], sync_only: list[tuple[int, int]],
               granule: int) -> Memory:
-        """A memory with arrays of its own (for tests): (base, size, data)
-        per block, data False for a block of a null subtree."""
-        return cls([Block(base, size, np.zeros(size, np.uint8) if data else None, f"b{i}")
-                    for i, (base, size, data) in enumerate(blocks)], sync_only, granule)
+        """A memory with arrays of its own (for tests): (base, size) per
+        block."""
+        return cls([Block(base, size, np.zeros(size, np.uint8), f"b{i}")
+                    for i, (base, size) in enumerate(blocks)], sync_only, granule)
 
     def block(self, addr: int, length: int) -> Block:
         i = bisect.bisect_right(self.bases, addr)
@@ -88,21 +86,12 @@ class Memory:
                 return b
         raise FuncError(f"[{addr:#x}, {addr + length:#x}) is not inside one memory block")
 
-    def is_null(self, addr: int, length: int) -> bool:
-        """True when the range lies in a block of a null subtree."""
-        try:
-            return self.block(addr, length).data is None
-        except FuncError:
-            return False
-
     def _is_sync_only(self, addr: int, length: int) -> bool:
         return any(addr < hi and lo < addr + length for lo, hi in self.sync_only)
 
     def view(self, addr: int, length: int) -> np.ndarray:
         """The bytes [addr, addr + length), as a view of the block."""
         b = self.block(addr, length)
-        if b.data is None:
-            raise FuncError(f"read of [{addr:#x}, +{length}) in a null-fidelity block")
         off = addr - b.base
         return b.data[off:off + length]
 
@@ -111,13 +100,10 @@ class Memory:
 
     def target(self, addr: int, length: int) -> np.ndarray | None:
         """The bytes [addr, addr + length) to write, as a view of the block;
-        None where a write has no effect (the sync-only space, a block of
-        a null subtree)."""
+        None where a write has no effect (the sync-only space)."""
         if self._is_sync_only(addr, length):
             return None
         b = self.block(addr, length)
-        if b.data is None:
-            return None
         off = addr - b.base
         return b.data[off:off + length]
 

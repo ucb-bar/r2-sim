@@ -34,16 +34,13 @@ def size_of(name: str) -> int:
 def dma(plane: Plane, desc: dict) -> None:
     """Copies `bytes` from `src` to `to`, or `rows` rows of `row_bytes`: row
     r from `src + r * src_stride` to `to + r * dst_stride`. Each written row
-    must be inside the task's masked destination. A row from a
-    null-fidelity block copies nothing."""
+    must be inside the task's masked destination."""
     src, to = desc["src"], desc["to"]
     rows = desc.get("rows", 1)
     n = desc["row_bytes"] if rows > 1 else desc["bytes"]
     for r in range(rows):
         s, d = src + r * desc.get("src_stride", 0), to + r * desc.get("dst_stride", 0)
         check_in_dst(plane, desc, d, n)
-        if plane.memory.is_null(s, n):
-            continue
         plane.provider.copy(plane.memory, s, d, n)
 
 

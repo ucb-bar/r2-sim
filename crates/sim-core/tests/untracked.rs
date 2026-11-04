@@ -268,10 +268,9 @@ fn the_loader_rejects_an_owned_range_that_holds_address_0() {
 
 #[test]
 fn an_untracked_dma_writes_another_nodes_memory_in_the_functional_plane() {
-    // Numeric fidelity: sm0 stores a pattern in its SMEM, copies it into
-    // sm1's SMEM with an untracked DMA, fences, and loads it back from
-    // sm1's SMEM.
-    let b = two_sm(&["root.fidelity=numeric"]).expect("config");
+    // sm0 stores a pattern in its SMEM, copies it into sm1's SMEM with an
+    // untracked DMA, fences, and loads it back from sm1's SMEM.
+    let b = two_sm(&[]).expect("config");
     let sm0 = b.nu("root.gpc0.sm0");
     let (s0, s1) = (
         b.memory("root.gpc0.sm0.smem").base,

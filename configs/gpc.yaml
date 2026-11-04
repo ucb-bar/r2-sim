@@ -3,9 +3,6 @@
 # addressed root.gpcN.sm0 .. sm3.
 
 # Data bridge to the device: 256 B/cycle each way, latency 20 cycles.
-# SMEM keeps data (router outputs, activations); HBM has no values:
-# weights have no values, and a DMA from HBM copies nothing.
-fidelity: numeric
 fabric:
   # Data crossbar 512 B/cycle: four SM links at full rate, and the HBM
   # slice. The data crossbar and data link have separate read and write

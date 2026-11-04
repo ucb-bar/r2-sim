@@ -1,14 +1,13 @@
 //! The memory store of the functional plane: one anonymous mapping per
 //! memory block that holds data, shared by every backend.
 //!
-//! Each block of a numeric subtree (each HBM, SMEM bank and tmem, and
-//! each linear range of an address hash) is one private anonymous mapping
-//! of the block's size, reserved at configure (`MAP_NORESERVE`): the
-//! operating system supplies a page at its first write, and a byte that no
-//! op wrote reads as zero. A block does not move until the store is
-//! dropped, which unmaps it. A block of a null subtree has no mapping: a
-//! read from it is an error, a write to it has no effect, and a copy from
-//! it copies nothing. A write into the sync-only space has no effect.
+//! Each block (each HBM, SMEM bank and tmem, and each linear range of an
+//! address hash) is one private anonymous mapping of the block's size,
+//! reserved at configure (`MAP_NORESERVE`): the operating system supplies
+//! a page at its first write, and a byte that no op wrote reads as zero.
+//! A block does not move until the store is dropped, which unmaps it. A
+//! write into the sync-only space has no effect. A run makes a store only
+//! when some backend keeps data.
 //!
 //! The blocks are sorted by base and do not overlap; a lookup is a binary
 //! search. A range must lie in one block. During a run only the worker
@@ -27,8 +26,7 @@ pub struct StoreBlock {
     pub base: u64,
     /// The bytes of the block.
     pub size: u64,
-    /// The bytes of the block in this process; null for a block of a null
-    /// subtree (no data).
+    /// The bytes of the block in this process.
     pub ptr: *mut u8,
     /// The block's name, for example `root.gpc0.hbm`.
     pub name: String,
@@ -51,8 +49,8 @@ fn err<T>(msg: String) -> Result<T, FuncError> {
 }
 
 impl Store {
-    /// Maps the blocks of `memories` that hold data (a block listed twice
-    /// is mapped once). `granule`: the Neutrino granule, the unit of a
+    /// Maps the blocks of `memories` (a block listed twice is mapped
+    /// once). `granule`: the Neutrino granule, the unit of a
     /// destination range's mask. An error when two blocks overlap or a
     /// mapping fails.
     pub fn new(
@@ -82,15 +80,10 @@ impl Store {
                 }
             }
             let size = m.range.len();
-            let ptr = if m.numeric {
-                map(size)?
-            } else {
-                std::ptr::null_mut()
-            };
             s.blocks.push(StoreBlock {
                 base: m.range.base,
                 size,
-                ptr,
+                ptr: map(size)?,
                 name: m.name.clone(),
             });
         }
@@ -128,16 +121,9 @@ impl Store {
         ))
     }
 
-    /// True when `[addr, addr + len)` lies in a block of a null subtree.
-    pub fn is_null(&self, addr: u64, len: u64) -> bool {
-        self.find(addr, len)
-            .is_ok_and(|i| self.blocks[i].ptr.is_null())
-    }
-
-    /// True when `[addr, addr + len)` lies in a block that holds data.
-    pub fn has_data(&self, addr: u64, len: u64) -> bool {
-        self.find(addr, len)
-            .is_ok_and(|i| !self.blocks[i].ptr.is_null())
+    /// True when `[addr, addr + len)` lies in one block.
+    pub fn in_block(&self, addr: u64, len: u64) -> bool {
+        self.find(addr, len).is_ok()
     }
 
     fn is_sync_only(&self, addr: u64, len: u64) -> bool {
@@ -145,16 +131,9 @@ impl Store {
         self.sync_only.iter().any(|s| s.overlaps(&r))
     }
 
-    /// The bytes `[addr, addr + len)`. An error outside one block and in a
-    /// block of a null subtree.
+    /// The bytes `[addr, addr + len)`. An error outside one block.
     pub fn bytes(&self, addr: u64, len: u64) -> Result<&[u8], FuncError> {
         let b = &self.blocks[self.find(addr, len)?];
-        if b.ptr.is_null() {
-            return err(format!(
-                "read of {} in a null-fidelity block",
-                Range::from_len(addr, len)
-            ));
-        }
         // SAFETY: the range lies in the block's mapping, which lives as
         // long as the store; `&self` excludes a writer.
         Ok(
@@ -165,16 +144,12 @@ impl Store {
     }
 
     /// The bytes `[addr, addr + len)` to write; `None` when a write has no
-    /// effect there (the sync-only space, or a block of a null subtree).
-    /// An error outside one block.
+    /// effect there (the sync-only space). An error outside one block.
     pub fn bytes_mut(&mut self, addr: u64, len: u64) -> Result<Option<&mut [u8]>, FuncError> {
         if self.is_sync_only(addr, len) {
             return Ok(None);
         }
         let b = &self.blocks[self.find(addr, len)?];
-        if b.ptr.is_null() {
-            return Ok(None);
-        }
         // SAFETY: as in `bytes`; `&mut self` makes the slice unique.
         Ok(Some(unsafe {
             std::slice::from_raw_parts_mut(b.ptr.add((addr - b.base) as usize), len as usize)
@@ -186,8 +161,7 @@ impl Store {
         self.bytes(addr, len).map(<[u8]>::to_vec)
     }
 
-    /// Writes `bytes` at `addr` (no effect in the sync-only space or a
-    /// block of a null subtree).
+    /// Writes `bytes` at `addr` (no effect in the sync-only space).
     pub fn write(&mut self, addr: u64, bytes: &[u8]) -> Result<(), FuncError> {
         if let Some(m) = self.bytes_mut(addr, bytes.len() as u64)? {
             m.copy_from_slice(bytes);
@@ -198,8 +172,7 @@ impl Store {
     /// The DMA of a task with dst `task_dst`: `bytes` from `src` to `dst`,
     /// or with `rows` the rows of a 2D copy, each as a memmove (a row's
     /// ranges may overlap). Each written row must lie in `task_dst`. A row
-    /// from a block of a null subtree copies nothing; a row into the
-    /// sync-only space or a block of a null subtree writes nothing.
+    /// into the sync-only space writes nothing.
     pub fn dma(
         &mut self,
         task_dst: &Dst,
@@ -216,28 +189,22 @@ impl Store {
             let (s, d) = (src + r * ss, dst + r * ds);
             check_in_dst(task_dst, self.granule(), &Range::from_len(d, len))?;
             let from = self.raw(s, len)?;
-            if from.is_null() || self.is_sync_only(d, len) {
+            if self.is_sync_only(d, len) {
                 continue;
             }
             let to = self.raw(d, len)?;
-            if !to.is_null() {
-                // SAFETY: both ranges lie in mappings of the store (`raw`),
-                // and no reference to their bytes exists; `copy` allows
-                // them to overlap.
-                unsafe { std::ptr::copy(from, to, len as usize) };
-            }
+            // SAFETY: both ranges lie in mappings of the store (`raw`), and
+            // no reference to their bytes exists; `copy` allows them to
+            // overlap.
+            unsafe { std::ptr::copy(from, to, len as usize) };
         }
         Ok(())
     }
 
-    /// A raw pointer to the first byte of `[addr, addr + len)`; null for a
-    /// block of a null subtree. An error outside one block. It makes no
-    /// reference to the bytes.
+    /// A raw pointer to the first byte of `[addr, addr + len)`. An error
+    /// outside one block. It makes no reference to the bytes.
     fn raw(&self, addr: u64, len: u64) -> Result<*mut u8, FuncError> {
         let b = &self.blocks[self.find(addr, len)?];
-        if b.ptr.is_null() {
-            return Ok(std::ptr::null_mut());
-        }
         // SAFETY: `find` checked that the range lies in the mapping.
         Ok(unsafe { b.ptr.add((addr - b.base) as usize) })
     }
@@ -246,10 +213,8 @@ impl Store {
 impl Drop for Store {
     fn drop(&mut self) {
         for b in &self.blocks {
-            if !b.ptr.is_null() {
-                // SAFETY: `ptr` is a mapping of `size` bytes made by `map`.
-                unsafe { libc::munmap(b.ptr.cast(), b.size as usize) };
-            }
+            // SAFETY: `ptr` is a mapping of `size` bytes made by `map`.
+            unsafe { libc::munmap(b.ptr.cast(), b.size as usize) };
         }
     }
 }
