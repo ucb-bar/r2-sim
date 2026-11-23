@@ -13,6 +13,9 @@ Model:
   row i / (wpr S R). Each macro serves one row per cycle (1R): lanes that hit
   the same row of a macro are served together (coalesced or broadcast); lanes
   that hit different rows of one macro conflict.
+  With `swizzle` (XOR), the macro of a word is its index XOR (row mod the
+  macro count): a column walk (fixed word offset, consecutive rows) spreads
+  over macros instead of hitting one.
 - Crossbar: inputs = cores x lanes, outputs = R x S macros. Full (radix None):
   only macro conflicts. Multistage radix r: an Omega network of k = ceil(log_r n)
   stages of r x r switches (n = r^k >= both sides) with destination-tag routing;
@@ -28,7 +31,7 @@ import math
 import random
 from functools import lru_cache
 
-PATTERNS = ["row", "col", "stride2", "stride4", "stride32", "gather", "broadcast"]
+PATTERNS = ["row", "col", "stride2", "stride4", "stride32", "gather", "gather32", "broadcast"]
 
 
 def addresses(pattern: str, lanes: int, access: int, region: int, rng: random.Random) -> list[int]:
@@ -46,18 +49,25 @@ def addresses(pattern: str, lanes: int, access: int, region: int, rng: random.Ra
         return [region + (access * lanes + l) * s for l in range(lanes)]
     if pattern == "gather":
         return [region + rng.randrange(16384) for _ in range(lanes)]
+    if pattern == "gather32":
+        # random 32 B segments (8 words): lanes 0-7 one segment, 8-15 another
+        segs = [rng.randrange(16384 // 8) * 8 for _ in range((lanes + 7) // 8)]
+        return [region + segs[l // 8] + l % 8 for l in range(lanes)]
     if pattern == "broadcast":
         return [region + access] * lanes
     raise ValueError(pattern)
 
 
-def place(word: int, banks: int, subbanks: int, wpr: int) -> tuple[int, int]:
+def place(word: int, banks: int, subbanks: int, wpr: int, swizzle: bool = False) -> tuple[int, int]:
     """(macro index, row) of a word."""
     line = word // wpr
     sb = line % subbanks
     bank = (line // subbanks) % banks
     row = line // (subbanks * banks)
-    return bank * subbanks + sb, row
+    m = bank * subbanks + sb
+    if swizzle:
+        m ^= row % (banks * subbanks)
+    return m, row
 
 
 @lru_cache(maxsize=None)
@@ -79,7 +89,8 @@ def links(src: int, dst: int, k: int, n: int, radix: int) -> list[tuple[int, int
 
 
 def efficiency(pattern: str, banks: int, subbanks: int, width: int, radix: int | None,
-               lanes: int = 16, cores: int = 2, accesses: int = 256, seed: int = 1) -> float:
+               lanes: int = 16, cores: int = 2, accesses: int = 256, seed: int = 1,
+               swizzle: bool = False) -> float:
     rng = random.Random(seed)
     wpr = max(1, width // 32)
     macros = banks * subbanks
@@ -96,7 +107,7 @@ def efficiency(pattern: str, banks: int, subbanks: int, width: int, radix: int |
         for c in range(cores):
             if not pending[c] and issued[c] < accesses:
                 ws = addresses(pattern, lanes, issued[c], regions[c], rng)
-                pending[c] = [(c * lanes + l, *place(w, banks, subbanks, wpr)) for l, w in enumerate(ws)]
+                pending[c] = [(c * lanes + l, *place(w, banks, subbanks, wpr, swizzle)) for l, w in enumerate(ws)]
                 issued[c] += 1
         busy_macro: dict[int, int] = {}
         busy_link: dict[tuple[int, int], tuple[int, int]] = {}

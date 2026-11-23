@@ -2,9 +2,11 @@
 
 Stage 1: every design that is buildable (< 128 macros, legal shapes) with an
 analytic bound >= --bound-min runs the concurrent attention workload.
-Stage 2: designs whose attention reaches >= --target also run the GEMMs
-(square, skinny, K-heavy) and Muon alone. The ideal-memory run of each kernel
-point gives its ceiling. Identical simulator inputs run once (a cache keyed by
+Stage 2: designs whose attention reaches >= --stage2-min (default 0: all) run
+the GEMMs (square, skinny, K-heavy) and the background Muon workloads (a GEMM
+beside a transpose, a 4 B gather, a 32 B segment gather). The ideal-memory run
+of each kernel point gives its ceiling. Atlas's MAC rate follows the dtype
+(archs.MACS). Identical simulator inputs run once (a cache keyed by
 the generated sm.yaml and the kernel point).
 
     python3 sweep.py --out results/sweep.jsonl --jobs 128
@@ -30,6 +32,7 @@ import simconfig
 
 SCRATCH = Path(os.environ.get("MEMARCH_SCRATCH", tempfile.gettempdir()))
 GEMMS = ["square", "skinny", "kheavy"]
+STAGE2 = GEMMS + archs.BG_WORKLOADS
 
 
 def sim_key(sp: simconfig.SimPoint, kp: dict) -> str:
@@ -75,10 +78,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--options", default="ABC")
-    ap.add_argument("--macs", type=int, nargs="+", default=[1024, 2048])
     ap.add_argument("--dtypes", nargs="+", default=["bf16", "fp8"])
     ap.add_argument("--bound-min", type=float, default=0.6)
     ap.add_argument("--target", type=float, default=0.95)
+    ap.add_argument("--stage2-min", type=float, default=0.0)
     ap.add_argument("--jobs", type=int, default=64)
     ap.add_argument("--limit", type=int, default=0, help="designs per (option, P, dtype), cheapest first (0: all)")
     a = ap.parse_args(argv)
@@ -86,8 +89,9 @@ def main(argv=None) -> int:
     t0 = time.time()
     designs, pruned = [], {}
     for opt in a.options:
-        for macs in a.macs:
+        for macs in [None]:
             for dt in a.dtypes:
+                macs = archs.MACS[dt]
                 group = []
                 for d in archs.enumerate_designs(opt, macs, dt):
                     ev = archs.evaluate(d)
@@ -111,7 +115,7 @@ def main(argv=None) -> int:
             for wl in workloads:
                 kp = archs.kernel_point(d, wl)
                 for ideal in (False, True):
-                    sp = archs.sim_point(d, ideal=ideal)
+                    sp = archs.sim_point(d, wl, ideal=ideal)
                     k = sim_key(sp, kp)
                     jobs[k] = (sp, kp)
                     refs.append((ev, wl, ideal, k, kp))
@@ -124,12 +128,12 @@ def main(argv=None) -> int:
     for ev, wl, ideal, k, kp in refs1:
         ev.setdefault("runs", {})[wl + ("_ideal" if ideal else "")] = {
             **results[k], "util": util(results[k], kp, ev["design"].macs), "kernel": kp}
-    passing = [ev for ev in designs if (ev["runs"]["attn"].get("util") or 0) >= a.target]
-    print(f"stage 1 done: {len(passing)} designs reach {a.target} on attention; {time.time() - t0:.0f}s",
+    passing = [ev for ev in designs if (ev["runs"]["attn"].get("util") or 0) >= a.stage2_min]
+    print(f"stage 1 done: {len(passing)} designs reach {a.stage2_min} on attention; {time.time() - t0:.0f}s",
           file=sys.stderr)
 
-    # Stage 2: GEMMs and Muon alone on the attention survivors.
-    jobs, refs2 = jobs_for(passing, GEMMS + ["muon_alone"])
+    # Stage 2: GEMMs and the background Muon workloads.
+    jobs, refs2 = jobs_for(passing, STAGE2)
     jobs = {k: v for k, v in jobs.items() if k not in results}
     print(f"stage 2: {len(jobs)} unique runs", file=sys.stderr)
     results.update(run_all(jobs, a.jobs))

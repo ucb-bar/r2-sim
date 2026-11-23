@@ -38,6 +38,9 @@ D = 128                   # attention head dim
 KV = 128                  # attention key block
 SM_OPS = 8                # softmax lane-ops per element of S
 MAX_MACROS = 128          # hard limit: total macros < 128
+MACS = {"bf16": 2048, "fp8": 4096}   # Atlas: 32x32 PEs, 2 bf16 or 4 fp8 MACs per PE per cycle
+MUON_LOAD = 0.5           # background Muon work: this fraction of its ideal smem port over the GEMM
+BG_TASK = 16 << 10        # bytes in (and out) of one background Muon task
 ASSUMPTIONS = [
     f"Muon: {MUON_CORES} cores x {LANES} lanes, {WORD} B per lane access, {MUON_OPS} lane-ops/cycle per core",
     f"Atlas in-array accumulator {ACC_ARRAY} B (2 x 32x32 fp32) in every option, not counted in area",
@@ -50,6 +53,11 @@ ASSUMPTIONS = [
     "Atlas operand reuse over a block > 32x32 needs an Atlas-local double-buffered operand buffer 2 (bm+bn) kc b",
     "HBM ideal (no latency, unlimited); DMA writes still charge the on-SM write ports",
     "Arbitration: first-come per task chunk (r2-sim flow model); no Atlas priority / round robin",
+    f"Atlas 32x32 PEs: {MACS['bf16']} bf16 or {MACS['fp8']} fp8 MACs per cycle; operand-reuse block 32x32",
+    f"Background Muon workloads (transpose, gather): a 512x512x1024 GEMM with Muon moving {MUON_LOAD} of its "
+    f"ideal smem bandwidth (2 x 64 B/cycle) over the GEMM's ideal time, {BG_TASK // 1024} KiB in + out per task",
+    "Muon pattern efficiency of a read+write workload: harmonic mean of the read and write patterns (equal bytes)",
+    "Scatter = gather in this model (1R1W macros, same conflicts for reads and writes)",
 ]
 
 
@@ -69,6 +77,7 @@ class Design:
     partitions: int = 2       # TMEM lane partitions (A, C)
     tmem_cols: int = 0        # TMEM macros side by side (A, C)
     qr: int = 64              # attention query rows per block
+    swizzle: bool = False     # smem XOR address swizzle (Muon accesses)
 
     @property
     def b(self) -> int:
@@ -76,7 +85,7 @@ class Design:
 
     def label(self) -> str:
         r = "full" if self.radix is None else f"r{self.radix}"
-        s = f"{self.option} P{self.macs} {self.dtype} {self.banks}x{self.subbanks}x{self.width}b {r} kc{self.kc} blk{self.block} q{self.qr}"
+        s = f"{self.option} P{self.macs} {self.dtype} {self.banks}x{self.subbanks}x{self.width}b {r}{' xor' if self.swizzle else ''} kc{self.kc} blk{self.block} q{self.qr}"
         if self.option in "BC":
             s += f" Wa{self.atlas_port}"
         if self.option in "AC":
@@ -186,6 +195,9 @@ def area(d: Design) -> dict | None:
     lanes = LANES * MUON_CORES
     xbar = A.xbar_area(lanes, ncols, 32, d.radix, lg)
     other = {"arbiters": A.arbiter_area(3, ncols, lg)}
+    if d.swizzle:
+        # per lane: XOR log2(macros) address bits (a MUX2-sized gate each, both read and write)
+        other["addr_xor"] = lg["k_xp"] * lanes * 2 * max(1, math.ceil(math.log2(ncols)))
     if d.option in "BC":
         bits = d.atlas_port * 8
         other["atlas_port_mux"] = lg["k_xp"] * d.banks * bits
@@ -201,16 +213,30 @@ def area(d: Design) -> dict | None:
 
 # ------------------------------------------------------------ bandwidth caps
 @lru_cache(maxsize=None)
-def muon_eff(pattern: str, banks: int, subbanks: int, width: int, radix: int | None) -> float:
+def muon_eff(pattern: str, banks: int, subbanks: int, width: int, radix: int | None,
+             swizzle: bool = False) -> float:
     return muonxbar.efficiency(pattern, banks, subbanks, width, radix, lanes=LANES, cores=MUON_CORES,
-                               accesses=128)
+                               accesses=128, swizzle=swizzle)
 
 
-def caps(d: Design, pattern: str = "row") -> dict:
+# Muon smem access patterns (read, write) of each workload.
+PATTERN_OF = {"transpose": ("row", "col"), "gather": ("gather", "row"), "gather32": ("gather32", "row")}
+BG_WORKLOADS = list(PATTERN_OF)
+
+
+def workload_eff(d: Design, workload: str) -> float:
+    """Muon smem port efficiency of a workload: harmonic mean of its read and
+    write patterns (equal bytes); softmax and the rest: row."""
+    pats = PATTERN_OF.get(workload, ("row", "row"))
+    effs = [muon_eff(p, d.banks, d.subbanks, d.width, d.radix, d.swizzle) for p in pats]
+    return len(effs) / sum(1 / e for e in effs)
+
+
+def caps(d: Design, workload: str = "attn") -> dict:
     smem = d.banks * d.subbanks * d.width / 8
     tmem = d.tmem_cols * TMEM_W / 8 if d.option in "AC" else 0
     c = {"smem_rd": smem, "smem_wr": smem, "tmem_rd": tmem, "tmem_wr": tmem,
-         "muon_smem": LANES * WORD * muon_eff(pattern, d.banks, d.subbanks, d.width, d.radix),
+         "muon_smem": LANES * WORD * workload_eff(d, workload),
          "muon_tmem": min(LANES * WORD, tmem / d.partitions) if tmem else 0}
     if d.option in "BC":
         c["atlas_port"] = d.atlas_port
@@ -278,7 +304,8 @@ def gemm_plan_b(d: Design, kind: str) -> int:
     return best[1]
 
 
-GEMMS = {"square": (1024, 1024, 1024), "skinny": (64, 4096, 4096), "kheavy": (256, 256, 8192)}
+GEMMS = {"square": (1024, 1024, 1024), "skinny": (64, 4096, 4096), "kheavy": (256, 256, 8192),
+         "mid": (512, 512, 1024)}   # mid: the GEMM beside the background Muon workloads
 
 
 def gemm_shape(d: Design, kind: str, tile: int | None = None) -> tuple[int, int, int]:
@@ -324,32 +351,33 @@ def bound(d: Design) -> dict:
 
 # ------------------------------------------------------------- enumeration
 KNOBS = {
-    "A": dict(banks=[1, 2, 4], subbanks=[8, 16, 32], n_acc=[4, 8, 16, 32], partitions=[2, 4],
+    "A": dict(banks=[1, 2, 4], subbanks=[4, 8, 16, 32], n_acc=[4, 8, 16, 32], partitions=[2, 4],
               tmem_mult=[1, 2, 4, 8]),
-    "B": dict(banks=[2, 4, 8], subbanks=[8, 16, 32], atlas_port=[64, 128, 256]),
-    "C": dict(banks=[2, 4, 8], subbanks=[8, 16, 32], atlas_port=[64, 128, 256], n_acc=[2, 4, 8, 16],
-              partitions=[2, 4], tmem_mult=[1, 2, 4, 8]),
+    "B": dict(banks=[1, 2, 4, 8, 16], subbanks=[4, 8, 16, 32], atlas_port=[64, 128, 256, 512]),
+    "C": dict(banks=[1, 2, 4, 8, 16], subbanks=[4, 8, 16, 32], atlas_port=[64, 128, 256, 512],
+              n_acc=[2, 4, 8, 16], partitions=[2, 4], tmem_mult=[1, 2, 4, 8]),
 }
 WIDTHS = [32, 64, 128, 256]
 RADIX = [2, 4, 8, None]
+SWIZZLE = [False, True]
 KCS = [64, 128]           # kc must divide 128 (attention)
-BLOCKS = [32, 64, 128]
+BLOCKS = [32]             # Atlas computes 32x32 output blocks (fixed)
 QRS = [32, 64, 128]       # attention query rows per block
 
 
 def enumerate_designs(option: str, macs: int, dtype: str):
     k = KNOBS[option]
-    for banks, sub, w, radix, kc, blk, qr in itertools.product(k["banks"], k["subbanks"], WIDTHS, RADIX, KCS,
-                                                               BLOCKS, QRS):
+    for banks, sub, w, radix, sw, kc, blk, qr in itertools.product(
+            k["banks"], k["subbanks"], WIDTHS, RADIX, SWIZZLE, KCS, BLOCKS, QRS):
         if option == "B":
             for wa in k["atlas_port"]:
-                yield Design("B", macs, dtype, banks, sub, w, radix, kc, blk, atlas_port=wa, qr=qr)
+                yield Design("B", macs, dtype, banks, sub, w, radix, kc, blk, atlas_port=wa, qr=qr, swizzle=sw)
         else:
             for nacc, part, mult in itertools.product(k["n_acc"], k["partitions"], k["tmem_mult"]):
                 ports = k.get("atlas_port", [0])
                 for wa in ports:
                     yield Design(option, macs, dtype, banks, sub, w, radix, kc, blk, atlas_port=wa or 0,
-                                 n_acc=nacc, partitions=part, tmem_cols=part * mult, qr=qr)
+                                 n_acc=nacc, partitions=part, tmem_cols=part * mult, qr=qr, swizzle=sw)
 
 
 def evaluate(d: Design) -> dict:
@@ -370,8 +398,8 @@ def evaluate(d: Design) -> dict:
 
 
 # ------------------------------------------------------------- sim mapping
-def sim_point(d: Design, pattern: str = "row", ideal: bool = False) -> simconfig.SimPoint:
-    c = caps(d, pattern)
+def sim_point(d: Design, workload: str = "attn", ideal: bool = False) -> simconfig.SimPoint:
+    c = caps(d, workload)
     if ideal:
         big = 1 << 20
         return simconfig.SimPoint(macs=d.macs, atlas_port=None, smem_rd=big, smem_wr=big, tmem_rd=big,
@@ -399,6 +427,14 @@ def kernel_point(d: Design, workload: str, scale: float = 1.0) -> dict:
         src = acm
         return dict(mode="muon", tasks=max(2, int(16 * scale)) * 2, ops=SM_OPS * qr * KV // 2,
                     bytes_in=qr * KV * 4 // 2, bytes_out=qr * KV * d.b // 2, mmem=src, cores=2)
+    if workload in BG_WORKLOADS:
+        m, n, k = GEMMS["mid"]
+        tm, tn, bl = gemm_shape(d, "mid")
+        t_ideal = m * n * k / d.macs
+        per_core = MUON_LOAD * LANES * WORD * t_ideal / (2 * BG_TASK)   # tasks per core
+        return dict(mode="gemm", dtype=d.dtype, m=m, n=n, k=k, tm=tm, tn=tn, bm=bl, bn=bl,
+                    kc=min(d.kc, k), opmem=opm, accmem=acm, bg=max(1, round(per_core)),
+                    ops=BG_TASK // WORD, bytes_in=BG_TASK, bytes_out=BG_TASK, cores=MUON_CORES)
     m, n, k = GEMMS[workload]
     tm, tn, bl = gemm_shape(d, workload)
     return dict(mode="gemm", dtype=d.dtype, m=m, n=n, k=k, tm=tm, tn=tn, bm=bl, bn=bl,
