@@ -1,0 +1,27 @@
+# One SM of the memarch experiment (generated).
+fabric:
+  - {name: smsbus, topology: xbar}
+  - {name: smcbus, topology: xbar, bw_bytes: 8, beat_bytes: 8, control: true}
+  - {name: lbus, topology: xbar}
+  - {name: tbus, topology: xbar}
+  - {name: smsbus_to_sbus, topology: link, from: $this.smsbus, to: $parent.sbus, bw_bytes: 128, wr_bytes: 128, latency: 10}
+  - {name: smcbus_to_cbus, topology: link, from: $this.smcbus, to: $parent.cbus, bw_bytes: 8, beat_bytes: 8, latency: 10, control: true}
+  - {name: ms0, topology: xbar}
+  - {name: mt0, topology: xbar}
+  - {name: m0_smem, topology: link, from: $this.ms0, to: $this.lbus, bw_bytes: 64, beat_bytes: 4}
+  - {name: m0_tmem, topology: link, from: $this.mt0, to: $this.tbus, bw_bytes: 64, beat_bytes: 4}
+  - {name: ms1, topology: xbar}
+  - {name: mt1, topology: xbar}
+  - {name: m1_smem, topology: link, from: $this.ms1, to: $this.lbus, bw_bytes: 64, beat_bytes: 4}
+  - {name: m1_tmem, topology: link, from: $this.mt1, to: $this.tbus, bw_bytes: 64, beat_bytes: 4}
+memory:
+  - {name: smem, type: scratch, addr: [[0x0, 0x100000]], bw_bytes: 256, wr_bytes: 256, beat_bytes: 4, latency: 2, slave: [$this.lbus, $this.smsbus]}
+  - {name: tmem, type: tmem, rules: free, addr: [[0x1000000, 0x1100000]], bw_bytes: 256, wr_bytes: 256, beat_bytes: 4, latency: 2, slave: [$this.tbus]}
+  - {name: hbm, type: dram, addr: [[0x10000000, 0x50000000]], bw_bytes: 1048576, latency: 0, slave: $this.lbus}
+  - {name: sync, type: sync, addr: [[0x1F0000000, 0x1F1000000]]}
+compute:
+  - {name: atlas, type: tensor, rate: {bf16: 1024, fp8: 1024}, tile: [128, 128], quantize: none, operand_reuse: none, acc_buffer: 8192, beat_bytes: 4096, master: [$this.lbus, $this.tbus]}
+  - {name: muon0, type: vector, rate: {lane_op: 128}, overhead: 50, beat_bytes: 4, master: [$this.ms0, $this.mt0]}
+  - {name: muon1, type: vector, rate: {lane_op: 128}, overhead: 50, beat_bytes: 4, master: [$this.ms1, $this.mt1]}
+  - {name: dma, type: dma, latency: 0, inflight: 8, beat_bytes: 4096, master: [$this.lbus, $this.tbus]}
+neutrino: {scoreboard: 1024, pending: 1024, execution: 1024, versions: 4096, inbound_refs: 1024, inbound_invokes: 256, outbound_deps: 1024, outbound_invokes: 256, c_invoke: 8, master: [$this.smcbus, $this.lbus, $this.smsbus]}

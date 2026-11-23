@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 464 360" width="232" height="180" role="img">
+<title>Option B: unified SMEM</title>
+<style>rect,line{fill:none;stroke:#1f2328;stroke-width:3.5}line.a{stroke-width:4.6}polygon,text{fill:#1f2328;stroke:none}text{font-family:Helvetica,Arial,sans-serif}@media (prefers-color-scheme: dark){rect,line{stroke:#e6edf3}polygon,text{fill:#e6edf3}}</style>
+<rect x="12.0" y="12.0" width="440.0" height="336.0"/>
+<text x="24.0" y="36.0" font-size="24.9" text-anchor="start" dominant-baseline="central">SM</text>
+<rect x="36.0" y="60.0" width="160.0" height="36.0"/>
+<text x="116.0" y="78.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">Muon 0</text>
+<rect x="36.0" y="108.0" width="160.0" height="36.0"/>
+<text x="116.0" y="126.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">Muon 1</text>
+<rect x="252.0" y="44.0" width="116.0" height="100.0"/>
+<text x="310.0" y="94.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">Atlas</text>
+<rect x="376.0" y="44.0" width="52.0" height="100.0"/>
+<text x="402.0" y="82.8" font-size="18.7" text-anchor="middle" dominant-baseline="central">acc</text>
+<text x="402.0" y="105.2" font-size="18.7" text-anchor="middle" dominant-baseline="central">×2</text>
+<rect x="36.0" y="172.0" width="392.0" height="32.0"/>
+<line x1="50.0" y1="198.0" x2="50.0" y2="178.0"/>
+<line x1="414.0" y1="198.0" x2="414.0" y2="178.0"/>
+<line x1="50.0" y1="184.0" x2="414.0" y2="192.0"/>
+<line x1="50.0" y1="192.0" x2="414.0" y2="184.0"/>
+<line class="a" x1="110.4" y1="172.0" x2="110.4" y2="155.6"/>
+<polygon points="110.4,144.0 102.1,156.4 118.7,156.4"/>
+<line class="a" x1="121.6" y1="144.0" x2="121.6" y2="160.4"/>
+<polygon points="121.6,172.0 129.9,159.6 113.3,159.6"/>
+<line class="a" x1="304.4" y1="172.0" x2="304.4" y2="155.6"/>
+<polygon points="304.4,144.0 296.1,156.4 312.7,156.4"/>
+<line class="a" x1="315.6" y1="144.0" x2="315.6" y2="160.4"/>
+<polygon points="315.6,172.0 323.9,159.6 307.3,159.6"/>
+<text x="328.0" y="158.0" font-size="18.7" text-anchor="start" dominant-baseline="central">port</text>
+<rect x="36.0" y="278.0" width="40.0" height="22.0"/>
+<rect x="36.0" y="252.0" width="40.0" height="22.0"/>
+<rect x="36.0" y="226.0" width="40.0" height="22.0"/>
+<rect x="86.0" y="278.0" width="40.0" height="22.0"/>
+<rect x="86.0" y="252.0" width="40.0" height="22.0"/>
+<rect x="86.0" y="226.0" width="40.0" height="22.0"/>
+<rect x="136.0" y="278.0" width="40.0" height="22.0"/>
+<rect x="136.0" y="252.0" width="40.0" height="22.0"/>
+<rect x="136.0" y="226.0" width="40.0" height="22.0"/>
+<rect x="186.0" y="278.0" width="40.0" height="22.0"/>
+<rect x="186.0" y="252.0" width="40.0" height="22.0"/>
+<rect x="186.0" y="226.0" width="40.0" height="22.0"/>
+<rect x="236.0" y="278.0" width="40.0" height="22.0"/>
+<rect x="236.0" y="252.0" width="40.0" height="22.0"/>
+<rect x="236.0" y="226.0" width="40.0" height="22.0"/>
+<text x="298.0" y="262.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">…</text>
+<rect x="328.0" y="278.0" width="40.0" height="22.0"/>
+<rect x="328.0" y="252.0" width="40.0" height="22.0"/>
+<rect x="328.0" y="226.0" width="40.0" height="22.0"/>
+<text x="232.0" y="324.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">SMEM: banks × subbanks</text>
+</svg>

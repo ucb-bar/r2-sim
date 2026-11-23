@@ -250,6 +250,11 @@ pub enum PeParams {
         /// The SMEM write port (`wr_bytes`), charged by C out and the
         /// flush instead of `smem_port`.
         smem_wport: Option<ResourceId>,
+        /// The array's own operand read port (key `port_bytes`, a flow
+        /// resource `<atlas>.port` of that many bytes per cycle): charged
+        /// with the A and B bytes the array reads from a block that is not
+        /// a tmem. `None`: no limit but the memory ports.
+        port: Option<ResourceId>,
         /// Efficiency of the array, in (0, 1].
         utilization: Ratio,
         /// The output tile `[rows, columns]` (key `tile`, default [128,
@@ -338,6 +343,10 @@ pub struct MemBlock {
     /// The memory type: "scratch", "dram" or "tmem" (an SM's tensor
     /// memory, tmem model, 2026-10-21).
     pub kind: &'static str,
+    /// A tmem without the access rules of the tmem model (key `rules:
+    /// free`): an Atlas on its SM may read A and B and write C in any
+    /// memory, and a DMA may read it into any memory.
+    pub free: bool,
 }
 
 impl MemBlock {
@@ -361,6 +370,7 @@ impl MemBlock {
             block: None,
             load_latency,
             kind: "scratch",
+            free: false,
         }
     }
 

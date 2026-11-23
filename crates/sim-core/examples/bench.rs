@@ -118,6 +118,7 @@ fn main() {
                     array,
                     smem_port: Some(smem_port),
                     smem_wport: None,
+                    port: None,
                     utilization: Ratio::ONE,
                     quantize: true,
                 },

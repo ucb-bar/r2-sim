@@ -1180,6 +1180,9 @@ impl Sim {
             return Ok(());
         };
         let nu = self.pes[pe.0 as usize].nu;
+        if self.memories.iter().any(|m| m.is_tmem() && m.owner == nu && m.free) {
+            return Ok(());
+        }
         match desc.args {
             Args::Matmul {
                 a,

@@ -1,0 +1,9 @@
+# Logic area constants (um^2). PLACEHOLDERS: no synthesis yet.
+# k_xp: one crosspoint-bit of a crossbar = one MUX2 cell per bit per input
+#       (an N:1 mux tree is N-1 MUX2s per output bit).
+# k_reg: one pipeline flop per bit.
+# Swap with synthesized 8x8 / 32x32 @ 32b crossbars when available.
+placeholder: true
+k_xp: 0.40     # um^2 per crosspoint-bit (MUX2 placeholder)
+k_reg: 1.00    # um^2 per register bit (DFF placeholder)
+k_arb: 10.0    # um^2 per arbiter request input (placeholder)

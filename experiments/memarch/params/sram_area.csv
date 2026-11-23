@@ -1,0 +1,13 @@
+# Area per bit (um^2) of a two-port (1R1W) register-file macro, by size (Kbit)
+# and width (bits). Read off the compiler plot (provided 2026-11-20); swap in
+# the raw compiler numbers when available. Empty = not offered.
+kbit,w32,w64,w128,w256
+0.25,3.37,,,
+0.5,1.80,2.40,,
+1,1.00,1.28,1.93,
+2,0.60,0.72,1.02,1.68
+4,0.37,0.43,0.57,0.88
+8,0.26,0.29,0.34,0.50
+16,0.20,0.21,0.23,0.30
+32,0.16,0.16,0.18,0.20
+64,0.14,0.15,0.14,0.15

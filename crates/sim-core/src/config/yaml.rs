@@ -661,6 +661,9 @@ struct MemSec {
     bank: HashMap<String, BankSec>,
     /// This scratch memory caches a DRAM (an experiment; `sim::cache`).
     cache: Option<CacheKeySec>,
+    /// A tmem: `free` lifts the access rules of the tmem model (default
+    /// `strict`).
+    rules: Option<String>,
 }
 
 /// `cache: {of: <dram>, line_bytes: L}` on a scratch memory.
@@ -777,6 +780,10 @@ struct CompSec {
     quantize: Option<String>,
     operand_reuse: Option<String>,
     acc_buffer: Option<Num>,
+    /// Tensor: the array's operand read port in bytes per cycle, charged
+    /// with the A and B bytes read from a block that is not a tmem
+    /// (default: none).
+    port_bytes: Option<Num>,
     /// DMA: the chunk size of every transfer (default: no limit, a
     /// transfer is one chunk).
     burst_bytes: Option<Num>,
@@ -1818,6 +1825,7 @@ impl Builder {
                         block: MemBlock {
                             wport,
                             block: block_of(&m.block_bytes, &name)?,
+                            free: rules_free(&m, &name)?,
                             ..MemBlock::plain(name, nu, range, port, m.latency)
                         },
                         slaves,
@@ -2001,6 +2009,7 @@ impl Builder {
                     banked: true,
                     wport,
                     block: block_of(&pick(&o.block_bytes, &m.block_bytes), &bname)?,
+                    free: rules_free(m, &bname)?,
                     ..MemBlock::plain(bname, nu, r, port, o.latency.unwrap_or(m.latency))
                 },
                 slaves: slaves.clone(),
@@ -2072,6 +2081,9 @@ impl Builder {
             if c.tile.is_some() && c.kind != "tensor" {
                 return err(format!("{name}: tile is a tensor key"));
             }
+            if c.port_bytes.is_some() && c.kind != "tensor" {
+                return err(format!("{name}: port_bytes is a tensor key"));
+            }
             if c.burst_bytes.is_some() && c.kind != "dma" {
                 return err(format!("{name}: burst_bytes is a dma key"));
             }
@@ -2122,6 +2134,18 @@ impl Builder {
                         r => return err(format!("{name}: operand_reuse {r:?}")),
                     };
                     let tile = c.tile.unwrap_or([128, 128]);
+                    let port = match &c.port_bytes {
+                        None => None,
+                        Some(b) => {
+                            let r = self.built.sim.resources_mut().add_flow(
+                                &format!("{name}.port"),
+                                Kind::Bandwidth,
+                                b.rate()?,
+                            );
+                            self.built.sim.resources_mut().set_clock(r, clock);
+                            Some(r)
+                        }
+                    };
                     if tile.contains(&0) {
                         return err(format!("{name}: tile {tile:?} has a 0"));
                     }
@@ -2140,6 +2164,7 @@ impl Builder {
                         rates,
                         smem_port,
                         smem_wport,
+                        port,
                         utilization: utilization()?,
                         masters: atts.clone(),
                     }
@@ -2200,6 +2225,16 @@ impl Builder {
             self.built.pes.insert(name, id);
         }
         Ok(())
+    }
+}
+
+/// The key `rules` of a memory: true for `free` (a tmem only).
+fn rules_free(m: &MemSec, name: &str) -> Result<bool, ConfigError> {
+    match (m.rules.as_deref(), m.kind.as_str()) {
+        (None, _) | (Some("strict"), "tmem") => Ok(false),
+        (Some("free"), "tmem") => Ok(true),
+        (Some(r), "tmem") => err(format!("{name}: rules {r:?}")),
+        (Some(_), _) => err(format!("{name}: rules is a tmem key")),
     }
 }
 

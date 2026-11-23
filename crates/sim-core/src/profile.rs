@@ -1166,6 +1166,7 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
         tile,
         smem_port,
         smem_wport,
+        port,
         utilization,
         quantize,
         row_panel,
@@ -1249,7 +1250,19 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
     // a chain writes C after the tile's compute, as a tail that holds the
     // Atlas. With room for two or more tiles the next tile accumulates
     // while C drains: the write overlaps the compute.
-    let tail = tmem.is_some() && !keep && acc_buffer > 0 && acc_buffer < 2 * tile[0] * tile[1] * 4;
+    // The tile is the chunk's (a task smaller than the Atlas tile and not
+    // quantized drains while the next one of its size accumulates).
+    let tail_for = |qm: u64, qn: u64| {
+        tmem.is_some() && !keep && acc_buffer > 0 && acc_buffer < 2 * qm * qn * 4
+    };
+    // A and B read from a block that is not a tmem take the array's port.
+    let in_tmem = |at: Addr| {
+        node.memories
+            .iter()
+            .any(|m| m.is_tmem() && m.holds(at))
+    };
+    let port_a = port.filter(|_| !in_tmem(a));
+    let port_b = port.filter(|_| !in_tmem(b));
     let mut chunks = Vec::new();
     for mi in (0..m).step_by(tile[0] as usize) {
         let tm = tile[0].min(m - mi);
@@ -1288,7 +1301,12 @@ pub(crate) fn matmul_profile(desc: &Descriptor, node: &NodeConfig) -> Profile {
             // are writes (one resource: charged as their sum).
             let read = a_bytes + b_bytes + c_in;
             let write = c_out + flush;
+            let tail = tail_for(qm, qn);
             let mut demand = vec![ops];
+            let port_bytes = port_a.map_or(0, |_| a_bytes) + port_b.map_or(0, |_| b_bytes);
+            if let Some(r) = port_a.or(port_b).filter(|_| port_bytes > 0) {
+                demand.push(Demand::read(r, port_bytes));
+            }
             // A tmem's banks take the bytes, whatever the SMEM's ports.
             match smem_port.filter(|_| tmem.is_none()) {
                 Some(port) => demand.extend([

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 360" width="240" height="180" role="img">
+<title>Option C: Blackwell-like</title>
+<style>rect,line{fill:none;stroke:#1f2328;stroke-width:3.5}line.a{stroke-width:4.6}polygon,text{fill:#1f2328;stroke:none}text{font-family:Helvetica,Arial,sans-serif}@media (prefers-color-scheme: dark){rect,line{stroke:#e6edf3}polygon,text{fill:#e6edf3}}</style>
+<rect x="12.0" y="12.0" width="456.0" height="336.0"/>
+<text x="24.0" y="36.0" font-size="24.9" text-anchor="start" dominant-baseline="central">SM</text>
+<rect x="36.0" y="60.0" width="160.0" height="36.0"/>
+<text x="116.0" y="78.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">Muon 0</text>
+<rect x="36.0" y="108.0" width="160.0" height="36.0"/>
+<text x="116.0" y="126.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">Muon 1</text>
+<rect x="36.0" y="168.0" width="160.0" height="36.0"/>
+<line x1="50.0" y1="198.0" x2="50.0" y2="174.0"/>
+<line x1="182.0" y1="198.0" x2="182.0" y2="174.0"/>
+<line x1="50.0" y1="180.0" x2="182.0" y2="192.0"/>
+<line x1="50.0" y1="192.0" x2="182.0" y2="180.0"/>
+<rect x="36.0" y="228.0" width="24.0" height="64.0"/>
+<rect x="70.0" y="228.0" width="24.0" height="64.0"/>
+<rect x="104.0" y="228.0" width="24.0" height="64.0"/>
+<text x="152.0" y="260.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">…</text>
+<rect x="166.0" y="228.0" width="24.0" height="64.0"/>
+<text x="116.0" y="318.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">SMEM</text>
+<rect x="268.0" y="60.0" width="176.0" height="22.0"/>
+<rect x="268.0" y="88.0" width="176.0" height="22.0"/>
+<rect x="268.0" y="116.0" width="176.0" height="22.0"/>
+<rect x="268.0" y="144.0" width="176.0" height="22.0"/>
+<text x="356.0" y="40.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">TMEM: acc</text>
+<line class="a" x1="350.4" y1="194.0" x2="350.4" y2="181.6"/>
+<polygon points="350.4,170.0 342.1,182.4 358.7,182.4"/>
+<line class="a" x1="361.6" y1="170.0" x2="361.6" y2="182.4"/>
+<polygon points="361.6,194.0 369.9,181.6 353.3,181.6"/>
+<rect x="268.0" y="204.0" width="176.0" height="120.0"/>
+<text x="356.0" y="264.0" font-size="20.7" text-anchor="middle" dominant-baseline="central">Atlas</text>
+<line class="a" x1="196.0" y1="120.4" x2="256.4" y2="120.4"/>
+<polygon points="268.0,120.4 255.6,112.1 255.6,128.7"/>
+<line class="a" x1="268.0" y1="131.6" x2="207.6" y2="131.6"/>
+<polygon points="196.0,131.6 208.4,139.9 208.4,123.3"/>
+<text x="232.0" y="150.0" font-size="18.7" text-anchor="middle" dominant-baseline="central">lanes</text>
+<line class="a" x1="202.0" y1="260.0" x2="256.4" y2="260.0"/>
+<polygon points="268.0,260.0 255.6,251.7 255.6,268.3"/>
+<text x="234.0" y="280.0" font-size="18.7" text-anchor="middle" dominant-baseline="central">A, B</text>
+</svg>
